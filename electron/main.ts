@@ -59,6 +59,22 @@ const __dirname = path.dirname(fileURLToPath(import.meta.url));
 // HUD/tray/menu. Parsed before any GUI side effects; see electron/cli/.
 const cliCommand = parseCliArgs(process.argv, app.isPackaged ? 1 : 2);
 
+/*
+ * `open` is the one verb that wants the GUI, so it is split out here and treated
+ * as a launch rather than a CLI run.
+ *
+ * The distinction is the single-instance lock. Every headless verb skips it on
+ * purpose, so `openscreen export` works while the app is open. `open` needs the
+ * opposite: the lock is what routes a document into an app that is *already*
+ * running, via `second-instance`, instead of starting a second copy that fights
+ * with the first over the same files.
+ */
+const openCommand = cliCommand?.kind === "open" ? cliCommand : null;
+const headlessCliCommand = cliCommand && cliCommand.kind !== "open" ? cliCommand : null;
+
+/** A path handed in before any window existed, flushed once one does. */
+let pendingOpenPath: string | null = openCommand?.projectPath ?? null;
+
 // Use Screen & System Audio Recording permissions instead of the CoreAudio Tap API on macOS.
 // Tap needs NSAudioCaptureUsageDescription in the parent app's Info.plist, which breaks when
 // running from a terminal/IDE during dev.
@@ -154,17 +170,69 @@ function showMainWindow() {
 
 // CLI runs skip the single-instance lock so `openscreen export/record` works
 // while the GUI app is open (they share nothing but the recordings directory).
-const hasSingleInstanceLock = cliCommand ? false : app.requestSingleInstanceLock();
+const hasSingleInstanceLock = headlessCliCommand ? false : app.requestSingleInstanceLock();
 
-if (cliCommand) {
-	runCli(cliCommand);
+if (headlessCliCommand) {
+	runCli(headlessCliCommand);
 } else if (hasSingleInstanceLock) {
-	app.on("second-instance", () => {
+	app.on("second-instance", (_event, argv, workingDirectory) => {
+		// A second launch may be carrying a document — `openscreen open <file>`
+		// from a script, or a Finder double-click once the file association is
+		// registered. Re-parse its argv rather than just raising the window, or
+		// the path the caller asked for is silently dropped.
+		const incoming = parseCliArgs(argv, app.isPackaged ? 1 : 2, workingDirectory);
+		if (incoming?.kind === "open") {
+			openProjectPath(incoming.projectPath);
+			return;
+		}
 		showMainWindow();
 	});
 } else {
 	app.quit();
 }
+
+/**
+ * Show a document in the editor.
+ *
+ * Mirrors `sendEditorMenuAction`: reuse a focused editor window if there is one,
+ * otherwise make one and wait for it to load before speaking to it. The path
+ * travels with the message, which is why this cannot reuse the menu channels —
+ * those carry no payload.
+ */
+function openProjectPath(projectPath: string) {
+	let targetWindow = BrowserWindow.getFocusedWindow() ?? mainWindow;
+
+	if (!targetWindow || targetWindow.isDestroyed() || !isEditorWindow(targetWindow)) {
+		createEditorWindowWrapper();
+		targetWindow = mainWindow;
+		if (!targetWindow || targetWindow.isDestroyed()) {
+			pendingOpenPath = projectPath;
+			return;
+		}
+		targetWindow.webContents.once("did-finish-load", () => {
+			if (!targetWindow || targetWindow.isDestroyed()) return;
+			targetWindow.webContents.send("open-project-path", projectPath);
+		});
+		targetWindow.show();
+		targetWindow.focus();
+		return;
+	}
+
+	targetWindow.webContents.send("open-project-path", projectPath);
+	targetWindow.show();
+	targetWindow.focus();
+}
+
+/*
+ * macOS opens an associated file through this event, not through argv, and it can
+ * fire before `whenReady`. Registering it at module scope and parking the path in
+ * `pendingOpenPath` is the documented way to not lose the very first one.
+ */
+app.on("open-file", (event, filePath) => {
+	event.preventDefault();
+	if (app.isReady()) openProjectPath(filePath);
+	else pendingOpenPath = filePath;
+});
 
 function isEditorWindow(window: BrowserWindow) {
 	return window.webContents.getURL().includes("windowType=editor");
@@ -908,7 +976,7 @@ app.on("will-quit", () => {
 	unregisterAllGlobalShortcuts();
 });
 
-const appReady = !cliCommand && hasSingleInstanceLock ? app.whenReady() : null;
+const appReady = !headlessCliCommand && hasSingleInstanceLock ? app.whenReady() : null;
 
 appReady?.then(async () => {
 	if (isDiagnosticModeEnabled()) {
@@ -1133,4 +1201,19 @@ appReady?.then(async () => {
 	}
 
 	createWindow();
+
+	/*
+	 * A document asked for before there was anywhere to put it.
+	 *
+	 * Two routes park a path in `pendingOpenPath`: `openscreen open <file>` on a
+	 * cold start, which is parsed at module scope long before `whenReady`, and
+	 * macOS's `open-file`, which can fire before ready as well. Either way the
+	 * window does not exist yet, so the path waits here rather than being sent to
+	 * nothing.
+	 */
+	if (pendingOpenPath) {
+		const projectPath = pendingOpenPath;
+		pendingOpenPath = null;
+		openProjectPath(projectPath);
+	}
 });

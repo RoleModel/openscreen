@@ -100,6 +100,24 @@
     }
   ],
 
+  // Make .openscreen a document type this app owns.
+  //
+  // Without this the bundle declares no CFBundleDocumentTypes, which is why a
+  // document could not be opened from outside at all: `open <file>` had nothing
+  // to route to, and `open -a Openscreen <file>` launched the app and discarded
+  // the argument. With it, Finder double-click and `open` both reach the
+  // `open-file` handler in electron/main.ts, and `openscreen open <file>` works
+  // through argv on the same path.
+  "fileAssociations": [
+    {
+      "ext": "openscreen",
+      "name": "OpenScreen Project",
+      "description": "OpenScreen project",
+      "role": "Editor",
+      "rank": "Owner",
+      "mimeType": "application/x-openscreen-project"
+    }
+  ],
   "mac": {
     "notarize": false,
     "hardenedRuntime": true,

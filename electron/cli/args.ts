@@ -9,6 +9,22 @@ export interface CliInfoCommand {
 	projectPath: string;
 }
 
+/**
+ * Hand a document to the GUI.
+ *
+ * Unlike every other verb this one is not headless: it exists so a document
+ * written by a script can be opened for editing. Before it existed there was no
+ * way in at all -- the bundle declared no document type, so `open <file>` had
+ * nothing to route to; `open -a Openscreen <file>` launched the app and
+ * discarded the argument; and a bare path here fell through `SUBCOMMANDS` and
+ * returned null, which starts the GUI on an empty project and silently drops the
+ * path the caller asked for.
+ */
+export interface CliOpenCommand {
+	kind: "open";
+	projectPath: string;
+}
+
 export interface CliHelpCommand {
 	kind: "help";
 }
@@ -21,6 +37,7 @@ export interface CliErrorCommand {
 export type CliCommand = (
 	| CliRequest
 	| CliInfoCommand
+	| CliOpenCommand
 	| CliPackCommand
 	| CliHelpCommand
 	| CliErrorCommand
@@ -56,6 +73,7 @@ const SUBCOMMANDS = new Set([
 	"pack",
 	"captions",
 	"info",
+	"open",
 	"help",
 	"--help",
 	"-h",
@@ -70,6 +88,7 @@ Usage:
   openscreen pack <project.openscreen> --out <dir>   Copy project + media into one portable folder
   openscreen captions <project.openscreen>           Add auto-captions (on-device Whisper) to a project
                      [--min-words <n>] [--max-words <n>]
+  openscreen open <project.openscreen>              Open a project in the editor
   openscreen info <project.openscreen> [--json]      Inspect a project file
   openscreen help                                    Show this help
 
@@ -161,6 +180,7 @@ export function parseCliArgs(
 		if (sub === "sources") return parseSources(args.slice(1), cwd);
 		if (sub === "pack") return parsePack(args.slice(1), cwd);
 		if (sub === "captions") return parseCaptions(args.slice(1), cwd);
+		if (sub === "open") return parseOpen(args.slice(1), cwd);
 		return parseInfo(args.slice(1), cwd);
 	} catch (error) {
 		return { kind: "error", message: error instanceof Error ? error.message : String(error) };
@@ -451,6 +471,21 @@ function parseCaptions(args: string[], cwd: string): CliCommand {
 		throw new Error("--min-words cannot exceed --max-words");
 	}
 	return { kind: "captions", projectPath, minWordsPerCaption, maxWordsPerCaption, json };
+}
+
+function parseOpen(args: string[], cwd: string): CliCommand {
+	let projectPath = "";
+	for (const arg of args) {
+		if (arg.startsWith("-")) {
+			throw new Error(`Unknown open option: ${arg}`);
+		} else if (projectPath) {
+			throw new Error(`Unexpected extra argument: ${arg}`);
+		} else {
+			projectPath = resolvePath(arg, cwd);
+		}
+	}
+	if (!projectPath) throw new Error("open requires a <project.openscreen> path");
+	return { kind: "open", projectPath };
 }
 
 function parseInfo(args: string[], cwd: string): CliCommand {

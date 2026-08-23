@@ -172,5 +172,9 @@
 	"main": "dist-electron/main.js",
 	"lint-staged": {
 		"*.{ts,tsx,js,jsx,mts,cts,json}": "biome check --no-errors-on-unmatched"
+	},
+	"allowScripts": {
+		"electron@41.2.1": true,
+		"esbuild@0.28.1": true
 	}
 }

@@ -11,7 +11,7 @@
 // so this is the single render path for the feature.
 
 import { AlertCircle, Film, FolderOpen, Upload, X } from "lucide-react";
-import { useCallback, useRef, useState } from "react";
+import { useCallback, useEffect, useRef, useState } from "react";
 import { Dialog, DialogContent, DialogHeader, DialogTitle } from "@/components/ui/dialog";
 import { useScopedT } from "@/contexts/I18nContext";
 import {
@@ -102,6 +102,26 @@ export function EditorEmptyState({
 		} catch {
 			setDropError("load-failed");
 		}
+	}, [openLoadedProject]);
+
+	// A document handed in from outside the app — `openscreen open <file>`, a file
+	// association, or a second launch with a path. Same two steps the drop handler
+	// takes, because it is the same job: read the file, then open what came back.
+	useEffect(() => {
+		const api = window.electronAPI;
+		if (!api?.onOpenProjectPath) return;
+		return api.onOpenProjectPath(async (filePath: string) => {
+			try {
+				const result = await window.electronAPI?.loadProjectFileFromPath?.(filePath);
+				if (!result?.success || !result.project) {
+					setDropError("load-failed");
+					return;
+				}
+				if (!(await openLoadedProject(result.project))) setDropError("load-failed");
+			} catch {
+				setDropError("load-failed");
+			}
+		});
 	}, [openLoadedProject]);
 
 	const handleDragOver = useCallback((e: React.DragEvent) => {

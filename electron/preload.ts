@@ -339,6 +339,18 @@ contextBridge.exposeInMainWorld("electronAPI", {
 		ipcRenderer.on("menu-import-video", listener);
 		return () => ipcRenderer.removeListener("menu-import-video", listener);
 	},
+	/**
+	 * A document handed to the app from outside: `openscreen open <file>`, a
+	 * second instance launched with a path, or macOS opening an associated file.
+	 *
+	 * Separate from `onMenuLoadProject`, which opens a picker and carries no path.
+	 */
+	onOpenProjectPath: (callback: (filePath: string) => void) => {
+		const listener = (_event: unknown, filePath: string) => callback(filePath);
+		ipcRenderer.on("open-project-path", listener);
+		return () => ipcRenderer.removeListener("open-project-path", listener);
+	},
+
 	onMenuLoadProject: (callback: () => void) => {
 		const listener = () => callback();
 		ipcRenderer.on("menu-load-project", listener);

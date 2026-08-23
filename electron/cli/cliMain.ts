@@ -245,6 +245,17 @@ export function runCli(command: CliCommand): void {
 		return;
 	}
 
+	// `open` is a GUI command, not a runner. main.ts hands it to the window layer
+	// before this is ever called — it needs the single-instance lock so a running
+	// app can receive the document, which is the opposite of what every headless
+	// verb wants. Guarding here keeps the narrowing below honest rather than
+	// relying on a caller to remember.
+	if (command.kind === "open") {
+		safeWrite(process.stderr, "openscreen: `open` is handled by the GUI path, not the CLI runner\n");
+		app.exit(1);
+		return;
+	}
+
 	const output = createOutput(command.json === true);
 
 	// stdout belongs to the CLI protocol (NDJSON / progress); reroute the app's

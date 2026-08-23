@@ -380,6 +380,8 @@ interface Window {
 		}>;
 		onMenuNewProject: (callback: () => void) => () => void;
 		onMenuImportVideo: (callback: () => void) => () => void;
+		/** A document handed in from outside: the `open` verb, a file association, or a second launch. */
+		onOpenProjectPath: (callback: (filePath: string) => void) => () => void;
 		onMenuLoadProject: (callback: () => void) => () => void;
 		onMenuSaveProject: (callback: () => void) => () => void;
 		onMenuSaveProjectAs: (callback: () => void) => () => void;

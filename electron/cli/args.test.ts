@@ -1,6 +1,6 @@
 import path from "node:path";
 import { describe, expect, it } from "vitest";
-import { parseCliArgs } from "./args";
+import { CLI_USAGE, parseCliArgs } from "./args";
 
 const CWD = path.resolve("/work");
 const inCwd = (name: string) => path.resolve(CWD, name);
@@ -225,5 +225,40 @@ describe("parseCliArgs", () => {
 		});
 		expect(parse(["help"])).toMatchObject({ kind: "help" });
 		expect(parse(["--help"])).toMatchObject({ kind: "help" });
+	});
+});
+
+describe("open", () => {
+	// The verb exists because there was no way in at all: the bundle declared no
+	// document type, `open -a Openscreen <file>` discarded its argument, and a
+	// bare path fell through SUBCOMMANDS and returned null — which starts the GUI
+	// on an empty project and silently drops the path.
+	it("parses a project path", () => {
+		const command = parseCliArgs(["node", "app", "open", "demo.openscreen"], 2, "/work");
+		expect(command).toEqual({ kind: "open", projectPath: "/work/demo.openscreen" });
+	});
+
+	it("keeps an absolute path as given", () => {
+		const command = parseCliArgs(["node", "app", "open", "/tmp/a.openscreen"], 2, "/work");
+		expect(command).toMatchObject({ kind: "open", projectPath: "/tmp/a.openscreen" });
+	});
+
+	it("requires a path", () => {
+		const command = parseCliArgs(["node", "app", "open"], 2, "/work");
+		expect(command).toMatchObject({ kind: "error" });
+	});
+
+	it("refuses options it does not have", () => {
+		const command = parseCliArgs(["node", "app", "open", "a.openscreen", "--json"], 2, "/work");
+		expect(command).toMatchObject({ kind: "error" });
+	});
+
+	it("refuses a second path", () => {
+		const command = parseCliArgs(["node", "app", "open", "a.openscreen", "b.openscreen"], 2, "/work");
+		expect(command).toMatchObject({ kind: "error" });
+	});
+
+	it("is listed in the usage text", () => {
+		expect(CLI_USAGE).toContain("openscreen open");
 	});
 });
