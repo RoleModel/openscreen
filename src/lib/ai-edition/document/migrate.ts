@@ -130,6 +130,38 @@ export function migrateProjectDataToAxcutDocument(
 		? input.editor.annotationRegions
 		: [];
 
+	/*
+	 * A v2 project can carry a crop, and it has to reach the clip.
+	 *
+	 * `cropRegion` lives on the clip in the current schema — see its comment
+	 * there — but v2 stored it on the editor envelope. It was being dropped: the
+	 * legacyEditor built below hardcodes the identity region and the clip got no
+	 * crop at all, so a v2 project with a real crop opened uncropped and exported
+	 * uncropped.
+	 *
+	 * This is not academic. A window capture on a HiDPI Mac can come back padded
+	 * into a display-sized buffer with black below the content (the shape of
+	 * issue #418, which `captureOutputSize` guards for displays). A crop is how a
+	 * recording like that is framed without re-encoding it, and the exporter
+	 * already applies one — it just never arrived.
+	 *
+	 * The identity region is treated as absent, per the schema's note that
+	 * untouched clips stay lean.
+	 */
+	const rawCrop = input.editor?.cropRegion;
+	const isFraction = (n: unknown): n is number => typeof n === "number" && Number.isFinite(n) && n >= 0 && n <= 1;
+	const cropRegion =
+		rawCrop &&
+		isFraction(rawCrop.x) &&
+		isFraction(rawCrop.y) &&
+		isFraction(rawCrop.width) &&
+		isFraction(rawCrop.height) &&
+		rawCrop.width > 0 &&
+		rawCrop.height > 0 &&
+		!(rawCrop.x === 0 && rawCrop.y === 0 && rawCrop.width === 1 && rawCrop.height === 1)
+			? { x: rawCrop.x, y: rawCrop.y, width: rawCrop.width, height: rawCrop.height }
+			: undefined;
+
 	const clip = primaryAssetId
 		? {
 				id: createId("clip"),
@@ -140,6 +172,7 @@ export function migrateProjectDataToAxcutDocument(
 				wordRefs: [] as string[],
 				origin: "system" as const,
 				reason: "migrated from v2",
+				...(cropRegion ? { cropRegion } : {}),
 			}
 		: null;
 
@@ -277,6 +310,10 @@ export function migrateAxcutDocumentToProjectData(input: AxcutDocument): EditorP
 			})
 		: null;
 
+	const primaryClipCrop = (document.timeline?.clips ?? []).find(
+		(c) => !primary || c.assetId === primary.id,
+	)?.cropRegion;
+
 	const trimRegions: TrimRegion[] = (document.timeline?.trimRanges ?? []).map((region, index) => ({
 		id: region.id ?? `trim-${index + 1}`,
 		startMs: secToMs(clampSec(region.startSec ?? 0)),
@@ -290,7 +327,10 @@ export function migrateAxcutDocumentToProjectData(input: AxcutDocument): EditorP
 		motionBlurAmount: 0,
 		borderRadius: 0,
 		padding: 50,
-		cropRegion: { x: 0, y: 0, width: 1, height: 1 } as CropRegion,
+		// Round-trip the crop the other way too. It lives on the clip now, so read
+		// it back off the primary clip rather than inventing the identity — a
+		// document that went v2 -> current -> v2 would otherwise lose it.
+		cropRegion: (primaryClipCrop ?? { x: 0, y: 0, width: 1, height: 1 }) as CropRegion,
 		zoomRegions: [],
 		cameraFullscreenRegions: [],
 		autoZoomEnabled: false,
