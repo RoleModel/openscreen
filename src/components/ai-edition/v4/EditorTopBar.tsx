@@ -14,6 +14,10 @@ import {
 	Sun,
 } from "lucide-react";
 import { type KeyboardEvent as ReactKeyboardEvent, useEffect, useRef, useState } from "react";
+// Imported, not spelled as a path: Vite rewrites this to a URL relative to the document,
+// which is the difference between a mark that renders and the broken-image icon a
+// packaged build showed for an absolute "/rolemodel-mark.svg" over file://.
+import logoMark from "@/assets/rolemodel-mark.svg";
 import { useI18n, useScopedT } from "@/contexts/I18nContext";
 import { useTheme } from "@/hooks/useTheme";
 import { getAvailableLocales, getLocaleName, getLocaleShort } from "@/i18n/loader";
@@ -22,10 +26,6 @@ import { getAvailableLocales, getLocaleName, getLocaleShort } from "@/i18n/loade
 // cannot drift from the name in the title bar and the About panel.
 import { PRODUCT_NAME } from "../../../../electron/about";
 import styles from "./EditorShellV4.module.css";
-
-// From public/, not src/assets/, so index.html's favicon and this wordmark are literally the
-// same file. See public/rolemodel-mark.svg.
-const logoMark = "/rolemodel-mark.svg";
 
 export type EditorMode = "media" | "edit" | "rec";
 
