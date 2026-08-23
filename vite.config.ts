@@ -36,7 +36,26 @@ export default defineConfig({
 				},
 			},
 			preload: {
-				input: path.join(__dirname, "electron/preload.ts"),
+				// Two preloads, deliberately. `preload.ts` carries the whole
+				// electronAPI surface for the app's own windows; `studio-preload.ts`
+				// carries two calls for the Studio window, which loads a page served
+				// over HTTP by a separate process. Giving that page the full surface
+				// would hand any page that server ever serves the run of the machine.
+				input: [
+					path.join(__dirname, "electron/preload.ts"),
+					path.join(__dirname, "electron/studio-preload.ts"),
+				],
+				vite: {
+					build: {
+						rollupOptions: {
+							// The plugin defaults preloads to one inlined bundle, which
+							// rollup refuses with more than one input. Neither preload has a
+							// dynamic import, so there is nothing to inline and nothing lost;
+							// each just emits its own file.
+							output: { inlineDynamicImports: false },
+						},
+					},
+				},
 			},
 			renderer: process.env.NODE_ENV === "test" ? undefined : {},
 		}),

@@ -472,6 +472,51 @@ export function createEditorWindow(query: Record<string, string> = {}): BrowserW
  * Floating source-selector window for picking a screen or window to record.
  * Frameless, transparent, and follows the user across macOS Spaces.
  */
+/**
+ * The RoleModel Studio, as a window in this app.
+ *
+ * Loads an http:// URL rather than the bundled renderer, which is the point: the
+ * Studio is a plain page served by its own process, so it needs nothing from
+ * `App.tsx` and cannot be broken by a change to it. There is no windowType here
+ * for the same reason — the renderer never runs for this window.
+ *
+ * Its preload is separate and tiny. The app-wide `preload.mjs` exposes the whole
+ * `electronAPI` surface, and handing that to a page served over HTTP would be
+ * giving a local web server the run of the machine. This one exposes two calls.
+ */
+export function createStudioWindow(url: string): BrowserWindow {
+	const isMac = process.platform === "darwin";
+
+	const win = new BrowserWindow({
+		width: 1400,
+		height: 940,
+		minWidth: 960,
+		minHeight: 640,
+		titleBarStyle: "hidden",
+		...(isMac
+			? { trafficLightPosition: { x: 18, y: 21 } }
+			: { titleBarOverlay: { color: "#09090b", symbolColor: "#a1a1aa", height: 58 } }),
+		title: "RoleModel Studio",
+		// Matches the Studio's own page surface, so there is no white flash and no
+		// seam between the titlebar and the document.
+		backgroundColor: "#141415",
+		show: false,
+		webPreferences: {
+			preload: path.join(__dirname, "studio-preload.mjs"),
+			nodeIntegration: false,
+			contextIsolation: true,
+			// Left ON, unlike the editor window. The editor turns it off to read
+			// media from disk by file:// URL; the Studio has its own server for that
+			// and has no reason to reach past it.
+			webSecurity: true,
+		},
+	});
+
+	win.once("ready-to-show", () => win.show());
+	win.loadURL(url);
+	return win;
+}
+
 export function createSourceSelectorWindow(): BrowserWindow {
 	const { width, height } = screen.getPrimaryDisplay().workAreaSize;
 

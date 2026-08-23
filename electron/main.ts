@@ -31,6 +31,7 @@ import {
 	type UpdateOutcome,
 } from "./auto-updater";
 import { parseCliArgs } from "./cli/args";
+import { startStudio } from "./studio/server";
 import { runCli } from "./cli/cliMain";
 import { isDiagnosticModeEnabled, mainLogBuffer } from "./diagnostics/main-log-buffer";
 import { buildEditMenuSubmenu, type EditorUndoRedoChannel, routeEditorUndoRedo } from "./edit-menu";
@@ -51,6 +52,7 @@ import {
 	createHudOverlayWindow,
 	createNotesWindow,
 	createSourceSelectorWindow,
+	createStudioWindow,
 } from "./windows";
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
@@ -199,6 +201,39 @@ if (headlessCliCommand) {
  * travels with the message, which is why this cannot reuse the menu channels —
  * those carry no payload.
  */
+/**
+ * Open the Studio window, starting its server if it is not up yet.
+ *
+ * Focuses the existing window rather than making a second one: two Studios on
+ * one library is two views of the same files disagreeing about state.
+ */
+let studioWindow: BrowserWindow | null = null;
+async function openStudio() {
+	if (studioWindow && !studioWindow.isDestroyed()) {
+		studioWindow.show();
+		studioWindow.focus();
+		return;
+	}
+	try {
+		const studio = await startStudio();
+		studioWindow = createStudioWindow(studio.url);
+		studioWindow.on("closed", () => {
+			studioWindow = null;
+		});
+	} catch (err) {
+		// A missing toolkit is a setup problem with a one-line fix, so say it in a
+		// dialog rather than only in a log the user will never open.
+		const message = err instanceof Error ? err.message : String(err);
+		await dialog.showMessageBox({
+			type: "warning",
+			title: "RoleModel Studio",
+			message: "The Studio could not start.",
+			detail: message,
+			buttons: ["OK"],
+		});
+	}
+}
+
 function openProjectPath(projectPath: string) {
 	let targetWindow = BrowserWindow.getFocusedWindow() ?? mainWindow;
 
@@ -1206,6 +1241,29 @@ appReady?.then(async () => {
 		return;
 	}
 
+	/*
+	 * The Studio, hosted here rather than in a browser tab.
+	 *
+	 * `studio:open-project` is what replaces the old round trip: the Studio used
+	 * to hand a document over by shelling out to `openscreen open <file>`, which
+	 * needed a PATH lookup, a probe for whether the installed build had that verb,
+	 * and a launch-and-reveal fallback for when it did not. Inside the app it is
+	 * the same call the `open` verb makes, minus the process boundary.
+	 */
+	ipcMain.handle("studio:open-project", (_event, filePath: unknown) => {
+		if (typeof filePath !== "string" || !filePath) return { ok: false, error: "no path" };
+		try {
+			openProjectPath(filePath);
+			return { ok: true };
+		} catch (err) {
+			return { ok: false, error: err instanceof Error ? err.message : String(err) };
+		}
+	});
+
+	ipcMain.handle("studio:show-editor", () => {
+		showMainWindow();
+	});
+
 	// The renderer collects a document handed in before it was listening. Paired
 	// with `openProjectPath`, which parks rather than pushes for exactly this
 	// reason. Clearing on read means a reload does not reopen the same file.
@@ -1216,6 +1274,17 @@ appReady?.then(async () => {
 	});
 
 	createWindow();
+
+	/*
+	 * The Studio comes up with the app.
+	 *
+	 * `createWindow()` above makes the HUD, which is the floating recorder — not a
+	 * place to work. The Studio is where a project is picked, a demo is scripted, a
+	 * voice is rendered and a video is branded, so it is the window the app should
+	 * actually open with. Awaited nothing: a failure shows its own dialog and must
+	 * not hold up the rest of boot.
+	 */
+	void openStudio();
 
 	/*
 	 * A document asked for before there was anywhere to put it.
