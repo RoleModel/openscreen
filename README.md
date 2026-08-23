@@ -1,3 +1,24 @@
+> ### This is RoleModel's fork
+>
+> Forked from [getopenscreen/openscreen](https://github.com/getopenscreen/openscreen).
+> Everything below is upstream's README and still true. What we added:
+>
+> - **`openscreen open <project.openscreen>`** — hand a document to the editor.
+>   Upstream has no way in from outside: the bundle declares no document type, so
+>   `open <file>` has nothing to route to, `open -a Openscreen <file>` launches and
+>   discards the argument, and a bare path is a silent no-op.
+> - **`.openscreen` as a document type**, so Finder and `open` both work.
+> - **The RoleModel Studio, hosted as a window in this app** — `electron/studio/`.
+> - **RoleModel brand tokens** in `src/index.css`, and our app icon.
+> - **`npm run app`** to launch from a checkout without the environment incantation.
+> - Portable cargo discovery, and `-rm.N` release tags.
+>
+> **Start here:** [the pipeline docs](https://github.com/RoleModel/rolemodel-openscreen/blob/main/docs/KICKOFF.md)
+> · [development guide](https://github.com/RoleModel/rolemodel-openscreen/blob/main/docs/DEVELOPMENT.md)
+>
+> Building the app needs full Xcode for the ScreenCaptureKit helper, which is why
+> releases are built in CI. Everything else builds without it.
+
 <p align="center">
   <img src="public/openscreen.png" alt="OpenScreen Logo" width="64" />
 </p>
