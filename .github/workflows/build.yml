@@ -770,8 +770,13 @@ jobs:
             TAG="${INPUT_TAG}"
           fi
 
-          if [[ ! "$TAG" =~ ^v[0-9]+\.[0-9]+\.[0-9]+(-(rc|beta|alpha)\.[0-9]+)?$ ]]; then
-            echo "::error::Release tag must look like v1.5.0 or v1.5.0-rc.1; got '${TAG}'"
+          # `rm` alongside rc/beta/alpha: this fork ships builds of upstream releases
+          # with additions of its own, and they have to be tellable apart from the
+          # upstream version they are based on — in About This Mac, in a cask, and
+          # in a bug report. Calling one `-rc.1` would say it is a candidate for
+          # 1.9.6, which is a different and untrue claim.
+          if [[ ! "$TAG" =~ ^v[0-9]+\.[0-9]+\.[0-9]+(-(rc|beta|alpha|rm)\.[0-9]+)?$ ]]; then
+            echo "::error::Release tag must look like v1.5.0, v1.5.0-rc.1 or v1.5.0-rm.1; got '${TAG}'"
             exit 1
           fi
 
@@ -784,6 +789,12 @@ jobs:
             exit 1
           fi
 
+          # `rm` is NOT in this list, on purpose. A prerelease is excluded from
+          # /releases/latest, and that endpoint is what the Homebrew cask's
+          # livecheck and `update-cask.mjs --latest` both read — marking these as
+          # prereleases would hide every shipping build of this fork from the only
+          # channel that installs it. An -rm build is not a candidate for
+          # anything; it is the release.
           if [[ "$TAG" =~ ^v[0-9]+\.[0-9]+\.[0-9]+-(rc|beta|alpha)\.[0-9]+$ ]]; then
             PRERELEASE_FLAG="--prerelease"
             IS_PRERELEASE="true"
