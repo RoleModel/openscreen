@@ -380,6 +380,8 @@ interface Window {
 		}>;
 		onMenuNewProject: (callback: () => void) => () => void;
 		onMenuImportVideo: (callback: () => void) => () => void;
+		/** Collect a document handed in before this window was listening; null when there is none. */
+		takePendingOpenPath: () => Promise<string | null>;
 		/** A document handed in from outside: the `open` verb, a file association, or a second launch. */
 		onOpenProjectPath: (callback: (filePath: string) => void) => () => void;
 		onMenuLoadProject: (callback: () => void) => () => void;

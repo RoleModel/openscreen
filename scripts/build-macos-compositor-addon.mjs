@@ -22,7 +22,7 @@
 // A Homebrew ffmpeg will NOT do as a drop-in: brew's formula builds with
 // --enable-gpl. It is fine to develop against, never fine to ship.
 
-import { execFileSync, spawn } from "node:child_process";
+import { execFileSync, spawn, spawnSync } from "node:child_process";
 import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
@@ -88,9 +88,31 @@ if (!fs.existsSync(path.join(macFfmpegDir, "include"))) {
 	);
 }
 
-const cargo = path.join(os.homedir(), ".cargo", "bin", "cargo");
-if (!fs.existsSync(cargo)) {
-	throw new Error(`cargo not found at ${cargo}. Install Rust (https://rustup.rs) first.`);
+/*
+ * Find cargo without assuming how Rust was installed.
+ *
+ * This looked only in `~/.cargo/bin`, which is rustup's layout. A Homebrew Rust
+ * puts it in `/opt/homebrew/bin` and has no `~/.cargo/bin` at all, so a machine
+ * with a perfectly good toolchain was told to go install Rust. Order: an explicit
+ * CARGO wins, then rustup's path, then whatever is on PATH.
+ */
+function findCargo() {
+	if (process.env.CARGO && fs.existsSync(process.env.CARGO)) return process.env.CARGO;
+	const rustup = path.join(os.homedir(), ".cargo", "bin", "cargo");
+	if (fs.existsSync(rustup)) return rustup;
+	const onPath = spawnSync(process.platform === "win32" ? "where" : "which", ["cargo"], {
+		encoding: "utf8",
+	});
+	const found = onPath.status === 0 ? onPath.stdout.split("\n")[0].trim() : "";
+	return found && fs.existsSync(found) ? found : null;
+}
+
+const cargo = findCargo();
+if (!cargo) {
+	throw new Error(
+		"cargo not found. Install Rust (https://rustup.rs), or set CARGO to it.\n" +
+			`  looked in: $CARGO, ${path.join(os.homedir(), ".cargo", "bin", "cargo")}, and PATH`,
+	);
 }
 
 // cwd = crates/ so cargo picks up crates/.cargo/config.toml, same as the Windows script.

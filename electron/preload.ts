@@ -345,6 +345,12 @@ contextBridge.exposeInMainWorld("electronAPI", {
 	 *
 	 * Separate from `onMenuLoadProject`, which opens a picker and carries no path.
 	 */
+	/**
+	 * Collect a document that was handed in before this window was listening.
+	 * Returns null when there is none. See `openProjectPath` in main.ts.
+	 */
+	takePendingOpenPath: (): Promise<string | null> => ipcRenderer.invoke("take-pending-open-path"),
+
 	onOpenProjectPath: (callback: (filePath: string) => void) => {
 		const listener = (_event: unknown, filePath: string) => callback(filePath);
 		ipcRenderer.on("open-project-path", listener);

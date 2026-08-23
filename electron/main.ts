@@ -209,10 +209,16 @@ function openProjectPath(projectPath: string) {
 			pendingOpenPath = projectPath;
 			return;
 		}
-		targetWindow.webContents.once("did-finish-load", () => {
-			if (!targetWindow || targetWindow.isDestroyed()) return;
-			targetWindow.webContents.send("open-project-path", projectPath);
-		});
+		// Park it and let the renderer collect it when it is ready.
+		//
+		// Pushing on `did-finish-load` is what the menu actions do, and it does not
+		// work here: that event fires when the page has loaded, which is before
+		// React has mounted the component that registers the listener. A menu
+		// action is safe because a person triggers it long after mount; a document
+		// handed in at launch arrives in the gap and is sent to nobody. That is
+		// exactly what happened -- the window opened, the message went out, and
+		// `userData/projects` stayed empty because nothing ever received it.
+		pendingOpenPath = projectPath;
 		targetWindow.show();
 		targetWindow.focus();
 		return;
@@ -1200,6 +1206,15 @@ appReady?.then(async () => {
 		return;
 	}
 
+	// The renderer collects a document handed in before it was listening. Paired
+	// with `openProjectPath`, which parks rather than pushes for exactly this
+	// reason. Clearing on read means a reload does not reopen the same file.
+	ipcMain.handle("take-pending-open-path", () => {
+		const projectPath = pendingOpenPath;
+		pendingOpenPath = null;
+		return projectPath;
+	});
+
 	createWindow();
 
 	/*
@@ -1212,8 +1227,8 @@ appReady?.then(async () => {
 	 * nothing.
 	 */
 	if (pendingOpenPath) {
-		const projectPath = pendingOpenPath;
-		pendingOpenPath = null;
-		openProjectPath(projectPath);
+		// Make sure the surface that will ask for it exists. The path itself stays
+		// parked; `take-pending-open-path` hands it over once the renderer mounts.
+		openProjectPath(pendingOpenPath);
 	}
 });

@@ -107,10 +107,8 @@ export function EditorEmptyState({
 	// A document handed in from outside the app — `openscreen open <file>`, a file
 	// association, or a second launch with a path. Same two steps the drop handler
 	// takes, because it is the same job: read the file, then open what came back.
-	useEffect(() => {
-		const api = window.electronAPI;
-		if (!api?.onOpenProjectPath) return;
-		return api.onOpenProjectPath(async (filePath: string) => {
+	const openFromPath = useCallback(
+		async (filePath: string) => {
 			try {
 				const result = await window.electronAPI?.loadProjectFileFromPath?.(filePath);
 				if (!result?.success || !result.project) {
@@ -121,8 +119,25 @@ export function EditorEmptyState({
 			} catch {
 				setDropError("load-failed");
 			}
+		},
+		[openLoadedProject],
+	);
+
+	// Two arrival routes, because a document can be handed over before or after
+	// this component exists.
+	//
+	// Asking is the one that matters at launch: the main process parks the path
+	// rather than pushing it, since `did-finish-load` fires before React mounts and
+	// a pushed message would land on nobody. Listening covers the other case — an
+	// app already open when a second `openscreen open` arrives.
+	useEffect(() => {
+		const api = window.electronAPI;
+		if (!api) return;
+		void api.takePendingOpenPath?.().then((filePath) => {
+			if (filePath) void openFromPath(filePath);
 		});
-	}, [openLoadedProject]);
+		return api.onOpenProjectPath?.((filePath: string) => void openFromPath(filePath));
+	}, [openFromPath]);
 
 	const handleDragOver = useCallback((e: React.DragEvent) => {
 		e.preventDefault();
