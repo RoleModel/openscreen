@@ -92,7 +92,8 @@
 		"prepare": "husky",
 		"fetch:ffmpeg": "node scripts/fetch-ffmpeg.mjs",
 		"fetch:ffmpeg:mac": "node scripts/fetch-ffmpeg-macos.mjs",
-		"fetch:ffmpeg:sdk": "node scripts/fetch-ffmpeg.mjs --sdk-only"
+		"fetch:ffmpeg:sdk": "node scripts/fetch-ffmpeg.mjs --sdk-only",
+		"app": "node scripts/launch.mjs"
 	},
 	"dependencies": {
 		"@fix-webm-duration/fix": "^1.0.1",

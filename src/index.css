@@ -5,58 +5,86 @@
 @tailwind utilities;
 
 @layer base {
+	/*
+	 * RoleModel brand, mapped onto the tokens the components already read.
+	 *
+	 * Nothing below this file changes: every component styles through these
+	 * variables, so rebranding is redefining twenty values rather than touching
+	 * two hundred components. The numbers come from brand/tokens.json in
+	 * rolemodel-openscreen, converted once — not eyeballed.
+	 *
+	 * Two deliberate departures from the stock palette this replaced:
+	 *
+	 *   The neutrals are hue 214 at low saturation, not the warm 20-60 they were.
+	 *   Optics tints its greys toward the brand hue — "the neutrals are not grey"
+	 *   is a stated design decision — and it is why the surface reads slightly
+	 *   cool rather than beige.
+	 *
+	 *   `--primary` is the academy green. Stock shadcn makes primary a near-black
+	 *   in light and a near-white in dark, which means the accent colour is
+	 *   nowhere and every button is a neutral. One accent, used for action and
+	 *   state, is the whole point of the brand.
+	 */
 	:root {
-		--background: 0 0% 100%;
-		--foreground: 20 14.3% 4.1%;
+		--background: 214 20% 99%;
+		--foreground: 212 27% 14%;
 		--card: 0 0% 100%;
-		--card-foreground: 20 14.3% 4.1%;
+		--card-foreground: 212 27% 14%;
 		--popover: 0 0% 100%;
-		--popover-foreground: 20 14.3% 4.1%;
-		--primary: 24 9.8% 10%;
-		--primary-foreground: 60 9.1% 97.8%;
-		--secondary: 60 4.8% 95.9%;
-		--secondary-foreground: 24 9.8% 10%;
-		--muted: 60 4.8% 95.9%;
-		--muted-foreground: 25 5.3% 44.7%;
-		--accent: 60 4.8% 95.9%;
-		--accent-foreground: 24 9.8% 10%;
-		--destructive: 0 84.2% 60.2%;
-		--destructive-foreground: 60 9.1% 97.8%;
-		--border: 20 5.9% 90%;
-		--input: 20 5.9% 90%;
-		--ring: 20 14.3% 4.1%;
-		--chart-1: 12 76% 61%;
-		--chart-2: 173 58% 39%;
-		--chart-3: 197 37% 24%;
-		--chart-4: 43 74% 66%;
-		--chart-5: 27 87% 67%;
+		--popover-foreground: 212 27% 14%;
+		/* academy green — brand/tokens.json palette.primary #00b871 */
+		--primary: 157 100% 36%;
+		--primary-foreground: 0 0% 100%;
+		--secondary: 214 16% 95%;
+		--secondary-foreground: 212 27% 22%;
+		--muted: 214 16% 95%;
+		--muted-foreground: 212 12% 42%;
+		--accent: 214 16% 93%;
+		--accent-foreground: 212 27% 22%;
+		--destructive: 0 72% 45%;
+		--destructive-foreground: 0 0% 100%;
+		--border: 214 14% 89%;
+		--input: 214 14% 89%;
+		/* Focus is the accent, so it is visible and means the same thing everywhere. */
+		--ring: 157 100% 36%;
+		/* The sub-brand hues, in order: academy, lcad, docks, decks, railing.
+		   A chart in a RoleModel product should be RoleModel's colours. */
+		--chart-1: 157 100% 36%;
+		--chart-2: 214 93% 47%;
+		--chart-3: 165 63% 41%;
+		--chart-4: 40 100% 45%;
+		--chart-5: 269 75% 50%;
 		--radius: 0.5rem;
 	}
 	.dark {
-		--background: 20 14.3% 4.1%;
-		--foreground: 60 9.1% 97.8%;
-		--card: 20 14.3% 4.1%;
-		--card-foreground: 60 9.1% 97.8%;
-		--popover: 20 14.3% 4.1%;
-		--popover-foreground: 60 9.1% 97.8%;
-		--primary: 60 9.1% 97.8%;
-		--primary-foreground: 24 9.8% 10%;
-		--secondary: 12 6.5% 15.1%;
-		--secondary-foreground: 60 9.1% 97.8%;
-		--muted: 12 6.5% 15.1%;
-		--muted-foreground: 24 5.4% 63.9%;
-		--accent: 12 6.5% 15.1%;
-		--accent-foreground: 60 9.1% 97.8%;
-		--destructive: 0 62.8% 30.6%;
-		--destructive-foreground: 60 9.1% 97.8%;
-		--border: 12 6.5% 15.1%;
-		--input: 12 6.5% 15.1%;
-		--ring: 24 5.7% 82.9%;
-		--chart-1: 220 70% 50%;
-		--chart-2: 160 60% 45%;
-		--chart-3: 30 80% 55%;
-		--chart-4: 280 65% 60%;
-		--chart-5: 340 75% 55%;
+		/* Optics' dark ramp: hue 214 at 4-6%, page darkest, panels one step up. */
+		--background: 214 6% 8%;
+		--foreground: 214 6% 97%;
+		--card: 214 6% 11%;
+		--card-foreground: 214 6% 97%;
+		--popover: 214 6% 11%;
+		--popover-foreground: 214 6% 97%;
+		/* The green lifts two points on dark — Optics' own academy-primary-base
+		   resolves to #00c278 there rather than the #00b871 it uses on light. */
+		--primary: 157 100% 38%;
+		--primary-foreground: 157 100% 9%;
+		--secondary: 214 6% 16%;
+		--secondary-foreground: 214 6% 97%;
+		--muted: 214 6% 16%;
+		--muted-foreground: 214 6% 64%;
+		--accent: 214 6% 18%;
+		--accent-foreground: 214 6% 97%;
+		--destructive: 0 68% 52%;
+		--destructive-foreground: 0 0% 100%;
+		/* A hairline, which is what a border is here — depth is tonal, not shadowed. */
+		--border: 214 6% 20%;
+		--input: 214 6% 20%;
+		--ring: 157 100% 38%;
+		--chart-1: 157 100% 42%;
+		--chart-2: 214 93% 60%;
+		--chart-3: 165 63% 51%;
+		--chart-4: 40 100% 55%;
+		--chart-5: 269 75% 62%;
 	}
 }
 

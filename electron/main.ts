@@ -1273,6 +1273,21 @@ appReady?.then(async () => {
 		return projectPath;
 	});
 
+	/*
+	 * The Dock icon, for a run from a checkout.
+	 *
+	 * electron-builder writes the icon into the packaged bundle, which means it is
+	 * absent exactly when you are developing: `npm run app` shows the generic
+	 * Electron globe, and it is the first thing anyone notices. Setting it here
+	 * costs nothing in a packaged build — `app.isPackaged` skips it, because the
+	 * bundle's own icon is already correct and better (it carries every size).
+	 */
+	if (!app.isPackaged && process.platform === "darwin") {
+		const iconPath = path.join(__dirname, "..", "icons", "icons", "png", "1024x1024.png");
+		const icon = nativeImage.createFromPath(iconPath);
+		if (!icon.isEmpty()) app.dock?.setIcon(icon);
+	}
+
 	createWindow();
 
 	/*

@@ -485,17 +485,32 @@ export function createEditorWindow(query: Record<string, string> = {}): BrowserW
  * giving a local web server the run of the machine. This one exposes two calls.
  */
 export function createStudioWindow(url: string): BrowserWindow {
-	const isMac = process.platform === "darwin";
-
-	const win = new BrowserWindow({
+		const win = new BrowserWindow({
 		width: 1400,
 		height: 940,
 		minWidth: 960,
 		minHeight: 640,
+		/*
+		 * A normal titlebar, unlike every other window here.
+		 *
+		 * The others use `titleBarStyle: "hidden"` and substitute their own topbar,
+		 * which declares `-webkit-app-region: drag` — that CSS property is the only
+		 * thing that makes a frameless window movable. This window loads a page
+		 * served by a different process, which has no such topbar and no reason to
+		 * know about Electron, so hiding the titlebar here produced a window that
+		 * could not be moved at all. Copied the style, not the thing that made it
+		 * work.
+		 *
+		 * So the drag region is injected by the host instead, below — the same
+		 * pattern this file already uses to hand a page `--titlebar-inset-left`.
+		 * The page stays unaware it is in Electron; the host declares what the host
+		 * needs. A real titlebar was the first fix and it was worse: macOS paints it
+		 * light, which puts a white bar above a deliberately dark interface.
+		 */
 		titleBarStyle: "hidden",
-		...(isMac
-			? { trafficLightPosition: { x: 18, y: 21 } }
-			: { titleBarOverlay: { color: "#09090b", symbolColor: "#a1a1aa", height: 58 } }),
+		...(process.platform === "darwin"
+			? { trafficLightPosition: { x: 18, y: 18 } }
+			: { titleBarOverlay: { color: "#141415", symbolColor: "#a1a1aa", height: 44 } }),
 		title: "RoleModel Studio",
 		// Matches the Studio's own page surface, so there is no white flash and no
 		// seam between the titlebar and the document.
@@ -510,6 +525,36 @@ export function createStudioWindow(url: string): BrowserWindow {
 			// and has no reason to reach past it.
 			webSecurity: true,
 		},
+	});
+
+	/*
+	 * The drag region, and room for the traffic lights.
+	 *
+	 * A frameless window is movable only where something declares
+	 * `-webkit-app-region: drag`, and the Studio is a page served by another
+	 * process with no reason to know that. Injected here it stays the host's
+	 * concern: in a browser these rules are inert, which is what keeps
+	 * `rm-studio` usable on its own.
+	 *
+	 * The header is the drag surface because it is the top strip and mostly empty.
+	 * Its buttons get `no-drag` back, or the breadcrumbs stop being clickable — a
+	 * drag region swallows clicks, which is the trap in this whole approach.
+	 */
+	win.webContents.on("dom-ready", () => {
+		const inset = process.platform === "darwin" ? "72px" : "0px";
+		win.webContents
+			.insertCSS(
+				`html, body { background: #141415 !important; }
+				 .op-page__main-header { -webkit-app-region: drag; }
+				 .op-page__main-header button,
+				 .op-page__main-header a,
+				 .op-page__main-header input { -webkit-app-region: no-drag; }
+				 /* Clear the traffic lights, which sit over the brand otherwise. */
+				 .sidebar__brand { margin-block-start: ${inset}; }`,
+			)
+			.catch(() => {
+				// Cosmetic, and the page may be mid-teardown.
+			});
 	});
 
 	win.once("ready-to-show", () => win.show());
