@@ -3,6 +3,16 @@ import type { SidebarsConfig } from "@docusaurus/plugin-content-docs";
 const sidebars: SidebarsConfig = {
 	mainSidebar: [
 		{
+			// RoleModel's own pages, synced from the rolemodel-openscreen repo by
+			// `npm run sync-docs` there — edit them in that repo, not here. First in
+			// the sidebar because for anyone on this team they are the entry point:
+			// upstream's Getting Started installs upstream's app.
+			type: "category",
+			label: "RoleModel pipeline",
+			collapsible: false,
+			items: ["rolemodel/pipeline", "rolemodel/development", "rolemodel/library"],
+		},
+		{
 			type: "category",
 			label: "Getting Started",
 			collapsible: false,
