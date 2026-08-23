@@ -1,3 +1,4 @@
+import { existsSync } from "node:fs";
 import path from "node:path";
 import react from "@vitejs/plugin-react";
 import { defineConfig } from "vite";
@@ -29,6 +30,26 @@ export default defineConfig({
 					}
 					const env = { ...process.env };
 					delete env.ELECTRON_RUN_AS_NODE;
+					/*
+					 * The Studio, which the app hosts in a window.
+					 *
+					 * `npm run app` (scripts/launch.mjs) points at it; `npm run dev` did not,
+					 * so the one command that gives you HMR — the command you want for any
+					 * design work — came up with the Studio window reporting that it could
+					 * not find the Studio. Same resolution order as launch.mjs: an explicit
+					 * RM_STUDIO_BIN wins, otherwise the sibling checkout, otherwise leave it
+					 * unset and let the window say why.
+					 */
+					if (!env.RM_STUDIO_BIN) {
+						const sibling = path.resolve(
+							__dirname,
+							"..",
+							"rolemodel-openscreen",
+							"bin",
+							"rm-studio.mjs",
+						);
+						if (existsSync(sibling)) env.RM_STUDIO_BIN = sibling;
+					}
 					return startup(["."], { env });
 				},
 				vite: {
