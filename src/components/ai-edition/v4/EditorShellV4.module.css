@@ -83,11 +83,15 @@
 	gap: 9px;
 	flex-shrink: 0;
 }
-/* Transparent aperture mark: no plate behind it, so it needs a touch more box
-   than a filled tile would to hold the same optical weight next to the wordmark. */
+/* Filled tile, which is the opposite of what this rule was written for: the mark it used to
+   hold was a transparent aperture and needed extra box to carry its weight. A solid green
+   square at the same 24px reads heavier than the wordmark beside it, so it gives two pixels
+   back. The radius is presentational and belongs here rather than in the mark — the SVG's own
+   corners are 6.7% of its box, which is right at 180px and reads as a hard square at 22. */
 .brand img {
-	width: 24px;
-	height: 24px;
+	width: 22px;
+	height: 22px;
+	border-radius: 6px;
 	object-fit: contain;
 	display: block;
 	flex-shrink: 0;

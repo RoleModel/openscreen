@@ -31,7 +31,6 @@ import {
 	type UpdateOutcome,
 } from "./auto-updater";
 import { parseCliArgs } from "./cli/args";
-import { startStudio } from "./studio/server";
 import { runCli } from "./cli/cliMain";
 import { isDiagnosticModeEnabled, mainLogBuffer } from "./diagnostics/main-log-buffer";
 import { buildEditMenuSubmenu, type EditorUndoRedoChannel, routeEditorUndoRedo } from "./edit-menu";
@@ -45,6 +44,7 @@ import { getInstallChannel, offersUpdateCheck, platformOwnsUpdates } from "./ins
 import { getSelectedDesktopSource, registerIpcHandlers } from "./ipc/handlers";
 import { installMainProcessErrorGuards } from "./main-process-errors";
 import { registerSttIpc, shutdownStt } from "./stt";
+import { startStudio } from "./studio/server";
 import { checkLatestRelease } from "./update-checker";
 import {
 	createCountdownOverlayWindow,
@@ -56,6 +56,30 @@ import {
 } from "./windows";
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
+
+/*
+ * The name Electron reads back for everything it draws itself: the first item in
+ * the macOS menu bar, the default window title, the About panel, and the title on
+ * every dialog.
+ *
+ * Set here rather than left to resolve, because the two builds resolve it
+ * differently. Packaged, macOS reads CFBundleDisplayName out of Info.plist and
+ * gets "RoleModel Studio". Unpackaged there is no Info.plist, and it falls back
+ * to package.json's `name` — the lowercase "openscreen", which is what a run from
+ * a checkout used to put in its menu bar.
+ *
+ * What this does NOT reliably change is `app.getPath("userData")`. That is derived
+ * from the same name, but it is read at import time by modules above this line, so
+ * by the time this runs the path is already fixed: a checkout keeps writing to
+ * `.../Application Support/openscreen`. A packaged copy is the other way round —
+ * Info.plist is in place before any of our code runs, so its userData IS
+ * `.../Application Support/RoleModel Studio`, where upstream's was `.../Openscreen`.
+ *
+ * That divergence is inherited rather than introduced (upstream already had
+ * "openscreen" in dev and "Openscreen" packaged), and it is why the cask's zap
+ * lists every spelling instead of just the current one.
+ */
+app.setName(PRODUCT_NAME);
 
 // CLI mode: `openscreen export|record|info|help ...` runs headless without
 // HUD/tray/menu. Parsed before any GUI side effects; see electron/cli/.
@@ -318,7 +342,7 @@ function setupApplicationMenu() {
 			submenu: [
 				{
 					role: "about",
-					label: mainT("common", "actions.about") || "About OpenScreen",
+					label: mainT("common", "actions.about") || `About ${PRODUCT_NAME}`,
 				},
 				// Omitted entirely — here, in the Help menu and in the tray — where a package
 				// manager owns the update. See `canOfferUpdateCheck`.
@@ -339,7 +363,7 @@ function setupApplicationMenu() {
 				{ type: "separator" },
 				{
 					role: "hide",
-					label: mainT("common", "actions.hide") || "Hide OpenScreen",
+					label: mainT("common", "actions.hide") || `Hide ${PRODUCT_NAME}`,
 				},
 				{
 					role: "hideOthers",
@@ -475,7 +499,7 @@ function setupApplicationMenu() {
 						]
 					: []),
 				{
-					label: mainT("common", "actions.about") || "About OpenScreen",
+					label: mainT("common", "actions.about") || `About ${PRODUCT_NAME}`,
 					click: runAboutDialog,
 				},
 			],
@@ -599,7 +623,7 @@ async function presentAboutDialog() {
 	const heading = `${PRODUCT_NAME} ${facts.version}`;
 	const choice = await showMessageBox({
 		type: "info",
-		title: mainT("common", "actions.about") || "About OpenScreen",
+		title: mainT("common", "actions.about") || `About ${PRODUCT_NAME}`,
 		message: heading,
 		detail,
 		buttons: [
@@ -833,10 +857,10 @@ function updateTrayMenu(recording: boolean = false) {
 				isMac
 					? {
 							role: "about" as const,
-							label: mainT("common", "actions.about") || "About OpenScreen",
+							label: mainT("common", "actions.about") || `About ${PRODUCT_NAME}`,
 						}
 					: {
-							label: mainT("common", "actions.about") || "About OpenScreen",
+							label: mainT("common", "actions.about") || `About ${PRODUCT_NAME}`,
 							click: runAboutDialog,
 						},
 				{ type: "separator" as const },

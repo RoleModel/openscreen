@@ -147,10 +147,25 @@
       }
     ],
     "extendInfo": {
-      "NSAudioCaptureUsageDescription": "OpenScreen needs audio capture permission to record system audio.",
-      "NSMicrophoneUsageDescription": "OpenScreen needs microphone access to record voice audio.",
-      "NSCameraUsageDescription": "OpenScreen needs camera access to record webcam video.",
-      "NSScreenCaptureUsageDescription": "OpenScreen needs screen recording permission to detect and capture windows.",
+      // The name a person reads, which is NOT the name on disk.
+      //
+      // `productName` above stays "Openscreen" on purpose: it names the bundle
+      // (`Openscreen.app`), the DMG that build.yml renames, the `app` stanza in the
+      // cask, and the path the `openscreen` shim execs. Renaming it would break all
+      // four for a string, so the display name is set here instead — macOS reads
+      // CFBundleDisplayName in Finder, the Dock, the About panel and every
+      // permission prompt, and CFBundleName in the menu bar.
+      //
+      // `app.setName()` in electron/main.ts sets the same string for an unpackaged
+      // run, where there is no Info.plist to read.
+      "CFBundleDisplayName": "RoleModel Studio",
+      "CFBundleName": "RoleModel Studio",
+      // These are quoted verbatim in the macOS permission dialogs, so they say the
+      // name of the app the person is being asked about.
+      "NSAudioCaptureUsageDescription": "RoleModel Studio needs audio capture permission to record system audio.",
+      "NSMicrophoneUsageDescription": "RoleModel Studio needs microphone access to record voice audio.",
+      "NSCameraUsageDescription": "RoleModel Studio needs camera access to record webcam video.",
+      "NSScreenCaptureUsageDescription": "RoleModel Studio needs screen recording permission to detect and capture windows.",
       "NSCameraUseContinuityCameraDeviceType": true
     }
   },

@@ -8,11 +8,25 @@
 
 import type { InstallChannel } from "./install-channel";
 
-export const WEBSITE_URL = "https://getopenscreen.com";
-/** The brand spelling, for the surfaces we render ourselves. NOT `app.name`: that resolves to
- *  electron-builder's `productName` ("Openscreen") when packaged and to package.json's `name`
- *  ("openscreen") in dev, so the About box would disagree with its own title bar. */
-export const PRODUCT_NAME = "OpenScreen";
+export const WEBSITE_URL = "https://rolemodelsoftware.com";
+/** Where the code came from. Shown beside our own URL rather than replacing it: this is a
+ *  fork, the MIT notice below names the people whose work it is, and a bug that belongs
+ *  upstream should be reportable by someone reading the About box. */
+export const UPSTREAM_NAME = "OpenScreen";
+export const UPSTREAM_URL = "https://getopenscreen.com";
+/** The brand spelling, for the surfaces we render ourselves — every window title, dialog and
+ *  About panel in electron/main.ts, and the wordmark in the editor's top bar.
+ *
+ *  NOT `app.name` as it comes from the build: that resolves to electron-builder's `productName`
+ *  ("Openscreen", which names the bundle on disk and must keep doing so) when packaged, and to
+ *  package.json's `name` ("openscreen") in dev — so the About box would disagree with its own
+ *  title bar. main.ts calls `app.setName()` with this instead, which makes the two agree and
+ *  gives an unpackaged run the same name as a packaged one, where CFBundleDisplayName in
+ *  electron-builder.json5 supplies it.
+ *
+ *  The bundle keeps upstream's name and this does not, deliberately: a filename is a contract
+ *  with the cask and the shim, and a name in a menu bar is a contract with a person. */
+export const PRODUCT_NAME = "RoleModel Studio";
 /** The collective form, and deliberately NOT the whole of LICENSE. LICENSE carries two holders:
  *  Siddharth Vaddem, who created the project — MIT obliges us to keep that notice on a codebase
  *  that still contains his code — and the contributors collectively. This is the line every user
@@ -57,5 +71,8 @@ export function formatAboutDetail(facts: AboutFacts): string {
 		`Electron ${facts.electron} · Chromium ${facts.chrome} · Node ${facts.node}`,
 		`${facts.platform} ${facts.arch} · ${facts.channel}`,
 		WEBSITE_URL,
+		// The attribution line. A fork that renames the app and shows only its own URL
+		// leaves a user with no way to find out what they are actually running.
+		`A RoleModel Software build of ${UPSTREAM_NAME} · ${UPSTREAM_URL}`,
 	].join("\n");
 }

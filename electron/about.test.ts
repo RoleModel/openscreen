@@ -4,6 +4,9 @@ import {
 	type AboutFacts,
 	COPYRIGHT,
 	formatAboutDetail,
+	PRODUCT_NAME,
+	UPSTREAM_NAME,
+	UPSTREAM_URL,
 	usesNativeAboutPanel,
 	WEBSITE_URL,
 } from "./about";
@@ -28,6 +31,7 @@ describe("formatAboutDetail", () => {
 				"Electron 41.2.1 · Chromium 138.0.7204.100 · Node 22.22.1",
 				"darwin arm64 · dmg",
 				WEBSITE_URL,
+				`A RoleModel Software build of ${UPSTREAM_NAME} · ${UPSTREAM_URL}`,
 			].join("\n"),
 		);
 	});
@@ -47,6 +51,41 @@ describe("formatAboutDetail", () => {
 		expect(
 			formatAboutDetail(facts({ platform: "linux", arch: "x64", channel: "appimage" })),
 		).toContain("linux x64 · appimage");
+	});
+});
+
+// The display name now lives in three files, because three different readers need it: this
+// module for every surface Electron draws itself, CFBundleDisplayName for Finder, the Dock and
+// the permission prompts, and CFBundleName for the menu bar. Nothing at runtime compares them,
+// so drift would show up as an app called one thing in its menu bar and another in its About
+// box — which is exactly what the name was changed to stop.
+//
+// `productName` is deliberately NOT in this set: it names the bundle on disk, which the cask's
+// `app` stanza and the `openscreen` shim both depend on, and it stays upstream's.
+describe("PRODUCT_NAME", () => {
+	const config = () => readFileSync(new URL("../electron-builder.json5", import.meta.url), "utf8");
+	const key = (name: string) => config().match(new RegExp(`"${name}"\\s*:\\s*"([^"]*)"`))?.[1];
+
+	it("matches the display name macOS reads out of Info.plist", () => {
+		expect(key("CFBundleDisplayName")).toBe(PRODUCT_NAME);
+		expect(key("CFBundleName")).toBe(PRODUCT_NAME);
+	});
+
+	it("leaves the bundle on disk named upstream's, which the cask and the shim resolve", () => {
+		expect(key("productName")).toBe("Openscreen");
+	});
+
+	// A permission dialog quotes its usage string verbatim, so one naming the old app is a
+	// prompt about a program the person has never heard of.
+	it("names this app in every permission prompt", () => {
+		for (const k of [
+			"NSAudioCaptureUsageDescription",
+			"NSMicrophoneUsageDescription",
+			"NSCameraUsageDescription",
+			"NSScreenCaptureUsageDescription",
+		]) {
+			expect(key(k)).toContain(PRODUCT_NAME);
+		}
 	});
 });
 

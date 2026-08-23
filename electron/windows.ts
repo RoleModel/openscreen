@@ -1,6 +1,7 @@
 import path from "node:path";
 import { fileURLToPath, pathToFileURL } from "node:url";
 import { BrowserWindow, ipcMain, screen } from "electron";
+import { PRODUCT_NAME } from "./about";
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 
@@ -412,7 +413,7 @@ export function createEditorWindow(query: Record<string, string> = {}): BrowserW
 		resizable: true,
 		alwaysOnTop: false,
 		skipTaskbar: false,
-		title: "OpenScreen",
+		title: PRODUCT_NAME,
 		backgroundColor: "#09090b",
 		show: false, // shown via ready-to-show to avoid white flash on first load
 		webPreferences: {
@@ -485,7 +486,7 @@ export function createEditorWindow(query: Record<string, string> = {}): BrowserW
  * giving a local web server the run of the machine. This one exposes two calls.
  */
 export function createStudioWindow(url: string): BrowserWindow {
-		const win = new BrowserWindow({
+	const win = new BrowserWindow({
 		width: 1400,
 		height: 940,
 		minWidth: 960,
@@ -664,7 +665,7 @@ export function createNotesWindow(): BrowserWindow {
 		minHeight: 400,
 		maxWidth: 640,
 		maxHeight: 720,
-		title: "OpenScreen - Notes",
+		title: `${PRODUCT_NAME} — Notes`,
 		backgroundColor: "#09090b",
 		resizable: true,
 		alwaysOnTop: true,

@@ -1,0 +1,11 @@
+<!-- The RoleModel mark: the same one the Studio shows in its sidebar and the same one
+     lib/make-icon.mjs in the toolkit rasterises into this app's icon, so the tab, the
+     dock and the editor's top bar cannot end up showing three different marks.
+
+     Kept in public/ rather than src/assets/ because both a bundled component and
+     index.html reference it, and public/ is the one location both can name with the
+     same string. width/height are deliberately absent: every caller sizes it. -->
+<svg viewBox="0 0 180 180" fill="none" xmlns="http://www.w3.org/2000/svg">
+  <path d="M0 12C0 5.37258 5.37258 0 12 0H168C174.627 0 180 5.37258 180 12V168C180 174.627 174.627 180 168 180H12C5.37258 180 0 174.627 0 168V12Z" fill="#00B871"/>
+  <path d="M59.2673 62.6584C59.2447 54.9604 67.5639 50.1248 74.2418 53.9543L126.694 84.0333C133.372 87.8627 133.4 97.4852 126.745 101.354L74.4695 131.739C67.8141 135.608 59.4667 130.821 59.4442 123.123L59.2673 62.6584Z" fill="white"/>
+</svg>

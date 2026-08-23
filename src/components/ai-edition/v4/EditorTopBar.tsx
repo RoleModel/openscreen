@@ -14,11 +14,18 @@ import {
 	Sun,
 } from "lucide-react";
 import { type KeyboardEvent as ReactKeyboardEvent, useEffect, useRef, useState } from "react";
-import logoMark from "@/assets/openscreen-mark.png";
 import { useI18n, useScopedT } from "@/contexts/I18nContext";
 import { useTheme } from "@/hooks/useTheme";
 import { getAvailableLocales, getLocaleName, getLocaleShort } from "@/i18n/loader";
+// The main process's brand module. It imports nothing at runtime — the one import in it is
+// `import type` — so it costs the renderer bundle a string, and the name in the top bar
+// cannot drift from the name in the title bar and the About panel.
+import { PRODUCT_NAME } from "../../../../electron/about";
 import styles from "./EditorShellV4.module.css";
+
+// From public/, not src/assets/, so index.html's favicon and this wordmark are literally the
+// same file. See public/rolemodel-mark.svg.
+const logoMark = "/rolemodel-mark.svg";
 
 export type EditorMode = "media" | "edit" | "rec";
 
@@ -389,7 +396,7 @@ function AppMenu({ actions }: { actions: TopBarActions }) {
 				{/* Decorative: the wordmark beside it already names the app — and, being the
 				    button's only text, is also its accessible name. */}
 				<img src={logoMark} alt="" draggable={false} />
-				<span className={styles.name}>OpenScreen</span>
+				<span className={styles.name}>{PRODUCT_NAME}</span>
 				<ChevronDown size={13} className={styles.brandChevron} aria-hidden />
 			</button>
 			{open ? (

@@ -5,6 +5,9 @@ import { installBrowserShims } from "./native/browserShim";
 
 installBrowserShims();
 
+// See EditorTopBar.tsx: one brand module, no runtime imports, so the fallback screen
+// cannot name a different app than the title bar above it.
+import { PRODUCT_NAME } from "../electron/about";
 import { CountdownOverlay } from "./components/launch/CountdownOverlay.tsx";
 import { LaunchWindow } from "./components/launch/LaunchWindow";
 import { NotesWindow } from "./components/launch/NotesWindow.tsx";
@@ -154,7 +157,7 @@ export default function App() {
 				return (
 					<div>
 						<div className="w-full h-full bg-background text-foreground">
-							<h1>Openscreen</h1>
+							<h1>{PRODUCT_NAME}</h1>
 						</div>
 					</div>
 				);

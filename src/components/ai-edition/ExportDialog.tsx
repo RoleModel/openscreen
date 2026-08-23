@@ -36,6 +36,9 @@ import { calculateMp4ExportSettings, wouldUpscale } from "@/lib/exporter/mp4Expo
 import { exportGifNative, exportMultiNative, useIsCpuCompositor } from "@/native";
 import type { CompositorClipInput } from "@/native/contracts";
 import { buildSceneDescription, resolveVisibleClips } from "@/native/sceneDescription";
+// An untitled project's export was named after the app, and the app has been renamed.
+// See EditorTopBar.tsx for why the constant comes from the main process's module.
+import { PRODUCT_NAME } from "../../../electron/about";
 import { ModalShell } from "./Modals";
 import styles from "./NewEditorShell.module.css";
 
@@ -249,7 +252,7 @@ export function ExportDialog({ open, onClose, document }: ExportDialogProps) {
 			return;
 		}
 
-		const safeName = (document.project.title || "OpenScreen")
+		const safeName = (document.project.title || PRODUCT_NAME)
 			.replace(/[^a-z0-9-_]+/gi, "_")
 			.replace(/^_+|_+$/g, "")
 			.slice(0, 60);
