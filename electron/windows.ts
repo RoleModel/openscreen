@@ -545,8 +545,25 @@ export function createStudioWindow(url: string): BrowserWindow {
 		const inset = process.platform === "darwin" ? "72px" : "0px";
 		win.webContents
 			.insertCSS(
-				`html, body { background: #141415 !important; }
-				 .op-page__main-header { -webkit-app-region: drag; }
+				/*
+				 * No `html, body { background: … !important }` here.
+				 *
+				 * It was belt-and-braces against a white flash, and the window's own
+				 * `backgroundColor: "#141415"` above already does that — it is painted
+				 * before the page exists, which is earlier than any injected rule can
+				 * manage anyway.
+				 *
+				 * What it also did was reset the page's background-image. `background`
+				 * is a shorthand, so with !important it wiped the Studio's grid and any
+				 * future page texture, and nothing in a stylesheet can outrank it.
+				 * Injected on dom-ready, it landed after first paint: the grid appeared
+				 * and then vanished, which reads as the page fighting itself. Two days
+				 * were spent looking for the override inside the page, where it was not.
+				 *
+				 * The drag region below is the only thing that genuinely belongs to the
+				 * host: it is about the window frame, and it is inert in a browser.
+				 */
+				`.op-page__main-header { -webkit-app-region: drag; }
 				 .op-page__main-header button,
 				 .op-page__main-header a,
 				 .op-page__main-header input { -webkit-app-region: no-drag; }
