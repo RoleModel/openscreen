@@ -75,11 +75,29 @@ console.log(`  app     ${ROOT}`);
 console.log(`  studio  ${studio ?? "not found — the Studio window will report why"}`);
 console.log("");
 
+const startedAt = Date.now();
 const child = spawn(electron, [".", ...process.argv.slice(2)], { cwd: ROOT, env, stdio: "inherit" });
 child.on("exit", (code, signal) => {
-	// A second instance hands its argv to the first and quits immediately, which
-	// looks like a crash if nobody says so.
-	if (code === 0 && !signal) console.log("\n  app exited\n");
+	/*
+	 * A second instance is not a crash, and it used to look exactly like one.
+	 *
+	 * main.ts takes a single-instance lock. A second copy hands its argv to the one
+	 * already running and exits 0 immediately, so the whole visible result was the
+	 * word "exited" a moment after you asked for it — reported as "the app keeps
+	 * starting and then stopping", which is a fair reading of what it looked like.
+	 *
+	 * Under two seconds with a clean exit is that handoff, near enough. Anything
+	 * slower was a real session, however short.
+	 */
+	const quick = Date.now() - startedAt < 2000;
+	if (code === 0 && !signal && quick) {
+		console.log("\n  another copy is already running — this one handed over to it and quit.");
+		console.log("  That is the single-instance lock, not a crash.\n");
+		console.log("  Look for the window it already has, or stop it first:");
+		console.log("    pkill -f 'Electron \\.'\n");
+	} else if (code === 0 && !signal) {
+		console.log("\n  app exited\n");
+	}
 	process.exit(code ?? 1);
 });
 child.on("error", (err) => die(`could not start Electron: ${err.message}`));
