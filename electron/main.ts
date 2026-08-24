@@ -1383,6 +1383,36 @@ appReady?.then(async () => {
 			? studioWindow
 			: null;
 
+	/**
+	 * Put text on the clipboard for the Studio page.
+	 *
+	 * `navigator.clipboard.writeText` cannot work here. This app installs a strict
+	 * permission allowlist — media and capture only — so the Clipboard API is denied
+	 * for every page it loads, and the call rejects with "Write permission denied".
+	 * Adding `clipboard-sanitized-write` to that allowlist would hand clipboard
+	 * writes to any page the local HTTP server ever serves, which is the thing the
+	 * two-call studio preload exists to avoid; and it would still leave the API
+	 * needing document focus and an unspent user activation, neither of which
+	 * survives the `await` a page makes while it resolves what to copy.
+	 *
+	 * Electron's own clipboard has none of those constraints. Sender-checked like
+	 * every other studio channel, so only the Studio window can reach it.
+	 */
+	const CLIPBOARD_LIMIT = 64 * 1024;
+	ipcMain.handle("studio:copy-text", (event, value: unknown) => {
+		if (!fromStudio(event)) return { ok: false, error: "only the Studio window can copy" };
+		if (typeof value !== "string") return { ok: false, error: "not text" };
+		// A share link is ~120 characters. The cap is here so a bug on the page cannot
+		// push an unbounded string across the bridge, not because anything needs 64KB.
+		if (value.length > CLIPBOARD_LIMIT) return { ok: false, error: "too long to copy" };
+		try {
+			clipboard.writeText(value);
+			return { ok: true };
+		} catch (err) {
+			return { ok: false, error: err instanceof Error ? err.message : String(err) };
+		}
+	});
+
 	ipcMain.handle("studio:mount-editor", (event, value: unknown) => {
 		const win = fromStudio(event);
 		const rect = rectFrom(value);

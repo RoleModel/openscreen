@@ -27,6 +27,19 @@ contextBridge.exposeInMainWorld("rmStudio", {
 	showEditor: (): Promise<void> => ipcRenderer.invoke("studio:show-editor"),
 
 	/*
+	 * Put text on the clipboard.
+	 *
+	 * Here because `navigator.clipboard` cannot work in this app: the permission
+	 * allowlist in main.ts is media and capture only, so the Clipboard API is denied
+	 * for every page and rejects with "Write permission denied". It would also need
+	 * document focus and an unspent user activation even if it were allowed, and a
+	 * page that fetches the thing it is about to copy has spent the activation by
+	 * the time it has the value. See the handler for the whole reasoning.
+	 */
+	copyText: (text: string): Promise<{ ok: boolean; error?: string }> =>
+		ipcRenderer.invoke("studio:copy-text", text),
+
+	/*
 	 * The editor as a view inside this window, rather than a window of its own.
 	 *
 	 * The page passes the rect of its own content area, because it is the only side
