@@ -40,6 +40,22 @@ contextBridge.exposeInMainWorld("rmStudio", {
 	layoutEditor: (rect: EditorRect): Promise<Mounted> =>
 		ipcRenderer.invoke("studio:layout-editor", rect),
 	unmountEditor: (): Promise<Mounted> => ipcRenderer.invoke("studio:unmount-editor"),
+
+	/*
+	 * The host asking for the Editor view. Main to page, one way.
+	 *
+	 * The recording HUD's "switch to editor" has to land in this window rather than
+	 * open another one, and the host cannot do that on its own: showing the editor
+	 * means changing this page's navigation, which only this page defines. So it is
+	 * told to, and it decides what that means.
+	 *
+	 * Returns its own unsubscribe, like every other listener the app exposes.
+	 */
+	onShowEditor: (callback: () => void): (() => void) => {
+		const listener = () => callback();
+		ipcRenderer.on("studio:show-editor-view", listener);
+		return () => ipcRenderer.removeListener("studio:show-editor-view", listener);
+	},
 });
 
 interface EditorRect {

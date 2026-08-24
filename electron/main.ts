@@ -936,6 +936,43 @@ function forceCloseEditorWindow(windowToClose: BrowserWindow | null) {
 	});
 }
 
+/**
+ * Where "go to the editor" lands.
+ *
+ * The recording HUD's toolbar called `createEditorWindowWrapper` straight, which
+ * opens a window of its own — the exact thing the embedded editor exists to avoid.
+ * Recording and then switching to the editor is the ordinary way into the editor,
+ * so it was also the ordinary way to end up with a second window and no Studio
+ * navigation, whatever `openProjectPath` did for documents opened any other way.
+ *
+ * The Studio wins when there is one: it comes forward and is asked to put its
+ * Editor view up, which is what mounts the embedded view. The page decides that,
+ * not this function — it is the only side that knows what its own navigation is.
+ * With no Studio open there is nothing to embed into, and a standalone editor
+ * window is still correct.
+ */
+function openEditorSurface() {
+	if (!studioWindow || studioWindow.isDestroyed()) {
+		createEditorWindowWrapper();
+		return;
+	}
+	/*
+	 * The HUD has to go. It is a separate always-on-top window, and nothing else
+	 * closes it once the editor is somewhere it cannot see — it would sit over the
+	 * Studio. This is the same force-close `createEditorWindowWrapper` does, for
+	 * the same reason, minus the window it would then open.
+	 */
+	if (mainWindow && !mainWindow.isDestroyed()) {
+		isForceClosing = true;
+		mainWindow.close();
+		isForceClosing = false;
+		mainWindow = null;
+	}
+	studioWindow.show();
+	studioWindow.focus();
+	studioWindow.webContents.send("studio:show-editor-view");
+}
+
 function createEditorWindowWrapper() {
 	if (mainWindow) {
 		isForceClosing = true;
@@ -1254,7 +1291,7 @@ appReady?.then(async () => {
 	}
 
 	registerIpcHandlers(
-		createEditorWindowWrapper,
+		openEditorSurface,
 		createSourceSelectorWindowWrapper,
 		createCountdownOverlayWindowWrapper,
 		createNotesWindowWrapper,
