@@ -1,4 +1,5 @@
 import { describe, expect, it } from "vitest";
+import { DEFAULT_WALLPAPER } from "@/lib/wallpaper";
 import { DEFAULT_CURSOR_THEME_ID } from "@/lib/cursor/cursorThemes";
 import {
 	createProjectData,
@@ -267,6 +268,9 @@ describe("wallpaper legacy normalization", () => {
 		const normalized = normalizeProjectEditor({
 			wallpaper: "file:///opt/Openscreen/resources/wallpapers/wallpaper99.jpg",
 		});
-		expect(normalized.wallpaper).toBe("/wallpapers/wallpaper1.jpg");
+		// The default, whatever it is. This is a test about falling back, and
+		// hardcoding wallpaper1.jpg made it a test about the stock run — which stopped
+		// being index 0 when the picker started leading with the brand set.
+		expect(normalized.wallpaper).toBe(DEFAULT_WALLPAPER);
 	});
 });

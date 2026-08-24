@@ -1,21 +1,55 @@
+import { BRAND_WALLPAPERS } from "@/lib/brandWallpapers";
 import { getAssetPath } from "@/lib/assetPath";
 
+/** The stock set, which is still a count and a naming convention. */
 export const WALLPAPER_COUNT = 18;
 
-export const WALLPAPER_PATHS: readonly string[] = Array.from(
+const STOCK_PATHS: readonly string[] = Array.from(
 	{ length: WALLPAPER_COUNT },
 	(_, i) => `/wallpapers/wallpaper${i + 1}.jpg`,
 );
+
+/*
+ * Brand wallpapers first, then the stock set.
+ *
+ * The list used to be derived entirely from WALLPAPER_COUNT, so a wallpaper that was
+ * not called `wallpaperN.jpg` did not exist as far as the picker was concerned — which
+ * is why the RoleModel set never appeared in it however many times the branding was
+ * redone. They live under /wallpapers/brand/ with their own names rather than being
+ * renumbered into the stock run: 19 upward would put them last, lose the names, and
+ * collide the moment upstream adds one.
+ *
+ * First on purpose. These are the default look for this build, and DEFAULT_WALLPAPER
+ * is still index 0 — which now means the brand board rather than a stock gradient.
+ *
+ * projectPersistence keys its canonical set off WALLPAPER_PATHS, so being in this
+ * array is also what stops a saved project's brand wallpaper being replaced by the
+ * default on load.
+ */
+export const WALLPAPER_PATHS: readonly string[] = [
+	...BRAND_WALLPAPERS.map((w) => w.path),
+	...STOCK_PATHS,
+];
 
 // Small (240x240, ~3-8KB) pre-generated copies used ONLY for the picker grid's swatches — the
 // full-res originals (up to 4+MB, up to 7680px) are what `settings.wallpaper` still stores and
 // what actually gets rendered/exported. Without this the grid was decoding all 18 originals
 // (~20MB combined) simultaneously just to paint a few dozen px each (reported: picker felt slow
 // to load).
-export const WALLPAPER_THUMB_PATHS: readonly string[] = Array.from(
-	{ length: WALLPAPER_COUNT },
-	(_, i) => `/wallpapers/thumbs/wallpaper${i + 1}.jpg`,
-);
+export const WALLPAPER_THUMB_PATHS: readonly string[] = [
+	...BRAND_WALLPAPERS.map((w) => w.thumb),
+	...Array.from({ length: WALLPAPER_COUNT }, (_, i) => `/wallpapers/thumbs/wallpaper${i + 1}.jpg`),
+];
+
+/**
+ * A label for a bundled wallpaper, or null for the stock set, which has none.
+ *
+ * The picker shows a bare grid of swatches; ours have names worth reading and a
+ * `title` is the cheapest place to put them.
+ */
+export function wallpaperLabel(path: string): string | null {
+	return BRAND_WALLPAPERS.find((w) => w.path === path)?.label ?? null;
+}
 
 export const DEFAULT_WALLPAPER = WALLPAPER_PATHS[0];
 

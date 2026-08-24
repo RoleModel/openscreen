@@ -8,15 +8,41 @@ import {
 	UnsafeImagePrefixError,
 	WALLPAPER_COUNT,
 	WALLPAPER_PATHS,
+	WALLPAPER_THUMB_PATHS,
+	wallpaperLabel,
 } from "./wallpaper";
+import { BRAND_WALLPAPERS } from "./brandWallpapers";
 
 describe("WALLPAPER_PATHS", () => {
-	it("contains WALLPAPER_COUNT entries", () => {
-		expect(WALLPAPER_PATHS).toHaveLength(WALLPAPER_COUNT);
+	// The list is the brand set followed by the stock run, not a count on its own —
+	// WALLPAPER_COUNT still describes the stock half and nothing else.
+	it("is the brand set plus the stock set", () => {
+		expect(WALLPAPER_PATHS).toHaveLength(BRAND_WALLPAPERS.length + WALLPAPER_COUNT);
+	});
+
+	it("puts the brand set first", () => {
+		expect(WALLPAPER_PATHS.slice(0, BRAND_WALLPAPERS.length)).toEqual(
+			BRAND_WALLPAPERS.map((w) => w.path),
+		);
+	});
+
+	// Being in this array is what stops projectPersistence replacing a saved brand
+	// wallpaper with the default, so every brand path has to be in it.
+	it("carries every brand path", () => {
+		for (const w of BRAND_WALLPAPERS) expect(WALLPAPER_PATHS).toContain(w.path);
+	});
+
+	it("has a thumb for every path", () => {
+		expect(WALLPAPER_THUMB_PATHS).toHaveLength(WALLPAPER_PATHS.length);
 	});
 
 	it("DEFAULT_WALLPAPER is WALLPAPER_PATHS[0]", () => {
 		expect(DEFAULT_WALLPAPER).toBe(WALLPAPER_PATHS[0]);
+	});
+
+	it("names the brand wallpapers and not the stock ones", () => {
+		expect(wallpaperLabel(BRAND_WALLPAPERS[0].path)).toBe(BRAND_WALLPAPERS[0].label);
+		expect(wallpaperLabel("/wallpapers/wallpaper1.jpg")).toBeNull();
 	});
 });
 
