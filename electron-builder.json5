@@ -1,7 +1,19 @@
 // @see - https://www.electron.build/configuration/configuration
 {
   "$schema": "https://raw.githubusercontent.com/electron-userland/electron-builder/master/packages/app-builder-lib/scheme.json",
-  "appId": "com.etiennelescot.openscreen",
+  // RoleModel's own identity, not upstream's.
+  //
+  // This was com.etiennelescot.openscreen — upstream's identifier — which meant a
+  // RoleModel build installed *as* upstream's app: macOS keys apps by this, so the
+  // two shared a Launch Services identity, a preferences domain and a saved-state
+  // directory, and you could not have both. Changing it makes this a separate app,
+  // which is why the version restarts at 0.0.1: nothing has ever shipped under this
+  // id, so there is no upgrade path to preserve.
+  //
+  // `productName` below still says Openscreen on purpose — that names the bundle on
+  // disk and is a contract with the cask's `app` stanza, the `openscreen` shim and
+  // the DMG name. What a person reads is CFBundleDisplayName, in mac.extendInfo.
+  "appId": "rolemodel.studio",
   "asar": true,
   // .node binaries can't be dlopen'd from inside an asar — must live unpacked.
   // onnxruntime-node distributes as a `.node` shared object that whisper.cpp
