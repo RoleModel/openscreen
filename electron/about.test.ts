@@ -68,7 +68,24 @@ describe("PRODUCT_NAME", () => {
 
 	it("matches the display name macOS reads out of Info.plist", () => {
 		expect(key("CFBundleDisplayName")).toBe(PRODUCT_NAME);
-		expect(key("CFBundleName")).toBe(PRODUCT_NAME);
+	});
+
+	/*
+	 * CFBundleName must NOT be set, and this is the assertion that says why.
+	 *
+	 * Electron resolves its helper apps from CFBundleName, and electron-builder names
+	 * them after `productName` — so they ship as "Openscreen Helper.app". Setting
+	 * CFBundleName to "RoleModel Studio" sent Electron looking for "RoleModel Studio
+	 * Helper.app", which does not exist, and the app aborted before drawing a window:
+	 *
+	 *   FATAL:electron_main_delegate_mac.mm:65] Unable to find helper app
+	 *
+	 * That is what made v0.0.1 unopenable. Nothing is lost by leaving it unset: the
+	 * menu bar reads PRODUCT_NAME because main.ts calls app.setName at module scope,
+	 * and everything a person actually reads comes from CFBundleDisplayName above.
+	 */
+	it("leaves CFBundleName unset, so Electron can still find its helper apps", () => {
+		expect(key("CFBundleName")).toBeUndefined();
 	});
 
 	it("leaves the bundle on disk named upstream's, which the cask and the shim resolve", () => {
