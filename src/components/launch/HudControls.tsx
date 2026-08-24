@@ -1,4 +1,5 @@
-import { Check, Languages, NotepadText, Settings } from "lucide-react";
+import { NotepadText, Settings } from "lucide-react";
+// import { Check, Languages } from "lucide-react";
 import { memo } from "react";
 import { formatTimePadded } from "../../utils/timeUtils";
 import { Button } from "../ui/button";
@@ -27,17 +28,17 @@ const hudDisabledClasses =
 	"disabled:opacity-30 disabled:cursor-not-allowed disabled:pointer-events-none";
 
 // Exact values from the design's renderVals() (comfortable density, rounded
-// shape, #10b981 accent) — btnSize 34 / btnRadius 10 / containerRadius 17
+// shape, --hud-accent) — btnSize 34 / btnRadius 10 / containerRadius 17
 // (btnRadius + padY) / dividerLen 22. Every control is its own standalone
 // transparent icon button (no shared "group" pill background) — grouping
 // reads purely from proximity + the divider spans between logical sections.
-const hudIconBtnClasses = `flex h-[34px] w-[34px] shrink-0 items-center justify-center rounded-[10px] border-0 bg-transparent cursor-pointer text-[#828c99] transition-all duration-150 hover:bg-[#1a1e25] hover:text-[#f5f7fa] active:scale-95 ${hudDisabledClasses} ${styles.electronNoDrag}`;
+const hudIconBtnClasses = `flex h-[34px] w-[34px] shrink-0 items-center justify-center rounded-[10px] border-0 bg-transparent cursor-pointer text-[var(--hud-fg-idle)] transition-all duration-150 hover:bg-[var(--hud-surface-raised)] hover:text-[var(--hud-fg)] active:scale-95 ${hudDisabledClasses} ${styles.electronNoDrag}`;
 
-const hudAuxIconBtnClasses = `flex h-7 w-7 shrink-0 items-center justify-center rounded-[10px] border-0 bg-transparent cursor-pointer text-[#828c99] transition-colors duration-150 hover:bg-[#1a1e25] hover:text-[#f5f7fa] ${hudDisabledClasses}`;
+const hudAuxIconBtnClasses = `flex h-7 w-7 shrink-0 items-center justify-center rounded-[10px] border-0 bg-transparent cursor-pointer text-[var(--hud-fg-idle)] transition-colors duration-150 hover:bg-[var(--hud-surface-raised)] hover:text-[var(--hud-fg)] ${hudDisabledClasses}`;
 
-const windowBtnClasses = `flex h-[30px] w-[30px] shrink-0 items-center justify-center rounded-[9px] border-0 bg-transparent cursor-pointer text-[#828c99] transition-all duration-150 hover:bg-[#1a1e25] hover:text-[#e9edf3] ${hudDisabledClasses}`;
+const windowBtnClasses = `flex h-[30px] w-[30px] shrink-0 items-center justify-center rounded-[9px] border-0 bg-transparent cursor-pointer text-[var(--hud-fg-idle)] transition-all duration-150 hover:bg-[var(--hud-surface-raised)] hover:text-[var(--hud-fg-hi)] ${hudDisabledClasses}`;
 
-const closeBtnClasses = `flex h-[30px] w-[30px] shrink-0 items-center justify-center rounded-[9px] border-0 bg-transparent cursor-pointer text-[#828c99] transition-all duration-150 hover:bg-[rgba(248,113,113,0.16)] hover:text-[#f87171] ${hudDisabledClasses}`;
+const closeBtnClasses = `flex h-[30px] w-[30px] shrink-0 items-center justify-center rounded-[9px] border-0 bg-transparent cursor-pointer text-[var(--hud-fg-idle)] transition-all duration-150 hover:bg-[var(--hud-danger-wash)] hover:text-[var(--hud-danger)] ${hudDisabledClasses}`;
 
 export const HudDivider = memo(function HudDivider({ vertical }: { vertical: boolean }) {
 	return (
@@ -85,7 +86,7 @@ export const HudDragHandle = memo(function HudDragHandle({
 			onPointerUp={onPointerEnd}
 			onPointerCancel={onPointerEnd}
 		>
-			{getIcon("drag", "text-[#333a45]")}
+			{getIcon("drag", "text-[var(--hud-border-hi)]")}
 		</div>
 	);
 });
@@ -129,7 +130,7 @@ export const HudSourceButton = memo(function HudSourceButton({
 	return (
 		<button
 			data-testid="launch-source-selector-button"
-			className={`flex h-[34px] shrink-0 items-center gap-[7px] rounded-[10px] border-0 bg-transparent text-[#f5f7fa] transition-all duration-150 hover:bg-[#1a1e25] active:scale-[0.97] ${hudDisabledClasses} ${
+			className={`flex h-[34px] shrink-0 items-center gap-[7px] rounded-[10px] border-0 bg-transparent text-[var(--hud-fg)] transition-all duration-150 hover:bg-[var(--hud-surface-raised)] active:scale-[0.97] ${hudDisabledClasses} ${
 				vertical ? "w-[34px] justify-center px-0" : "pr-3 pl-2.5"
 			} ${styles.electronNoDrag}`}
 			onClick={onClick}
@@ -164,7 +165,7 @@ export const HudSystemAudioButton = memo(function HudSystemAudioButton({
 			disabled={disabled}
 			title={label}
 		>
-			<VolumeIcon muted={!enabled} className={enabled ? "text-[#10b981]" : ""} />
+			<VolumeIcon muted={!enabled} className={enabled ? "text-[var(--hud-accent)]" : ""} />
 		</button>
 	);
 });
@@ -189,7 +190,7 @@ export const HudMicButton = memo(function HudMicButton({
 			disabled={disabled}
 			title={label}
 		>
-			<MicIcon muted={!enabled} className={enabled ? "text-[#10b981]" : ""} />
+			<MicIcon muted={!enabled} className={enabled ? "text-[var(--hud-accent)]" : ""} />
 		</button>
 	);
 });
@@ -214,7 +215,7 @@ export const HudCameraButton = memo(function HudCameraButton({
 			disabled={disabled}
 			title={label}
 		>
-			<CameraIcon off={!enabled} className={enabled ? "text-[#10b981]" : ""} />
+			<CameraIcon off={!enabled} className={enabled ? "text-[var(--hud-accent)]" : ""} />
 		</button>
 	);
 });
@@ -243,7 +244,7 @@ export const HudSettingsButton = memo(function HudSettingsButton({
 				aria-haspopup="dialog"
 				// Dimmer at rest than the toggles it configures, so it reads as their
 				// accessory rather than a fourth peer control.
-				className={`${hudIconBtnClasses} text-[#5c6672] ${disabled ? "opacity-30 cursor-not-allowed pointer-events-none" : ""}`}
+				className={`${hudIconBtnClasses} text-[var(--hud-fg-dim)] ${disabled ? "opacity-30 cursor-not-allowed pointer-events-none" : ""}`}
 				onClick={onClick}
 				disabled={disabled}
 			>
@@ -269,8 +270,8 @@ export const HudCursorButton = memo(function HudCursorButton({
 			data-testid="launch-cursor-mode-button"
 			className={`flex h-[34px] w-[34px] shrink-0 items-center justify-center rounded-[10px] border-0 cursor-pointer transition-all duration-150 active:scale-95 ${hudDisabledClasses} ${styles.electronNoDrag} ${
 				editableOverlay
-					? "bg-[#10b981] text-[#08090d] hover:bg-[#0e9e6e]"
-					: "bg-transparent text-[#828c99] hover:bg-[#1a1e25] hover:text-[#f5f7fa]"
+					? "bg-[var(--hud-accent)] text-[var(--hud-accent-on)] hover:bg-[var(--hud-accent-hover)]"
+					: "bg-transparent text-[var(--hud-fg-idle)] hover:bg-[var(--hud-surface-raised)] hover:text-[var(--hud-fg)]"
 			}`}
 			onClick={onClick}
 			disabled={disabled}
@@ -306,7 +307,7 @@ export const HudRecordButton = memo(function HudRecordButton({
 				className={`flex h-[34px] shrink-0 items-center justify-center rounded-[17px] border-0 transition-all duration-150 ${recording || saving ? "min-w-[78px] px-3" : "w-[34px]"} ${styles.electronNoDrag} ${
 					saving
 						? "bg-transparent opacity-60 cursor-not-allowed"
-						: "bg-transparent hover:bg-[rgba(248,113,113,0.16)]"
+						: "bg-transparent hover:bg-[var(--hud-danger-wash)]"
 				}`}
 				onClick={onClick}
 				title={label}
@@ -316,20 +317,22 @@ export const HudRecordButton = memo(function HudRecordButton({
 				<div className={`flex items-center justify-center ${recording || saving ? "gap-1.5" : ""}`}>
 					{saving ? (
 						<div className="animate-spin flex items-center justify-center">
-							{getIcon("spinner", "text-[#f87171]")}
+							{getIcon("spinner", "text-[var(--hud-danger)]")}
 						</div>
 					) : (
 						<RecordGlyph
 							recording={recording}
-							className={paused ? "text-amber-400" : "text-[#f87171]"}
+							className={paused ? "text-amber-400" : "text-[var(--hud-danger)]"}
 						/>
 					)}
 					{saving && (
-						<span className="text-[#f87171] text-xs font-semibold select-none">{savingLabel}</span>
+						<span className="text-[var(--hud-danger)] text-xs font-semibold select-none">
+							{savingLabel}
+						</span>
 					)}
 					{recording && (
 						<span
-							className={`${paused ? "text-amber-400" : "text-[#f87171]"} inline-block w-[34px] text-left text-xs font-semibold tabular-nums`}
+							className={`${paused ? "text-amber-400" : "text-[var(--hud-danger)]"} inline-block w-[34px] text-left text-xs font-semibold tabular-nums`}
 						>
 							{formatTimePadded(elapsedSeconds)}
 						</span>
@@ -435,46 +438,46 @@ export const HudRecordingControls = memo(function HudRecordingControls({
 	);
 });
 
-export const HudLanguageButton = memo(function HudLanguageButton({
-	vertical,
-	code,
-	label,
-	disabled,
-	expanded,
-	onClick,
-	buttonRef,
-}: {
-	vertical: boolean;
-	code: string;
-	label: string;
-	disabled: boolean;
-	expanded: boolean;
-	onClick: () => void;
-	buttonRef: React.MutableRefObject<HTMLButtonElement | null>;
-}) {
-	return (
-		<button
-			ref={buttonRef}
-			type="button"
-			aria-label={label}
-			aria-expanded={expanded}
-			aria-haspopup="menu"
-			disabled={disabled}
-			onClick={onClick}
-			title={label}
-			className={`flex h-[34px] items-center rounded-[10px] border-0 bg-transparent text-[#828c99] transition-all duration-150 hover:bg-[#1a1e25] hover:text-[#e9edf3] ${
-				vertical ? "w-[34px] justify-center px-0" : "gap-1.5 px-2.5"
-			} ${styles.electronNoDrag} ${disabled ? "opacity-30 cursor-not-allowed pointer-events-none" : ""}`}
-		>
-			<Languages size={16} className="shrink-0" />
-			<span
-				className={`${vertical ? "sr-only" : ""} font-mono text-[11px] font-semibold tracking-wide text-[#f5f7fa]`}
-			>
-				{code}
-			</span>
-		</button>
-	);
-});
+// export const HudLanguageButton = memo(function HudLanguageButton({
+// 	vertical,
+// 	code,
+// 	label,
+// 	disabled,
+// 	expanded,
+// 	onClick,
+// 	buttonRef,
+// }: {
+// 	vertical: boolean;
+// 	code: string;
+// 	label: string;
+// 	disabled: boolean;
+// 	expanded: boolean;
+// 	onClick: () => void;
+// 	buttonRef: React.MutableRefObject<HTMLButtonElement | null>;
+// }) {
+// 	return (
+// 		<button
+// 			ref={buttonRef}
+// 			type="button"
+// 			aria-label={label}
+// 			aria-expanded={expanded}
+// 			aria-haspopup="menu"
+// 			disabled={disabled}
+// 			onClick={onClick}
+// 			title={label}
+// 			className={`flex h-[34px] items-center rounded-[10px] border-0 bg-transparent text-[var(--hud-fg-idle)] transition-all duration-150 hover:bg-[var(--hud-surface-raised)] hover:text-[var(--hud-fg-hi)] ${
+// 				vertical ? "w-[34px] justify-center px-0" : "gap-1.5 px-2.5"
+// 			} ${styles.electronNoDrag} ${disabled ? "opacity-30 cursor-not-allowed pointer-events-none" : ""}`}
+// 		>
+// 			<Languages size={16} className="shrink-0" />
+// 			<span
+// 				className={`${vertical ? "sr-only" : ""} font-mono text-[11px] font-semibold tracking-wide text-[var(--hud-fg)]`}
+// 			>
+// 				{code}
+// 			</span>
+// 		</button>
+// 	);
+// });
 
 export const HudWindowControls = memo(function HudWindowControls({
 	vertical,
@@ -503,51 +506,51 @@ export const HudWindowControls = memo(function HudWindowControls({
 	);
 });
 
-export const HudLanguageMenu = memo(function HudLanguageMenu({
-	locales,
-	activeLocale,
-	getName,
-	onSelect,
-	panelRef,
-	onEnsureInteractive,
-}: {
-	locales: readonly string[];
-	activeLocale: string;
-	getName: (locale: string) => string;
-	onSelect: (locale: string) => void;
-	panelRef: (el: HTMLDivElement | null) => void;
-	onEnsureInteractive: () => void;
-}) {
-	return (
-		<div
-			ref={panelRef}
-			data-hud-interactive="true"
-			data-testid="hud-language-menu"
-			role="menu"
-			className={`${styles.hudPopover} ${styles.hudPopoverScroll} ${styles.hudScrollbar} animate-mic-panel-in ${styles.electronNoDrag}`}
-			onPointerDown={(event) => event.stopPropagation()}
-			onPointerEnter={onEnsureInteractive}
-			onWheel={(event) => {
-				onEnsureInteractive();
-				event.stopPropagation();
-			}}
-		>
-			{locales.map((loc) => (
-				<button
-					key={loc}
-					type="button"
-					role="menuitemradio"
-					aria-checked={loc === activeLocale}
-					onClick={() => onSelect(loc)}
-					className={`${styles.languageMenuItem} ${loc === activeLocale ? styles.languageMenuItemActive : ""}`}
-				>
-					<span className="truncate">{getName(loc)}</span>
-					{loc === activeLocale ? <Check size={11} className="text-white/85" /> : null}
-				</button>
-			))}
-		</div>
-	);
-});
+// export const HudLanguageMenu = memo(function HudLanguageMenu({
+// 	locales,
+// 	activeLocale,
+// 	getName,
+// 	onSelect,
+// 	panelRef,
+// 	onEnsureInteractive,
+// }: {
+// 	locales: readonly string[];
+// 	activeLocale: string;
+// 	getName: (locale: string) => string;
+// 	onSelect: (locale: string) => void;
+// 	panelRef: (el: HTMLDivElement | null) => void;
+// 	onEnsureInteractive: () => void;
+// }) {
+// 	return (
+// 		<div
+// 			ref={panelRef}
+// 			data-hud-interactive="true"
+// 			data-testid="hud-language-menu"
+// 			role="menu"
+// 			className={`${styles.hudPopover} ${styles.hudPopoverScroll} ${styles.hudScrollbar} animate-mic-panel-in ${styles.electronNoDrag}`}
+// 			onPointerDown={(event) => event.stopPropagation()}
+// 			onPointerEnter={onEnsureInteractive}
+// 			onWheel={(event) => {
+// 				onEnsureInteractive();
+// 				event.stopPropagation();
+// 			}}
+// 		>
+// 			{locales.map((loc) => (
+// 				<button
+// 					key={loc}
+// 					type="button"
+// 					role="menuitemradio"
+// 					aria-checked={loc === activeLocale}
+// 					onClick={() => onSelect(loc)}
+// 					className={`${styles.languageMenuItem} ${loc === activeLocale ? styles.languageMenuItemActive : ""}`}
+// 				>
+// 					<span className="truncate">{getName(loc)}</span>
+// 					{loc === activeLocale ? <Check size={11} className="text-white/85" /> : null}
+// 				</button>
+// 			))}
+// 		</div>
+// 	);
+// });
 
 export const HudNotice = memo(function HudNotice({
 	title,
@@ -565,11 +568,14 @@ export const HudNotice = memo(function HudNotice({
 	onConfirm: () => void;
 }) {
 	return (
+		// --hud-surface-raised is the surface every other panel in this floating stack
+		// uses (.hudPopover / .hudModal read the same token). The notice sits beside
+		// them, and its own rgba(20,20,28,.95) read as a foreign element.
 		<div
 			data-hud-interactive="true"
-			className={`w-full rounded-xl border border-white/15 bg-[rgba(20,20,28,0.95)] p-3 shadow-2xl backdrop-blur-xl text-white animate-in fade-in-0 zoom-in-95 duration-200 ${styles.electronNoDrag}`}
+			className={`w-full rounded-xl border border-white/10 bg-[var(--hud-surface-raised)] p-3 shadow-2xl text-[var(--hud-fg)] animate-in fade-in-0 zoom-in-95 duration-200 ${styles.electronNoDrag}`}
 		>
-			<div className="text-[13px] font-semibold text-white">{title}</div>
+			<div className="text-[13px] font-semibold text-[var(--hud-fg)]">{title}</div>
 			<div className="mt-1 text-[11px] leading-relaxed text-white/75">{description}</div>
 			<div className="mt-3 flex items-center justify-end gap-2">
 				<Button
@@ -585,7 +591,7 @@ export const HudNotice = memo(function HudNotice({
 					type="button"
 					size="sm"
 					onClick={onConfirm}
-					className="h-7 text-xs bg-white text-[#10121b] hover:bg-white/90"
+					className="h-7 text-xs bg-white text-[var(--hud-accent-on)] hover:bg-white/90"
 				>
 					{confirmLabel}
 				</Button>

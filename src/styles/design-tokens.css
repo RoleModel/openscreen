@@ -335,3 +335,71 @@
 	--elev-card-soft: 0 1px 2px rgba(0, 0, 0, 0.3);
 	--elev-pop: 0 8px 24px -8px rgba(0, 0, 0, 0.6);
 }
+
+/* The recording HUD.
+ *
+ * Deliberately NOT in the two blocks above, and deliberately not reading the
+ * --op-color-*-plus-* ramp steps the rest of this file maps: those resolve
+ * through light-dark(), and the HUD is the one surface in the product that is
+ * dark in BOTH themes. It floats over whatever the user is recording, and this
+ * app's stored theme defaults to light (hooks/useTheme.ts), so a HUD wired to
+ * the ramp would come up as a white bar on a light-theme machine.
+ *
+ * So these are built from the scales' h/s SEEDS at a fixed dark lightness. That
+ * is the tinting API rolemodel-scales.css documents as its own contract — the
+ * ramps are computed from those three numbers — so changing
+ * --op-color-primary-h still re-tints every surface here, exactly as it re-tints
+ * the editor above. Only the lightness is pinned, and the values used are the
+ * neutral ramp's own dark-half steps (8/10/14/16/24%), so the HUD sits on the
+ * system's lightness ladder rather than beside it.
+ *
+ * The ladder matters and is why there are three surfaces rather than one: the bar
+ * and the panels floating above it must not resolve to the same colour, or the
+ * stack loses the elevation that separates them. */
+:root {
+	/* Surfaces, darkest first: thumbnail wells, then the camera preview and the
+	   source cards, then the bar and the selector shell, then everything that
+	   floats above the bar (popovers, the device modal, notices, hovers), then
+	   the fill of a selected tab or a disabled button. */
+	--hud-surface-well: hsl(var(--op-color-neutral-h) var(--op-color-neutral-s) 5%);
+	--hud-surface-sunken: hsl(var(--op-color-neutral-h) var(--op-color-neutral-s) 8%);
+	--hud-surface: hsl(var(--op-color-neutral-h) var(--op-color-neutral-s) 10%);
+	--hud-surface-raised: hsl(var(--op-color-neutral-h) var(--op-color-neutral-s) 14%);
+	--hud-surface-active: hsl(var(--op-color-neutral-h) var(--op-color-neutral-s) 16%);
+
+	/* `soft` is the internal divider between sections of one surface; the plain
+	   token is a card edge; `hi` is the outer edge of a floating window. Same
+	   soft/plain/hi ladder the editor's --border-* tokens use above. */
+	--hud-border-soft: hsl(var(--op-color-neutral-h) var(--op-color-neutral-s) 12%);
+	--hud-border: hsl(var(--op-color-neutral-h) var(--op-color-neutral-s) 16%);
+	--hud-border-hi: hsl(var(--op-color-neutral-h) var(--op-color-neutral-s) 24%);
+	--hud-border-hover: hsl(var(--op-color-neutral-h) var(--op-color-neutral-s) 28%);
+
+	/* Ink ramp on those surfaces. */
+	--hud-fg: hsl(var(--op-color-neutral-h) var(--op-color-neutral-s) 100%);
+	--hud-fg-hi: hsl(var(--op-color-neutral-h) var(--op-color-neutral-s) 88%);
+	--hud-fg-idle: hsl(var(--op-color-neutral-h) var(--op-color-neutral-s) 52%);
+	--hud-fg-dim: hsl(var(--op-color-neutral-h) var(--op-color-neutral-s) 40%);
+
+	/* Accent — the record CTA and every enabled toggle. academy-primary is
+	   RoleModel's green; seeded at hsl(157 100% 40%), which is within a couple of
+	   degrees of the #10b981 this replaced. Pinned dark-half lightness for the
+	   same reason as the surfaces, and `-on` is the ink that sits ON the green. */
+	--hud-accent: hsl(
+		var(--op-color-academy-primary-h) var(--op-color-academy-primary-s) 38%
+	);
+	--hud-accent-hover: hsl(
+		var(--op-color-academy-primary-h) var(--op-color-academy-primary-s) 34%
+	);
+	--hud-accent-on: hsl(
+		var(--op-color-academy-primary-h) var(--op-color-academy-primary-s) 14%
+	);
+
+	/* Destructive — cancel, and the close button's hover wash. The wash is built
+	   from the same seeds rather than from a resolved colour, so it re-tints with
+	   the scale instead of pinning today's red. */
+	--hud-danger: hsl(var(--op-color-alerts-danger-h) var(--op-color-alerts-danger-s) 71%);
+	--hud-danger-wash: hsl(
+		var(--op-color-alerts-danger-h) var(--op-color-alerts-danger-s) 71% / 0.16
+	);
+}

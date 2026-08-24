@@ -5,7 +5,7 @@ import {
 	FolderPlus,
 	Info,
 	Keyboard,
-	Languages,
+	// Languages,
 	Moon,
 	PanelLeft,
 	RefreshCw,
@@ -18,9 +18,10 @@ import { type KeyboardEvent as ReactKeyboardEvent, useEffect, useRef, useState }
 // which is the difference between a mark that renders and the broken-image icon a
 // packaged build showed for an absolute "/rolemodel-mark.svg" over file://.
 import logoMark from "@/assets/rolemodel-mark.svg";
-import { useI18n, useScopedT } from "@/contexts/I18nContext";
+import { useScopedT } from "@/contexts/I18nContext";
+// import { useI18n } from "@/contexts/I18nContext";
 import { useTheme } from "@/hooks/useTheme";
-import { getAvailableLocales, getLocaleName, getLocaleShort } from "@/i18n/loader";
+// import { getAvailableLocales, getLocaleName, getLocaleShort } from "@/i18n/loader";
 // The main process's brand module. It imports nothing at runtime — the one import in it is
 // `import type` — so it costs the renderer bundle a string, and the name in the top bar
 // cannot drift from the name in the title bar and the About panel.
@@ -159,7 +160,7 @@ export function EditorTopBar({
 				) : null}
 			</button>
 			<span className={styles.sep} aria-hidden />
-			<LangButton />
+			{/* <LangButton /> */}
 			{/* Both states are always rendered, stacked in one grid cell, so the slot
 			    keeps the width of the longer label and the bar doesn't twitch every
 			    time the document goes dirty. The inactive one is visibility:hidden,
@@ -478,77 +479,79 @@ function AppMenu({ actions }: { actions: TopBarActions }) {
 	);
 }
 
-function LangButton() {
-	const { locale, setLocale } = useI18n();
-	const t = useScopedT("editor");
-	const [open, setOpen] = useState(false);
-	const ref = useRef<HTMLDivElement | null>(null);
-	useEffect(() => {
-		if (!open) return;
-		const onDocClick = (e: MouseEvent) => {
-			if (ref.current && !ref.current.contains(e.target as Node)) setOpen(false);
-		};
-		document.addEventListener("mousedown", onDocClick);
-		return () => document.removeEventListener("mousedown", onDocClick);
-	}, [open]);
-	return (
-		<div ref={ref} style={{ position: "relative", flexShrink: 0 }}>
-			<button
-				type="button"
-				className={styles.iconBtn}
-				style={{ width: "auto", padding: "0 8px", gap: 6, display: "inline-flex" }}
-				onClick={() => setOpen((v) => !v)}
-				aria-label={t("topbar.changeLanguage")}
-				aria-pressed={open}
-			>
-				<Languages size={15} />
-				{/* Fixed-width, centred: the short labels run from "EN" to "PT-BR" to
-				    the CJK "简中", and letting the button size to them moved everything
-				    to its right on each language change. */}
-				<span className={styles.langShort}>{getLocaleShort(locale)}</span>
-				<ChevronDown size={9} style={{ color: "var(--muted)" }} />
-			</button>
-			{open ? (
-				<div
-					style={{
-						position: "absolute",
-						top: "calc(100% + 4px)",
-						right: 0,
-						minWidth: 160,
-						background: "var(--surface)",
-						border: "1px solid var(--border)",
-						borderRadius: "var(--r-md)",
-						boxShadow: "var(--elev-pop)",
-						padding: 4,
-						zIndex: 60,
-					}}
-				>
-					{getAvailableLocales().map((code) => (
-						<button
-							key={code}
-							type="button"
-							style={{
-								display: "block",
-								width: "100%",
-								textAlign: "left",
-								padding: "6px 10px",
-								border: 0,
-								background: code === locale ? "var(--accent-wash)" : "transparent",
-								color: code === locale ? "var(--accent)" : "var(--fg-2)",
-								borderRadius: "var(--r-sm)",
-								cursor: "pointer",
-								font: "500 12px var(--font-body)",
-							}}
-							onClick={() => {
-								setLocale(code);
-								setOpen(false);
-							}}
-						>
-							{getLocaleName(code)}
-						</button>
-					))}
-				</div>
-			) : null}
-		</div>
-	);
-}
+// The language switcher is commented out with the rest of the language UI
+// (see LaunchWindow.tsx). Kept rather than deleted so it can come back.
+// function LangButton() {
+// 	const { locale, setLocale } = useI18n();
+// 	const t = useScopedT("editor");
+// 	const [open, setOpen] = useState(false);
+// 	const ref = useRef<HTMLDivElement | null>(null);
+// 	useEffect(() => {
+// 		if (!open) return;
+// 		const onDocClick = (e: MouseEvent) => {
+// 			if (ref.current && !ref.current.contains(e.target as Node)) setOpen(false);
+// 		};
+// 		document.addEventListener("mousedown", onDocClick);
+// 		return () => document.removeEventListener("mousedown", onDocClick);
+// 	}, [open]);
+// 	return (
+// 		<div ref={ref} style={{ position: "relative", flexShrink: 0 }}>
+// 			<button
+// 				type="button"
+// 				className={styles.iconBtn}
+// 				style={{ width: "auto", padding: "0 8px", gap: 6, display: "inline-flex" }}
+// 				onClick={() => setOpen((v) => !v)}
+// 				aria-label={t("topbar.changeLanguage")}
+// 				aria-pressed={open}
+// 			>
+// 				<Languages size={15} />
+// 				{/* Fixed-width, centred: the short labels run from "EN" to "PT-BR" to
+// 				    the CJK "简中", and letting the button size to them moved everything
+// 				    to its right on each language change. */}
+// 				<span className={styles.langShort}>{getLocaleShort(locale)}</span>
+// 				<ChevronDown size={9} style={{ color: "var(--muted)" }} />
+// 			</button>
+// 			{open ? (
+// 				<div
+// 					style={{
+// 						position: "absolute",
+// 						top: "calc(100% + 4px)",
+// 						right: 0,
+// 						minWidth: 160,
+// 						background: "var(--surface)",
+// 						border: "1px solid var(--border)",
+// 						borderRadius: "var(--r-md)",
+// 						boxShadow: "var(--elev-pop)",
+// 						padding: 4,
+// 						zIndex: 60,
+// 					}}
+// 				>
+// 					{getAvailableLocales().map((code) => (
+// 						<button
+// 							key={code}
+// 							type="button"
+// 							style={{
+// 								display: "block",
+// 								width: "100%",
+// 								textAlign: "left",
+// 								padding: "6px 10px",
+// 								border: 0,
+// 								background: code === locale ? "var(--accent-wash)" : "transparent",
+// 								color: code === locale ? "var(--accent)" : "var(--fg-2)",
+// 								borderRadius: "var(--r-sm)",
+// 								cursor: "pointer",
+// 								font: "500 12px var(--font-body)",
+// 							}}
+// 							onClick={() => {
+// 								setLocale(code);
+// 								setOpen(false);
+// 							}}
+// 						>
+// 							{getLocaleName(code)}
+// 						</button>
+// 					))}
+// 				</div>
+// 			) : null}
+// 		</div>
+// 	);
+// }

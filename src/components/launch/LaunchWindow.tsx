@@ -1,6 +1,7 @@
 import { useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState } from "react";
-import { useI18n, useScopedT } from "@/contexts/I18nContext";
-import { getAvailableLocales, getLocaleName } from "@/i18n/loader";
+import { useScopedT } from "@/contexts/I18nContext";
+// import { useI18n } from "@/contexts/I18nContext";
+// import { getAvailableLocales, getLocaleName } from "@/i18n/loader";
 import { loadUserPreferences, saveUserPreferences } from "@/lib/userPreferences";
 import { nativeBridgeClient } from "@/native";
 import { type CameraDevice, useCameraDevices } from "../../hooks/useCameraDevices";
@@ -13,8 +14,8 @@ import {
 	HudCursorButton,
 	HudDivider,
 	HudDragHandle,
-	HudLanguageButton,
-	HudLanguageMenu,
+	// HudLanguageButton,
+	// HudLanguageMenu,
 	HudMicButton,
 	HudNotesButton,
 	HudNotice,
@@ -43,7 +44,7 @@ import { openSourceSelectorWithPermissionRetry } from "./openSourceSelectorFlow"
 
 // Locale list is computed once at module load; keeping the reference stable lets
 // the language menu sit behind a memo boundary.
-const AVAILABLE_LOCALES = getAvailableLocales();
+// const AVAILABLE_LOCALES = getAvailableLocales();
 
 // Used only when the renderer can't see a real display (tests, headless).
 const FALLBACK_SCREEN_HEIGHT = 1080;
@@ -65,20 +66,20 @@ export function LaunchWindow() {
 	// The update-check label is shared with the app menu and the tray, which read it from
 	// `common`. A second copy under `launch` drifted from it in en and ar before it ever shipped.
 	const tCommon = useScopedT("common");
-	const {
-		locale,
-		setLocale,
-		systemLocaleSuggestion,
-		acceptSystemLocaleSuggestion,
-		dismissSystemLocaleSuggestion,
-		resolveSystemLocaleSuggestion,
-	} = useI18n();
-	const suggestedLanguageName = systemLocaleSuggestion ? getLocaleName(systemLocaleSuggestion) : "";
-	const activeLanguageLabel = getLocaleName(locale).split(/\s+/)[0] || locale.toUpperCase();
+	// const {
+	// 	locale,
+	// 	setLocale,
+	// 	systemLocaleSuggestion,
+	// 	acceptSystemLocaleSuggestion,
+	// 	dismissSystemLocaleSuggestion,
+	// 	resolveSystemLocaleSuggestion,
+	// } = useI18n();
+	// const suggestedLanguageName = systemLocaleSuggestion ? getLocaleName(systemLocaleSuggestion) : "";
+	// const activeLanguageLabel = getLocaleName(locale).split(/\s+/)[0] || locale.toUpperCase();
 	// Short mono-font code shown on the button itself (matches the design's
 	// "EN"/"FR" treatment) — activeLanguageLabel (the full localized name)
 	// stays as the tooltip/aria-label text.
-	const languageCode = locale.split("-")[0].toUpperCase();
+	// const languageCode = locale.split("-")[0].toUpperCase();
 
 	const {
 		recording,
@@ -116,7 +117,7 @@ export function LaunchWindow() {
 	// settings panel. Overloading one button with both jobs is what made turning a
 	// camera on take two clicks.
 	const [isDeviceSettingsOpen, setIsDeviceSettingsOpen] = useState(false);
-	const [isLanguageMenuOpen, setIsLanguageMenuOpen] = useState(false);
+	// const [isLanguageMenuOpen, setIsLanguageMenuOpen] = useState(false);
 	const [trayLayout, setTrayLayout] = useState<"horizontal" | "vertical">(
 		() => loadUserPreferences().trayLayout,
 	);
@@ -138,11 +139,13 @@ export function LaunchWindow() {
 	const portalOwnsSource = usePortalOwnsSource();
 
 	const isVertical = trayLayout === "vertical";
-	const isPopoverOpen = isLanguageMenuOpen || isDeviceSettingsOpen;
+	// The device settings panel is the only floating surface left; it was one of two.
+	// const isPopoverOpen = isLanguageMenuOpen || isDeviceSettingsOpen;
+	const isPopoverOpen = isDeviceSettingsOpen;
 	const controlsLocked = recording || saving;
 
 	const settingsTriggerRef = useRef<HTMLButtonElement | null>(null);
-	const languageTriggerRef = useRef<HTMLButtonElement | null>(null);
+	// const languageTriggerRef = useRef<HTMLButtonElement | null>(null);
 	const hudAnchorRef = useRef<HTMLDivElement | null>(null);
 	const hudBarRef = useRef<HTMLDivElement | null>(null);
 	const popoverRef = useRef<HTMLDivElement | null>(null);
@@ -287,7 +290,7 @@ export function LaunchWindow() {
 	// so a single pointerdown/Escape/blur listener covers the pair instead of two.
 	const closePopovers = useCallback(() => {
 		setIsDeviceSettingsOpen(false);
-		setIsLanguageMenuOpen(false);
+		// setIsLanguageMenuOpen(false);
 	}, []);
 
 	useEffect(() => {
@@ -295,9 +298,8 @@ export function LaunchWindow() {
 
 		const handlePointerDown = (event: PointerEvent) => {
 			const target = event.target as Node;
-			const insideTrigger =
-				settingsTriggerRef.current?.contains(target) ||
-				languageTriggerRef.current?.contains(target);
+			const insideTrigger = settingsTriggerRef.current?.contains(target);
+			// || languageTriggerRef.current?.contains(target);
 			if (!insideTrigger && !popoverRef.current?.contains(target)) {
 				closePopovers();
 			}
@@ -761,7 +763,7 @@ export function LaunchWindow() {
 
 	const toggleDeviceSettings = useCallback(() => {
 		if (controlsLocked) return;
-		setIsLanguageMenuOpen(false);
+		// setIsLanguageMenuOpen(false);
 		setIsDeviceSettingsOpen((open) => !open);
 	}, [controlsLocked]);
 
@@ -769,20 +771,20 @@ export function LaunchWindow() {
 		setIsDeviceSettingsOpen(false);
 	}, []);
 
-	const toggleLanguageMenu = useCallback(() => {
-		if (saving) return;
-		setIsDeviceSettingsOpen(false);
-		setIsLanguageMenuOpen((open) => !open);
-	}, [saving]);
-
-	const handleSelectLocale = useCallback(
-		(nextLocale: string) => {
-			setLocale(nextLocale as Parameters<typeof setLocale>[0]);
-			resolveSystemLocaleSuggestion();
-			setIsLanguageMenuOpen(false);
-		},
-		[resolveSystemLocaleSuggestion, setLocale],
-	);
+	// 	const toggleLanguageMenu = useCallback(() => {
+	// 		if (saving) return;
+	// 		setIsDeviceSettingsOpen(false);
+	// 		setIsLanguageMenuOpen((open) => !open);
+	// 	}, [saving]);
+	//
+	// 	const handleSelectLocale = useCallback(
+	// 		(nextLocale: string) => {
+	// 			setLocale(nextLocale as Parameters<typeof setLocale>[0]);
+	// 			resolveSystemLocaleSuggestion();
+	// 			setIsLanguageMenuOpen(false);
+	// 		},
+	// 		[resolveSystemLocaleSuggestion, setLocale],
+	// 	);
 
 	const enableHudMouseEvents = useCallback(() => {
 		setHudMouseEventsEnabled(true);
@@ -906,7 +908,10 @@ export function LaunchWindow() {
 
 	const versionLabel = appInfo ? t("deviceSettings.version", { version: appInfo.version }) : null;
 
-	const hasNotices = Boolean(systemLocaleSuggestion) || softwareEncoderFallbackNoticeVisible;
+	// The system-language suggestion was the other notice; the encoder fallback is
+	// the only one left, so this is no longer an `||`.
+	// const hasNotices = Boolean(systemLocaleSuggestion) || softwareEncoderFallbackNoticeVisible;
+	const hasNotices = softwareEncoderFallbackNoticeVisible;
 
 	return (
 		// Avoid w-screen/h-screen: 100vw can exceed the inner layout width when scrollbars
@@ -1067,7 +1072,7 @@ export function LaunchWindow() {
 					<div
 						className={`flex items-center gap-[5px] ${isVertical ? "flex-col" : ""} ${styles.electronNoDrag}`}
 					>
-						<HudLanguageButton
+						{/* <HudLanguageButton
 							buttonRef={languageTriggerRef}
 							vertical={isVertical}
 							code={languageCode}
@@ -1077,7 +1082,7 @@ export function LaunchWindow() {
 							onClick={toggleLanguageMenu}
 						/>
 
-						<HudDivider vertical={isVertical} />
+						<HudDivider vertical={isVertical} /> */}
 
 						<HudWindowControls
 							vertical={isVertical}
@@ -1117,7 +1122,7 @@ export function LaunchWindow() {
 							/>
 						)}
 
-						{isLanguageMenuOpen && (
+						{/* {isLanguageMenuOpen && (
 							<HudLanguageMenu
 								locales={AVAILABLE_LOCALES}
 								activeLocale={locale}
@@ -1126,7 +1131,7 @@ export function LaunchWindow() {
 								panelRef={setPopoverEl}
 								onEnsureInteractive={enableHudMouseEvents}
 							/>
-						)}
+						)} */}
 
 						{hasNotices && (
 							<div
@@ -1134,7 +1139,7 @@ export function LaunchWindow() {
 								data-testid="hud-notice-column"
 								className={styles.hudNoticeColumn}
 							>
-								{systemLocaleSuggestion && (
+								{/* {systemLocaleSuggestion && (
 									<HudNotice
 										title={t("systemLanguagePrompt.title")}
 										description={t("systemLanguagePrompt.description", {
@@ -1147,7 +1152,7 @@ export function LaunchWindow() {
 										onDismiss={dismissSystemLocaleSuggestion}
 										onConfirm={acceptSystemLocaleSuggestion}
 									/>
-								)}
+								)} */}
 
 								{softwareEncoderFallbackNoticeVisible && (
 									<HudNotice

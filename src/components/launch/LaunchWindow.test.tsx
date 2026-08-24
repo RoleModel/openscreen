@@ -720,26 +720,28 @@ describe("LaunchWindow overlay sizing", () => {
 		expect(height).toBeLessThan(inflatedHeight);
 	});
 
-	it("does not resize the overlay when a popover opens", async () => {
-		renderLaunchWindow();
-
-		const bar = (await screen.findByTestId("hud-drag-handle")).closest(
-			"[data-tray-layout]",
-		) as HTMLElement;
-		stubBox(bar, 400, 56);
-		await flushResizeObservers();
-
-		const sizeMock = window.electronAPI.setHudOverlaySize as unknown as {
-			mockClear: () => void;
-		};
-		sizeMock.mockClear();
-
-		fireEvent.click(screen.getByRole("button", { name: "English" }));
-		await screen.findByTestId("hud-language-menu");
-		await flushResizeObservers();
-
-		expect(window.electronAPI.setHudOverlaySize).not.toHaveBeenCalled();
-	});
+	// The language-menu half of this pair. The assertion it made is still covered by
+	// "does not resize the overlay when the device-settings panel opens" below.
+	// it("does not resize the overlay when a popover opens", async () => {
+	// 	renderLaunchWindow();
+	//
+	// 	const bar = (await screen.findByTestId("hud-drag-handle")).closest(
+	// 		"[data-tray-layout]",
+	// 	) as HTMLElement;
+	// 	stubBox(bar, 400, 56);
+	// 	await flushResizeObservers();
+	//
+	// 	const sizeMock = window.electronAPI.setHudOverlaySize as unknown as {
+	// 		mockClear: () => void;
+	// 	};
+	// 	sizeMock.mockClear();
+	//
+	// 	fireEvent.click(screen.getByRole("button", { name: "English" }));
+	// 	await screen.findByTestId("hud-language-menu");
+	// 	await flushResizeObservers();
+	//
+	// 	expect(window.electronAPI.setHudOverlaySize).not.toHaveBeenCalled();
+	// });
 
 	it("does not resize the overlay when the device-settings panel opens", async () => {
 		renderLaunchWindow();
@@ -773,12 +775,16 @@ describe("LaunchWindow overlay sizing", () => {
 		expect(window.electronAPI.setHudOverlaySize).not.toHaveBeenCalled();
 	});
 
-	it("grows the HUD overlay tall enough to fit the system language prompt", async () => {
-		i18nState.value.systemLocaleSuggestion = "zh-CN";
+	// Was written against the system-language prompt, which is commented out with the
+	// rest of the language UI. Retargeted to the encoder-fallback notice rather than
+	// dropped: the behaviour under test is the overlay growing to fit the notice
+	// column, and that is not language-specific.
+	it("grows the HUD overlay tall enough to fit a notice", async () => {
+		recorderState.value.softwareEncoderFallbackNoticeVisible = true;
 
 		renderLaunchWindow();
 
-		expect(await screen.findByText("Use your system language?")).toBeInTheDocument();
+		expect(await screen.findByText("Switched to software encoding")).toBeInTheDocument();
 
 		const bar = (await screen.findByTestId("hud-drag-handle")).closest(
 			"[data-tray-layout]",
@@ -800,35 +806,37 @@ describe("LaunchWindow overlay sizing", () => {
 	});
 });
 
-describe("LaunchWindow language menu", () => {
-	beforeEach(() => {
-		platformState.value = "darwin";
-		resetLaunchMocks();
-	});
-
-	afterEach(() => {
-		cleanup();
-		vi.unstubAllGlobals();
-	});
-
-	it("sizes the menu from CSS instead of the overlay window's own height", async () => {
-		renderLaunchWindow();
-
-		fireEvent.click(await screen.findByRole("button", { name: "English" }));
-
-		const menu = await screen.findByTestId("hud-language-menu");
-		// A measured maxHeight/bottom is what used to truncate the list to whatever
-		// the (initially tiny) overlay window could fit, then let it grow later when
-		// the window grew for an unrelated reason -- e.g. after dragging the HUD.
-		expect(menu.style.maxHeight).toBe("");
-		expect(menu.style.bottom).toBe("");
-		// And it lives inside the HUD stack, not portaled out to the document body.
-		expect(menu.closest("[data-tray-layout]")).toBeNull();
-		expect(menu.parentElement?.parentElement).toContainElement(
-			screen.getByTestId("hud-drag-handle"),
-		);
-	});
-});
+// The language menu is commented out with the rest of the language UI
+// (see LaunchWindow.tsx). Its device-settings twin covers the same shell.
+// describe("LaunchWindow language menu", () => {
+// 	beforeEach(() => {
+// 		platformState.value = "darwin";
+// 		resetLaunchMocks();
+// 	});
+//
+// 	afterEach(() => {
+// 		cleanup();
+// 		vi.unstubAllGlobals();
+// 	});
+//
+// 	it("sizes the menu from CSS instead of the overlay window's own height", async () => {
+// 		renderLaunchWindow();
+//
+// 		fireEvent.click(await screen.findByRole("button", { name: "English" }));
+//
+// 		const menu = await screen.findByTestId("hud-language-menu");
+// 		// A measured maxHeight/bottom is what used to truncate the list to whatever
+// 		// the (initially tiny) overlay window could fit, then let it grow later when
+// 		// the window grew for an unrelated reason -- e.g. after dragging the HUD.
+// 		expect(menu.style.maxHeight).toBe("");
+// 		expect(menu.style.bottom).toBe("");
+// 		// And it lives inside the HUD stack, not portaled out to the document body.
+// 		expect(menu.closest("[data-tray-layout]")).toBeNull();
+// 		expect(menu.parentElement?.parentElement).toContainElement(
+// 			screen.getByTestId("hud-drag-handle"),
+// 		);
+// 	});
+// });
 
 describe("LaunchWindow popover dismissal", () => {
 	beforeEach(() => {
@@ -841,11 +849,11 @@ describe("LaunchWindow popover dismissal", () => {
 		vi.unstubAllGlobals();
 	});
 
-	/** Opens the language menu the way a user does, and hands back its panel. */
-	async function openLanguageMenu() {
-		fireEvent.click(await screen.findByRole("button", { name: "English" }));
-		return await screen.findByTestId("hud-language-menu");
-	}
+	// /** Opens the language menu the way a user does, and hands back its panel. */
+	// async function openLanguageMenu() {
+	// 	fireEvent.click(await screen.findByRole("button", { name: "English" }));
+	// 	return await screen.findByTestId("hud-language-menu");
+	// }
 
 	/** Same for the device-settings panel. */
 	async function openDeviceSettings() {
@@ -853,59 +861,61 @@ describe("LaunchWindow popover dismissal", () => {
 		return await screen.findByTestId("hud-device-settings");
 	}
 
-	it("closes the language menu on Escape without changing the locale", async () => {
+	// it("closes the language menu on Escape without changing the locale", async () => {
+	// renderLaunchWindow();
+	// await openLanguageMenu();
+	//
+	// fireEvent.keyDown(window, { key: "Escape" });
+	//
+	// await waitFor(() => {
+	// expect(screen.queryByTestId("hud-language-menu")).not.toBeInTheDocument();
+	// });
+	// // Escape dismisses; it must never pick whatever entry happened to be under
+	// // the cursor or focused.
+	// expect(i18nState.value.setLocale).not.toHaveBeenCalled();
+	// expect(i18nState.value.resolveSystemLocaleSuggestion).not.toHaveBeenCalled();
+	// });
+
+	// it("closes the language menu on a pointerdown outside the trigger and the panel", async () => {
+	// renderLaunchWindow();
+	// await openLanguageMenu();
+	//
+	// // The HUD window is mostly empty reserve above the bar; a press there is a
+	// // real DOM pointerdown on the root, and it has to dismiss.
+	// fireEvent.pointerDown(document.body);
+	//
+	// await waitFor(() => {
+	// expect(screen.queryByTestId("hud-language-menu")).not.toBeInTheDocument();
+	// });
+	// expect(i18nState.value.setLocale).not.toHaveBeenCalled();
+	// });
+
+	// Retargeted from the language menu, which no longer renders. A press inside an
+	// open panel must not dismiss it, and nothing else covered that.
+	it("keeps an open panel open for a pointerdown inside it", async () => {
 		renderLaunchWindow();
-		await openLanguageMenu();
+		const panel = await openDeviceSettings();
 
-		fireEvent.keyDown(window, { key: "Escape" });
+		fireEvent.pointerDown(panel);
 
-		await waitFor(() => {
-			expect(screen.queryByTestId("hud-language-menu")).not.toBeInTheDocument();
-		});
-		// Escape dismisses; it must never pick whatever entry happened to be under
-		// the cursor or focused.
-		expect(i18nState.value.setLocale).not.toHaveBeenCalled();
-		expect(i18nState.value.resolveSystemLocaleSuggestion).not.toHaveBeenCalled();
+		expect(screen.getByTestId("hud-device-settings")).toBeInTheDocument();
 	});
 
-	it("closes the language menu on a pointerdown outside the trigger and the panel", async () => {
-		renderLaunchWindow();
-		await openLanguageMenu();
-
-		// The HUD window is mostly empty reserve above the bar; a press there is a
-		// real DOM pointerdown on the root, and it has to dismiss.
-		fireEvent.pointerDown(document.body);
-
-		await waitFor(() => {
-			expect(screen.queryByTestId("hud-language-menu")).not.toBeInTheDocument();
-		});
-		expect(i18nState.value.setLocale).not.toHaveBeenCalled();
-	});
-
-	it("keeps the language menu open for a pointerdown inside the panel", async () => {
-		renderLaunchWindow();
-		const menu = await openLanguageMenu();
-
-		fireEvent.pointerDown(menu);
-
-		expect(screen.getByTestId("hud-language-menu")).toBeInTheDocument();
-	});
-
-	it("closes the language menu when the HUD window loses focus", async () => {
-		renderLaunchWindow();
-		await openLanguageMenu();
-
-		// A click that lands beyond the HUD's native window produces no pointerdown
-		// in this renderer at all — the only signal it gets is the window blur. And
-		// once focus is gone, Escape can no longer be delivered here either, so this
-		// is the one listener that can unstick that state (issue #435).
-		fireEvent.blur(window);
-
-		await waitFor(() => {
-			expect(screen.queryByTestId("hud-language-menu")).not.toBeInTheDocument();
-		});
-		expect(i18nState.value.setLocale).not.toHaveBeenCalled();
-	});
+	// it("closes the language menu when the HUD window loses focus", async () => {
+	// renderLaunchWindow();
+	// await openLanguageMenu();
+	//
+	// // A click that lands beyond the HUD's native window produces no pointerdown
+	// // in this renderer at all — the only signal it gets is the window blur. And
+	// // once focus is gone, Escape can no longer be delivered here either, so this
+	// // is the one listener that can unstick that state (issue #435).
+	// fireEvent.blur(window);
+	//
+	// await waitFor(() => {
+	// expect(screen.queryByTestId("hud-language-menu")).not.toBeInTheDocument();
+	// });
+	// expect(i18nState.value.setLocale).not.toHaveBeenCalled();
+	// });
 
 	it("closes the device-settings panel on Escape", async () => {
 		renderLaunchWindow();
@@ -942,11 +952,11 @@ describe("LaunchWindow popover dismissal", () => {
 
 	it("leaves a key that is not Escape alone", async () => {
 		renderLaunchWindow();
-		await openLanguageMenu();
+		await openDeviceSettings();
 
 		fireEvent.keyDown(window, { key: "a" });
 
-		expect(screen.getByTestId("hud-language-menu")).toBeInTheDocument();
+		expect(screen.getByTestId("hud-device-settings")).toBeInTheDocument();
 	});
 });
 
