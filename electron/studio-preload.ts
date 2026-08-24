@@ -23,6 +23,33 @@ contextBridge.exposeInMainWorld("rmStudio", {
 	openProject: (filePath: string): Promise<{ ok: boolean; error?: string }> =>
 		ipcRenderer.invoke("studio:open-project", filePath),
 
-	/** Bring the editor forward without changing what it has open. */
+	/** Bring the separate editor window forward without changing what it has open. */
 	showEditor: (): Promise<void> => ipcRenderer.invoke("studio:show-editor"),
+
+	/*
+	 * The editor as a view inside this window, rather than a window of its own.
+	 *
+	 * The page passes the rect of its own content area, because it is the only side
+	 * that knows where its navigation ends — the host would otherwise have to carry
+	 * a copy of the Studio's layout and keep it in step with the stylesheet.
+	 * Coordinates are CSS pixels relative to the window's content area, which is
+	 * what `getBoundingClientRect()` already returns.
+	 */
+	mountEditor: (rect: EditorRect): Promise<Mounted> =>
+		ipcRenderer.invoke("studio:mount-editor", rect),
+	layoutEditor: (rect: EditorRect): Promise<Mounted> =>
+		ipcRenderer.invoke("studio:layout-editor", rect),
+	unmountEditor: (): Promise<Mounted> => ipcRenderer.invoke("studio:unmount-editor"),
 });
+
+interface EditorRect {
+	x: number;
+	y: number;
+	width: number;
+	height: number;
+}
+
+interface Mounted {
+	ok: boolean;
+	error?: string;
+}

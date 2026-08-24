@@ -110,7 +110,7 @@
 		background:
 			radial-gradient(
 				circle at 18% 0%,
-				rgba(52, 178, 123, 0.08),
+				hsl(var(--primary) / 0.08),
 				transparent 30%
 			),
 			linear-gradient(180deg, #08090b 0%, #050606 100%);
@@ -195,7 +195,7 @@
 
 	.editor-inspector-shell button:focus-visible,
 	.editor-inspector-shell [role="button"]:focus-visible {
-		outline: 1px solid rgba(52, 178, 123, 0.68);
+		outline: 1px solid hsl(var(--primary) / 0.68);
 		outline-offset: 2px;
 	}
 
@@ -206,7 +206,7 @@
 	}
 
 	.editor-inspector-shell [role="slider"] {
-		box-shadow: 0 0 0 4px rgba(52, 178, 123, 0.12);
+		box-shadow: 0 0 0 4px hsl(var(--primary) / 0.12);
 	}
 
 	.editor-inspector-shell .editor-panel-section > h3 {
@@ -281,7 +281,7 @@
 	}
 
 	.custom-scrollbar::-webkit-scrollbar-thumb:hover {
-		background: rgba(52, 178, 123, 0.55);
+		background: hsl(var(--primary) / 0.55);
 		border: 3px solid transparent;
 		background-clip: content-box;
 	}
@@ -313,7 +313,7 @@
 		background: #fff;
 		transform: scale(1.15);
 		box-shadow: 0 3px 10px rgba(255, 255, 255, 0.5);
-		border-color: #34b27b;
+		border-color: hsl(var(--primary));
 	}
 
 	input[type="range"]::-webkit-slider-thumb:active {
@@ -335,7 +335,7 @@
 		background: #fff;
 		transform: scale(1.15);
 		box-shadow: 0 3px 10px rgba(255, 255, 255, 0.5);
-		border-color: #34b27b;
+		border-color: hsl(var(--primary));
 	}
 
 	input[type="range"]::-moz-range-thumb:active {

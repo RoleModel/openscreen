@@ -44,6 +44,15 @@ import { getInstallChannel, offersUpdateCheck, platformOwnsUpdates } from "./ins
 import { getSelectedDesktopSource, registerIpcHandlers } from "./ipc/handlers";
 import { installMainProcessErrorGuards } from "./main-process-errors";
 import { registerSttIpc, shutdownStt } from "./stt";
+import {
+	destroyEmbeddedEditor,
+	type EditorRect,
+	embeddedEditorAttached,
+	embeddedEditorContents,
+	layoutEmbeddedEditor,
+	mountEmbeddedEditor,
+	unmountEmbeddedEditor,
+} from "./studio/embedded-editor";
 import { startStudio } from "./studio/server";
 import { checkLatestRelease } from "./update-checker";
 import {
@@ -243,6 +252,9 @@ async function openStudio() {
 		studioWindow = createStudioWindow(studio.url);
 		studioWindow.on("closed", () => {
 			studioWindow = null;
+			// The view is parented to this window, so it goes with it. Left alive it
+			// would be a web contents nothing can reach and nothing will close.
+			destroyEmbeddedEditor();
 		});
 	} catch (err) {
 		// A missing toolkit is a setup problem with a one-line fix, so say it in a
@@ -259,6 +271,25 @@ async function openStudio() {
 }
 
 function openProjectPath(projectPath: string) {
+	/*
+	 * The embedded editor first, when it is on screen.
+	 *
+	 * This is what makes "open in the editor" stay in the Studio window instead of
+	 * spawning a second one. `pendingOpenPath` is set either way, because the view
+	 * may still be loading — the renderer collects it through
+	 * `take-pending-open-path` on mount, which is the same mechanism a handed-in
+	 * document at launch uses and for the same reason: `did-finish-load` fires
+	 * before React is listening.
+	 */
+	if (embeddedEditorAttached()) {
+		pendingOpenPath = projectPath;
+		const contents = embeddedEditorContents();
+		if (contents) contents.send("open-project-path", projectPath);
+		studioWindow?.show();
+		studioWindow?.focus();
+		return;
+	}
+
 	let targetWindow = BrowserWindow.getFocusedWindow() ?? mainWindow;
 
 	if (!targetWindow || targetWindow.isDestroyed() || !isEditorWindow(targetWindow)) {
@@ -1286,6 +1317,61 @@ appReady?.then(async () => {
 
 	ipcMain.handle("studio:show-editor", () => {
 		showMainWindow();
+	});
+
+	/*
+	 * The editor as a view inside the Studio window.
+	 *
+	 * The rect comes from the page, which is the only thing that knows where its
+	 * own navigation ends. It arrives in CSS pixels relative to the content area,
+	 * which is the coordinate space `setBounds` uses, so there is no conversion
+	 * here and nothing to keep in sync with the Studio's stylesheet.
+	 *
+	 * Sender-checked rather than trusting the argument: only the Studio window may
+	 * place a view in the Studio window.
+	 */
+	const rectFrom = (value: unknown): EditorRect | null => {
+		if (!value || typeof value !== "object") return null;
+		const r = value as Record<string, unknown>;
+		const nums = ["x", "y", "width", "height"].map((k) => r[k]);
+		if (!nums.every((n) => typeof n === "number" && Number.isFinite(n))) return null;
+		const [x, y, width, height] = nums as number[];
+		return { x, y, width, height };
+	};
+
+	const fromStudio = (event: Electron.IpcMainInvokeEvent) =>
+		studioWindow &&
+		!studioWindow.isDestroyed() &&
+		BrowserWindow.fromWebContents(event.sender) === studioWindow
+			? studioWindow
+			: null;
+
+	ipcMain.handle("studio:mount-editor", (event, value: unknown) => {
+		const win = fromStudio(event);
+		const rect = rectFrom(value);
+		if (!win) return { ok: false, error: "only the Studio window can mount the editor" };
+		if (!rect) return { ok: false, error: "no rect" };
+		try {
+			mountEmbeddedEditor(win, rect);
+			// A document opened before the view existed is still parked; push it now
+			// that there is something to push it to.
+			if (pendingOpenPath) embeddedEditorContents()?.send("open-project-path", pendingOpenPath);
+			return { ok: true };
+		} catch (err) {
+			return { ok: false, error: err instanceof Error ? err.message : String(err) };
+		}
+	});
+
+	ipcMain.handle("studio:layout-editor", (event, value: unknown) => {
+		if (!fromStudio(event)) return { ok: false, error: "not the Studio window" };
+		const rect = rectFrom(value);
+		if (!rect) return { ok: false, error: "no rect" };
+		return { ok: layoutEmbeddedEditor(rect) };
+	});
+
+	ipcMain.handle("studio:unmount-editor", (event) => {
+		if (!fromStudio(event)) return { ok: false, error: "not the Studio window" };
+		return { ok: unmountEmbeddedEditor() };
 	});
 
 	// The renderer collects a document handed in before it was listening. Paired

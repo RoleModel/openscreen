@@ -27,6 +27,23 @@ import { getAvailableLocales, getLocaleName, getLocaleShort } from "@/i18n/loade
 import { PRODUCT_NAME } from "../../../../electron/about";
 import styles from "./EditorShellV4.module.css";
 
+/**
+ * True when this renderer is a view inside the Studio window rather than a window
+ * of its own (electron/studio/embedded-editor.ts passes it).
+ *
+ * The shell around an embedded editor already shows the mark and the app name in
+ * its sidebar, and the thing that makes an embedded view look like an accident is
+ * the same brand repeated a few pixels away. So the wordmark comes off — but not
+ * the button, which is the app menu, and not the mark, which is what makes it
+ * legible as one.
+ *
+ * Read per render rather than once at module scope. The query string does not
+ * change without a reload, so this is not about staleness — it is that a constant
+ * captured at import time cannot be exercised by a test, and the branch it guards
+ * changes the accessible name of a control.
+ */
+export const isEmbedded = () => new URLSearchParams(window.location.search).get("embedded") === "1";
+
 export type EditorMode = "media" | "edit" | "rec";
 
 export interface TopBarActions {
@@ -383,6 +400,8 @@ function AppMenu({ actions }: { actions: TopBarActions }) {
 		action();
 	};
 
+	const embedded = isEmbedded();
+
 	return (
 		<div ref={ref} className={styles.appMenuAnchor}>
 			<button
@@ -391,12 +410,16 @@ function AppMenu({ actions }: { actions: TopBarActions }) {
 				className={`${styles.brand} ${styles.brandBtn}`}
 				aria-haspopup="menu"
 				aria-expanded={open}
+				// Embedded, the wordmark is gone and the mark is decorative — which would
+				// leave the app menu a button with no accessible name at all. Named here
+				// instead, with the same string the wordmark carries.
+				aria-label={embedded ? PRODUCT_NAME : undefined}
 				onClick={() => setOpen((v) => !v)}
 			>
 				{/* Decorative: the wordmark beside it already names the app — and, being the
 				    button's only text, is also its accessible name. */}
 				<img src={logoMark} alt="" draggable={false} />
-				<span className={styles.name}>{PRODUCT_NAME}</span>
+				{embedded ? null : <span className={styles.name}>{PRODUCT_NAME}</span>}
 				<ChevronDown size={13} className={styles.brandChevron} aria-hidden />
 			</button>
 			{open ? (
