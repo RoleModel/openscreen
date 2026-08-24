@@ -457,13 +457,28 @@ function setupApplicationMenu() {
 		{
 			label: mainT("common", "actions.view") || "View",
 			submenu: [
+				/*
+				 * Reload has to reach the editor, which is no longer a window.
+				 *
+				 * `role: "reload"` acts on the focused BrowserWindow's own webContents.
+				 * Since the editor became a WebContentsView inside the Studio window
+				 * that is the Studio page, so Cmd+R reloaded the navigation around the
+				 * editor and left the editor itself on whatever bundle it started with —
+				 * which meant a rebuilt renderer could only be seen by restarting the
+				 * whole app.
+				 *
+				 * So: the embedded editor when it is mounted, the focused window
+				 * otherwise. Same key, same expectation.
+				 */
 				{
-					role: "reload",
 					label: mainT("common", "actions.reload") || "Reload",
+					accelerator: "CmdOrCtrl+R",
+					click: () => reloadEditorOrWindow(false),
 				},
 				{
-					role: "forceReload",
 					label: mainT("common", "actions.forceReload") || "Force Reload",
+					accelerator: "CmdOrCtrl+Shift+R",
+					click: () => reloadEditorOrWindow(true),
 				},
 				{
 					role: "toggleDevTools",
@@ -951,6 +966,20 @@ function forceCloseEditorWindow(windowToClose: BrowserWindow | null) {
  * With no Studio open there is nothing to embed into, and a standalone editor
  * window is still correct.
  */
+/**
+ * Reload whatever the person means by "this page".
+ *
+ * The embedded editor first when it is on screen, because that is the thing being
+ * looked at; `ignoreCache` is the difference between Reload and Force Reload.
+ */
+function reloadEditorOrWindow(ignoreCache: boolean) {
+	const editor = embeddedEditorAttached() ? embeddedEditorContents() : null;
+	const target = editor ?? BrowserWindow.getFocusedWindow()?.webContents ?? null;
+	if (!target || target.isDestroyed()) return;
+	if (ignoreCache) target.reloadIgnoringCache();
+	else target.reload();
+}
+
 function openEditorSurface() {
 	if (!studioWindow || studioWindow.isDestroyed()) {
 		createEditorWindowWrapper();
