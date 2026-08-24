@@ -11,17 +11,12 @@
 // so this is the single render path for the feature.
 
 import { AlertCircle, Film, FolderOpen, Upload, X } from "lucide-react";
-import { useCallback, useEffect, useRef, useState } from "react";
+import { useCallback, useRef, useState } from "react";
 import { Dialog, DialogContent, DialogHeader, DialogTitle } from "@/components/ui/dialog";
 import { useScopedT } from "@/contexts/I18nContext";
-import {
-	migrateProjectDataToAxcutDocument,
-	migrateRawDocumentToCurrent,
-} from "@/lib/ai-edition/document/migrate";
-import { documentSchema } from "@/lib/ai-edition/schema";
 import { useProjectStore } from "@/lib/ai-edition/store/projectStore";
-import { nativeBridgeClient } from "@/native";
 import styles from "./NewEditorShell.module.css";
+import { useOpenLoadedProject } from "./useOpenProjectFile";
 
 type DropError = "unsupported-format" | "load-failed" | null;
 
@@ -47,7 +42,6 @@ export function EditorEmptyState({
 
 	const createProject = useProjectStore((s) => s.createProject);
 	const addAsset = useProjectStore((s) => s.addAsset);
-	const loadProject = useProjectStore((s) => s.loadProject);
 
 	const ensureProject = useCallback(async (): Promise<string | null> => {
 		const existing = useProjectStore.getState().projectId;
@@ -72,25 +66,7 @@ export function EditorEmptyState({
 		}
 	}, [addAsset, ensureProject]);
 
-	// A loaded project JSON is either a current AxcutDocument (has its own
-	// `schemaVersion`) or a legacy EditorProjectData that must be migrated.
-	// Discriminate on the version field so a current document is never fed to
-	// the legacy migrator (which reads `.media`/`.editor` and would yield an
-	// empty doc). Returns true once the project is saved and loaded.
-	const openLoadedProject = useCallback(
-		async (raw: unknown): Promise<boolean> => {
-			const isAxcutDocument =
-				typeof raw === "object" && raw !== null && "schemaVersion" in raw && "timeline" in raw;
-			const doc = isAxcutDocument
-				? documentSchema.parse(migrateRawDocumentToCurrent(raw)) // disk-load: upgrade v3/v4 → v5, then validate
-				: migrateProjectDataToAxcutDocument(raw as never);
-			const saved = await nativeBridgeClient.aiEdition.save(doc);
-			if (!saved.success || !saved.document) return false;
-			await loadProject(doc.project.id);
-			return true;
-		},
-		[loadProject],
-	);
+	const openLoadedProject = useOpenLoadedProject();
 
 	const handleLoadProject = useCallback(async () => {
 		try {
@@ -103,41 +79,6 @@ export function EditorEmptyState({
 			setDropError("load-failed");
 		}
 	}, [openLoadedProject]);
-
-	// A document handed in from outside the app — `openscreen open <file>`, a file
-	// association, or a second launch with a path. Same two steps the drop handler
-	// takes, because it is the same job: read the file, then open what came back.
-	const openFromPath = useCallback(
-		async (filePath: string) => {
-			try {
-				const result = await window.electronAPI?.loadProjectFileFromPath?.(filePath);
-				if (!result?.success || !result.project) {
-					setDropError("load-failed");
-					return;
-				}
-				if (!(await openLoadedProject(result.project))) setDropError("load-failed");
-			} catch {
-				setDropError("load-failed");
-			}
-		},
-		[openLoadedProject],
-	);
-
-	// Two arrival routes, because a document can be handed over before or after
-	// this component exists.
-	//
-	// Asking is the one that matters at launch: the main process parks the path
-	// rather than pushing it, since `did-finish-load` fires before React mounts and
-	// a pushed message would land on nobody. Listening covers the other case — an
-	// app already open when a second `openscreen open` arrives.
-	useEffect(() => {
-		const api = window.electronAPI;
-		if (!api) return;
-		void api.takePendingOpenPath?.().then((filePath) => {
-			if (filePath) void openFromPath(filePath);
-		});
-		return api.onOpenProjectPath?.((filePath: string) => void openFromPath(filePath));
-	}, [openFromPath]);
 
 	const handleDragOver = useCallback((e: React.DragEvent) => {
 		e.preventDefault();

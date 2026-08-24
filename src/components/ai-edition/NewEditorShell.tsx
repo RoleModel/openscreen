@@ -44,6 +44,7 @@ import {
 import { Preview } from "./Preview";
 import type { TrimTarget } from "./RightPanes";
 import { importPendingRecording } from "./recordingImport";
+import { useIncomingProjectPath } from "./useOpenProjectFile";
 import v4 from "./v4/EditorShellV4.module.css";
 import { type EditorMode, EditorTopBar } from "./v4/EditorTopBar";
 import { type Facet, FloatingInspector } from "./v4/FloatingInspector";
@@ -90,6 +91,12 @@ function NativePlaybackSync({
 
 export function NewEditorShell() {
 	const te = useScopedT("editor");
+
+	// Documents handed in from outside — the Studio, `openscreen open <file>`, a
+	// file association. Mounted here rather than in EditorEmptyState because the
+	// empty state unmounts as soon as a document is open, which silently dropped
+	// every hand-over after the first (see useOpenProjectFile).
+	useIncomingProjectPath();
 	const document = useProjectStore((s) => s.document);
 	const projectId = useProjectStore((s) => s.projectId);
 	const dirty = useProjectStore((s) => s.dirty);
