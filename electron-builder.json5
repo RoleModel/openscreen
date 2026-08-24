@@ -171,7 +171,20 @@
       // `app.setName()` in electron/main.ts sets the same string for an unpackaged
       // run, where there is no Info.plist to read.
       "CFBundleDisplayName": "RoleModel Studio",
-      "CFBundleName": "RoleModel Studio",
+      // CFBundleName is deliberately NOT overridden.
+      //
+      // Electron resolves its helper apps from CFBundleName. electron-builder names
+      // them after `productName`, so they ship as "Openscreen Helper.app" — and
+      // setting CFBundleName to "RoleModel Studio" made Electron look for
+      // "RoleModel Studio Helper.app", find nothing, and abort before drawing a
+      // window:
+      //
+      //   FATAL:electron_main_delegate_mac.mm:65] Unable to find helper app
+      //
+      // That is what made v0.0.1 unopenable. Nothing is lost by leaving it alone:
+      // the menu bar reads "RoleModel Studio" because electron/main.ts calls
+      // `app.setName(PRODUCT_NAME)` at module scope, and Finder, the Dock, the
+      // About panel and every permission prompt read CFBundleDisplayName above.
       // These are quoted verbatim in the macOS permission dialogs, so they say the
       // name of the app the person is being asked about.
       "NSAudioCaptureUsageDescription": "RoleModel Studio needs audio capture permission to record system audio.",

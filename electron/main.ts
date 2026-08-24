@@ -1092,6 +1092,13 @@ if (!cliCommand) {
 
 app.on("activate", () => {
 	if (cliCommand) return;
+	// `activate` can arrive before `whenReady`, the same way `open-file` can — and
+	// the window this ends up building measures the primary display, which throws
+	// "The 'screen' module can't be used before the app 'ready' event" and takes the
+	// main process with it. Launching the binary directly is enough to see it.
+	// Nothing is lost by ignoring an early activate: whenReady creates the window
+	// anyway, and macOS re-sends activate when the dock icon is clicked.
+	if (!app.isReady()) return;
 	// On macOS, re-open a window when the dock icon is clicked and none are open.
 	const hasVisibleWindow = BrowserWindow.getAllWindows().some((window) => {
 		if (window.isDestroyed() || !window.isVisible()) {
