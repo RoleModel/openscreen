@@ -1,5 +1,6 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { AssetBaseUnavailableError, UnsafeAssetPathError } from "./assetPath";
+import { BRAND_WALLPAPERS } from "./brandWallpapers";
 import {
 	BackgroundLoadError,
 	classifyWallpaper,
@@ -11,7 +12,6 @@ import {
 	WALLPAPER_THUMB_PATHS,
 	wallpaperLabel,
 } from "./wallpaper";
-import { BRAND_WALLPAPERS } from "./brandWallpapers";
 
 describe("WALLPAPER_PATHS", () => {
 	// The list is the brand set followed by the stock run, not a count on its own —

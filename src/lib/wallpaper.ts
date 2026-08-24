@@ -1,5 +1,5 @@
-import { BRAND_WALLPAPERS } from "@/lib/brandWallpapers";
 import { getAssetPath } from "@/lib/assetPath";
+import { BRAND_WALLPAPERS } from "@/lib/brandWallpapers";
 
 /** The stock set, which is still a count and a naming convention. */
 export const WALLPAPER_COUNT = 18;

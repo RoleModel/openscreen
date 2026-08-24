@@ -1,6 +1,6 @@
 import { describe, expect, it } from "vitest";
-import { DEFAULT_WALLPAPER } from "@/lib/wallpaper";
 import { DEFAULT_CURSOR_THEME_ID } from "@/lib/cursor/cursorThemes";
+import { DEFAULT_WALLPAPER } from "@/lib/wallpaper";
 import {
 	createProjectData,
 	createProjectSnapshot,
