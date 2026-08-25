@@ -25,4 +25,5 @@ export const BRAND_WALLPAPERS: readonly BrandWallpaper[] = [
 	{ path: "/wallpapers/brand/docks-board.jpg", thumb: "/wallpapers/brand/thumbs/docks-board.jpg", label: "Dock Designer · tinted board" },
 	{ path: "/wallpapers/brand/railing-board.jpg", thumb: "/wallpapers/brand/thumbs/railing-board.jpg", label: "Railing Designer · tinted board" },
 	{ path: "/wallpapers/brand/rolemodel-blue.jpg", thumb: "/wallpapers/brand/thumbs/rolemodel-blue.jpg", label: "Blue" },
+	{ path: "/wallpapers/brand/rolemodel.jpg", thumb: "/wallpapers/brand/thumbs/rolemodel.jpg", label: "Bright Blue" },
 ];
