@@ -107,7 +107,7 @@ function create(): WebContentsView {
 	created.webContents.on("dom-ready", () => {
 		created.webContents
 			.insertCSS(
-				"html, body, #root { background: #09090b !important; } :root { --titlebar-inset-left: 0px; }",
+				":root { --titlebar-inset-left: 0px; }",
 			)
 			.catch(() => {
 				/* cosmetic, and the page may be mid-teardown */
