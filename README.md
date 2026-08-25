@@ -30,6 +30,23 @@
 >
 > Building the app needs full Xcode for the ScreenCaptureKit helper, which is why
 > releases are built in CI. Everything else builds without it.
+>
+> **Speech to text needs its helper compiled, and the build now does it.** `electron/native/bin/`
+> is gitignored, and for a while nothing put `whisper-stt-server` into it: `build:whisper-binaries`
+> was a script no build called, and `stage-whisper-stt.sh` was not a script at all — so
+> installers shipped with no transcription and said so only when somebody pressed the
+> button, in a sentence naming a shell script the reader did not have. `npm run whisper:ensure`
+> now runs first in `build:mac`, `build:win` and `build:linux`; it prefers what is already
+> staged, then a CI artifact, then a local compile, and **fails the build** rather than
+> produce an installer that cannot transcribe.
+>
+> It is deliberately not done at app launch. The compile needs cmake, a C++ toolchain and
+> three git clones, and whisper.cpp with Metal is minutes of CPU — so at launch it would
+> either stall the app or fail outright on any machine that only runs it. Launch instead
+> *checks*: `checkSttReadiness()` resolves the binary once at startup and logs the answer,
+> and the renderer can ask over `stt:readiness`, so the UI can say the feature is missing
+> before anyone relies on it. From a checkout, `brew install cmake && npm run build:whisper-binaries`
+> once is enough.
 
 <p align="center">
   <img src="public/openscreen.png" alt="OpenScreen Logo" width="64" />
