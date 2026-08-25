@@ -304,6 +304,11 @@ contextBridge.exposeInMainWorld("electronAPI", {
 	readFileChunk: (filePath: string, offset: number, length: number) => {
 		return ipcRenderer.invoke("read-file-chunk", filePath, offset, length);
 	},
+	/** Whether speech to text can run — asked at launch, so the UI can say so
+	 *  before somebody relies on it rather than after they press transcribe. */
+	sttReadiness: () => {
+		return ipcRenderer.invoke("stt:readiness");
+	},
 	preparePreviewAudioTrack: (filePath: string) => {
 		return ipcRenderer.invoke("prepare-preview-audio-track", filePath);
 	},
