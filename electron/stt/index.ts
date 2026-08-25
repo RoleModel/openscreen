@@ -440,8 +440,56 @@ export function _resetSttManagerForTests(): void {
  * fan out on `"stt:status"` (main → renderer push), scoped to the calling
  * `webContents` so two windows don't cross-talk.
  */
+/**
+ * Whether speech to text can run at all, resolved once at launch.
+ *
+ * The binary is found or not found by `resolveBinaryPath()` at the moment
+ * something asks for a transcript — so a build shipped without it looked
+ * completely healthy until somebody pressed transcribe, minutes into a session,
+ * and got a failure for a reason that had been true since startup.
+ *
+ * This asks the question at launch instead and writes the answer down. It does
+ * NOT build anything: that needs cmake, a C++ toolchain and three git clones
+ * from GitHub, and compiling whisper.cpp with Metal is minutes of CPU — work
+ * nobody would choose to wait through while an app opens, and work that simply
+ * fails on a machine without the toolchain. Being able to SAY it is missing is
+ * the part that belongs here.
+ */
+export async function checkSttReadiness(): Promise<{
+	ready: boolean;
+	backend: string;
+	path: string | null;
+}> {
+	const { resolveBinaryPath } = await import("./gpuDetector");
+	const resolved = await resolveBinaryPath();
+	if (resolved.path) {
+		console.info(`[stt] ready — ${resolved.backend} at ${resolved.path}`);
+	} else {
+		// One line, not a throw: no transcription is a missing feature, not a
+		// reason the app should fail to start. Everything else still works.
+		const { missingBinaryMessage } = await import("./whisperServer");
+		console.warn(`[stt] unavailable — ${missingBinaryMessage()}`);
+	}
+	return { ready: Boolean(resolved.path), backend: resolved.backend, path: resolved.path };
+}
+
 export function registerSttIpc(ipcMain: IpcMain): void {
 	const manager = getSttManager();
+	/*
+	 * Asked at launch, so the renderer can say "transcription is unavailable"
+	 * before somebody relies on it rather than after. Not awaited: the probe is a
+	 * few stat() calls, and registering IPC must not wait on the filesystem.
+	 */
+	let readiness: Promise<{ ready: boolean; backend: string; path: string | null }> | null =
+		checkSttReadiness();
+	ipcMain.handle("stt:readiness", async () => {
+		// Re-probed if the first answer was "missing": somebody may have built it
+		// since, and a cached no would outlive the fix for the whole session.
+		const current = await readiness;
+		if (current?.ready) return current;
+		readiness = checkSttReadiness();
+		return readiness;
+	});
 	ipcMain.handle(
 		"stt:transcribe",
 		async (event, req: SttTranscribeRequest): Promise<SttTranscribeResponse> => {

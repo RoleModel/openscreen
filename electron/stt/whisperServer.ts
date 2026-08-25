@@ -112,6 +112,38 @@ interface WhisperJsonResponse {
 	timing?: WhisperJsonTiming;
 }
 
+/** Packaged or not, read defensively: this module is imported by unit tests and
+ *  by scripts, where Electron's `app` does not exist. Unknown means developer. */
+function isPackagedApp(): boolean {
+	try {
+		const { app } = require("electron") as typeof import("electron");
+		return Boolean(app?.isPackaged);
+	} catch {
+		return false;
+	}
+}
+
+/**
+ * Why there is no speech-to-text, phrased for whoever is reading it.
+ *
+ * This sentence reaches a toast. The old one — "build it via
+ * scripts/build-whisper-stt.sh" — is a developer instruction, and in a packaged
+ * app it names a script the reader does not have and could not run: the repo is
+ * not on their disk, and the build needs cmake and a C++ toolchain besides. It
+ * told them to do something impossible instead of telling them what happened.
+ *
+ * `app.isPackaged` is the only thing that separates the two audiences. It is
+ * taken as a parameter rather than only read here so both sentences are reachable
+ * from a test: the read goes through `require("electron")` — the same lazy
+ * pattern gpuDetector.ts uses, so this module stays importable outside Electron —
+ * and a module-level require is not something a test double can intercept.
+ */
+export function missingBinaryMessage(packaged: boolean = isPackagedApp()): string {
+	return packaged
+		? "Speech to text is not available in this build: its helper was not packaged. Transcription and captions need it; nothing else is affected."
+		: "whisper-stt-server binary not found. Build it with `npm run build:whisper-binaries` (needs cmake), or stage a CI build with `bash scripts/stage-whisper-stt.sh <tag>`.";
+}
+
 export class WhisperServerManager {
 	private process: WhisperChild | null = null;
 	private shuttingDown = false;
@@ -236,8 +268,7 @@ export class WhisperServerManager {
 			: await resolveBinaryPath();
 		const binaryPath = resolved.path;
 		if (!binaryPath) {
-			const message =
-				"whisper-stt-server binary not found; build it via scripts/build-whisper-stt.sh";
+			const message = missingBinaryMessage();
 			this.recordError(message);
 			throw new Error(message);
 		}

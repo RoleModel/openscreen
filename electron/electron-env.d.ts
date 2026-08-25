@@ -335,6 +335,10 @@ interface Window {
 			message?: string;
 			error?: string;
 		}>;
+		/** Whether speech to text can run. `ready` false means the helper binary
+		 *  was not built or not packaged; transcription and captions are the only
+		 *  things affected. */
+		sttReadiness: () => Promise<{ ready: boolean; backend: string; path: string | null }>;
 		preparePreviewAudioTrack: (filePath: string) => Promise<{
 			success: boolean;
 			path?: string | null;
