@@ -1,6 +1,6 @@
 import { describe, expect, it } from "vitest";
 import { DEFAULT_CURSOR_THEME_ID } from "@/lib/cursor/cursorThemes";
-import { DEFAULT_WALLPAPER } from "@/lib/wallpaper";
+import { DEFAULT_WALLPAPER, WALLPAPER_PATHS } from "@/lib/wallpaper";
 import {
 	createProjectData,
 	createProjectSnapshot,
@@ -32,7 +32,7 @@ describe("projectPersistence media compatibility", () => {
 				webcamVideoPath: "/tmp/webcam.webm",
 			},
 			{
-				wallpaper: "/wallpapers/wallpaper1.jpg",
+				wallpaper: "/wallpapers/brand/rm-dark-dotgrid.jpg",
 				shadowIntensity: 0,
 				showBlur: false,
 				motionBlurAmount: 0,
@@ -183,7 +183,7 @@ it("creates stable snapshots for identical project state", () => {
 		webcamVideoPath: "/tmp/webcam.webm",
 	};
 	const editor = normalizeProjectEditor({
-		wallpaper: "/wallpapers/wallpaper1.jpg",
+		wallpaper: "/wallpapers/brand/rm-dark-dotgrid.jpg",
 		shadowIntensity: 0,
 		showBlur: false,
 		motionBlurAmount: 0,
@@ -216,35 +216,47 @@ it("detects unsaved changes from differing snapshots", () => {
 describe("wallpaper legacy normalization", () => {
 	it("rewrites pre-fix packaged paths (resources/assets/wallpapers/…)", () => {
 		const normalized = normalizeProjectEditor({
-			wallpaper: "file:///opt/Openscreen/resources/assets/wallpapers/wallpaper5.jpg",
+			wallpaper: "file:///opt/Openscreen/resources/assets/wallpapers/brand/rm-grid.jpg",
 		});
-		expect(normalized.wallpaper).toBe("/wallpapers/wallpaper5.jpg");
+		expect(normalized.wallpaper).toBe("/wallpapers/brand/rm-grid.jpg");
 	});
 
 	it("rewrites new packaged layout (resources/wallpapers/…)", () => {
 		const normalized = normalizeProjectEditor({
-			wallpaper: "file:///opt/Openscreen/resources/wallpapers/wallpaper3.jpg",
+			wallpaper: "file:///opt/Openscreen/resources/wallpapers/brand/rm-framed.jpg",
 		});
-		expect(normalized.wallpaper).toBe("/wallpapers/wallpaper3.jpg");
+		expect(normalized.wallpaper).toBe("/wallpapers/brand/rm-framed.jpg");
 	});
 
 	it("rewrites unpackaged dev layout (public/wallpapers/…)", () => {
 		const normalized = normalizeProjectEditor({
-			wallpaper: "file:///home/user/project/public/wallpapers/wallpaper1.jpg",
+			wallpaper: "file:///home/user/project/public/wallpapers/brand/rm-dark-dotgrid.jpg",
 		});
-		expect(normalized.wallpaper).toBe("/wallpapers/wallpaper1.jpg");
+		expect(normalized.wallpaper).toBe("/wallpapers/brand/rm-dark-dotgrid.jpg");
 	});
 
 	it("rewrites Windows-style file URLs with drive letter", () => {
 		const normalized = normalizeProjectEditor({
-			wallpaper: "file:///C:/Users/me/openscreen/resources/wallpapers/wallpaper2.jpg",
+			wallpaper: "file:///C:/Users/me/openscreen/resources/wallpapers/brand/rm-grid.jpg",
 		});
-		expect(normalized.wallpaper).toBe("/wallpapers/wallpaper2.jpg");
+		expect(normalized.wallpaper).toBe("/wallpapers/brand/rm-grid.jpg");
 	});
 
 	it("leaves canonical relative paths untouched", () => {
+		const normalized = normalizeProjectEditor({ wallpaper: "/wallpapers/brand/rm-grid.jpg" });
+		expect(normalized.wallpaper).toBe("/wallpapers/brand/rm-grid.jpg");
+	});
+
+	/*
+	 * And a project naming a wallpaper that is no longer bundled falls back.
+	 *
+	 * The eighteen stock gradients were removed, so an older project can name one
+	 * that is not there any more. Left as-is it would be a broken image behind
+	 * somebody's recording; DEFAULT_WALLPAPER is a brand board.
+	 */
+	it("falls back when a project names a wallpaper that is gone", () => {
 		const normalized = normalizeProjectEditor({ wallpaper: "/wallpapers/wallpaper2.jpg" });
-		expect(normalized.wallpaper).toBe("/wallpapers/wallpaper2.jpg");
+		expect(normalized.wallpaper).toBe(WALLPAPER_PATHS[0]);
 	});
 
 	it("leaves data URIs untouched", () => {

@@ -7,17 +7,18 @@ import {
 	DEFAULT_WALLPAPER,
 	resolveImageWallpaperUrl,
 	UnsafeImagePrefixError,
-	WALLPAPER_COUNT,
 	WALLPAPER_PATHS,
 	WALLPAPER_THUMB_PATHS,
 	wallpaperLabel,
 } from "./wallpaper";
 
 describe("WALLPAPER_PATHS", () => {
-	// The list is the brand set followed by the stock run, not a count on its own —
-	// WALLPAPER_COUNT still describes the stock half and nothing else.
-	it("is the brand set plus the stock set", () => {
-		expect(WALLPAPER_PATHS).toHaveLength(BRAND_WALLPAPERS.length + WALLPAPER_COUNT);
+	// The brand set and nothing else. This is a branded build, and a picker offering
+	// eighteen stock gradients beside the boards invites a video that is off-brand by
+	// one click.
+	it("is the brand set, and only the brand set", () => {
+		expect(WALLPAPER_PATHS).toHaveLength(BRAND_WALLPAPERS.length);
+		expect(WALLPAPER_PATHS.every((p) => p.startsWith("/wallpapers/brand/"))).toBe(true);
 	});
 
 	it("puts the brand set first", () => {
