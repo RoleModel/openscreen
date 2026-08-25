@@ -49,19 +49,47 @@ import {
 
 const VALID_BLUR_SHAPES = new Set(["rectangle", "oval", "freehand"] as const);
 
-// Old projects persisted machine-specific file:// URLs for bundled wallpapers.
-// Match only the known install layouts (packaged resources/[assets/]wallpapers,
-// dev public/wallpapers) so a user's own file under some "wallpapers" folder isn't
-// silently replaced.
+/*
+ * Old projects persisted machine-specific file:// URLs for bundled wallpapers.
+ *
+ * Only the known install layouts are matched — packaged
+ * `resources/[assets/]wallpapers`, dev `public/wallpapers` — so a user's own file
+ * under some folder called "wallpapers" is not silently replaced.
+ *
+ * The tail allows one directory, because the bundled set moved into
+ * `wallpapers/brand/`. It used to be `wallpaper\d+\.jpg` and nothing else, which
+ * matched the stock run and no brand board: a packaged project whose wallpaper was
+ * one of ours came back as an unrewritten file:// URL pointing at the machine it
+ * was saved on. Now that the brand set is the ONLY set, that was every packaged
+ * project. Still one segment and still `.jpg`, so it cannot walk anywhere.
+ */
 const LEGACY_FILE_WALLPAPER_RE =
-	/^file:\/\/.*?\/(?:resources\/(?:assets\/)?|public\/)wallpapers\/(wallpaper\d+\.jpg)$/i;
+	/^file:\/\/.*?\/(?:resources\/(?:assets\/)?|public\/)wallpapers\/((?:[\w-]+\/)?[\w-]+\.jpg)$/i;
 const CANONICAL_WALLPAPERS = new Set(WALLPAPER_PATHS);
 
 function normalizeWallpaperValue(value: string): string {
 	const match = LEGACY_FILE_WALLPAPER_RE.exec(value);
-	if (!match) return value;
-	const canonical = `/wallpapers/${match[1]}`;
-	return CANONICAL_WALLPAPERS.has(canonical) ? canonical : DEFAULT_WALLPAPER;
+	if (match) {
+		const canonical = `/wallpapers/${match[1]}`;
+		return CANONICAL_WALLPAPERS.has(canonical) ? canonical : DEFAULT_WALLPAPER;
+	}
+	/*
+	 * A bundled path that is no longer bundled also falls back.
+	 *
+	 * Only file:// URLs used to be checked against the canonical set, so an
+	 * already-relative `/wallpapers/…` was passed through whatever it named. That was
+	 * harmless while the bundled set only ever grew. It stopped being harmless when
+	 * the eighteen stock gradients were removed: every project that used one now
+	 * names a file that is not there, and passing it through puts a broken image
+	 * behind somebody's recording instead of a board.
+	 *
+	 * Scoped to `/wallpapers/` — a data: URI or a user's own file:// path is theirs
+	 * and is left exactly as it is, which the tests above pin.
+	 */
+	if (value.startsWith("/wallpapers/") && !CANONICAL_WALLPAPERS.has(value)) {
+		return DEFAULT_WALLPAPER;
+	}
+	return value;
 }
 
 export const PROJECT_VERSION = 2;
