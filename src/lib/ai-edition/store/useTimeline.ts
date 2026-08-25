@@ -10,10 +10,10 @@ import { useScopedT } from "@/contexts/I18nContext";
 import { createId } from "../document/ids";
 import {
 	duplicateClip as duplicateClipInDocument,
+	insertAssetClip,
 	moveClip as moveClipInDocument,
 	PLACEHOLDER_DURATION_SEC,
 	type RegionKind,
-	rederiveRegionMs,
 	removeClip as removeClipInDocument,
 	removeRegion as removeRegionInDocument,
 	resequenceClips,
@@ -57,8 +57,6 @@ interface RegionHandle {
 	kind: RegionKind;
 	id: string;
 }
-
-type Clip = AxcutDocument["timeline"]["clips"][number];
 
 /**
  * Patch every region under the pill `id` belongs to. A payload edit must hit them all,
@@ -1062,33 +1060,19 @@ export function useTimeline() {
 			if (!currentDoc) return;
 			const asset = currentDoc.assets.find((a) => a.id === assetId);
 			if (!asset) return;
-			// Insert immediately at whatever we know. If the asset has a cached
-			// durationSec we use it; otherwise we fall back to the placeholder
-			// and let the background probe correct it.
-			const knownDuration = asset.durationSec ?? PLACEHOLDER_DURATION_SEC;
-			const newClip: Clip = {
-				id: createId("clip"),
+			// Delegates to the shared document/timeline.ts implementation — the same
+			// function the agent tool-executor uses for "insert_asset_clip" ops — for
+			// the reason `moveClip` below gives: the splice/resequence/rederive recipe
+			// in two places is how the two paths drift into disagreeing about clip
+			// widths and anchored pills. The placeholder duration for an unprobed
+			// asset lives there now too, and the probe below still corrects it.
+			const { document: finalDoc, clipId } = insertAssetClip(currentDoc, {
 				assetId,
-				sourceStartSec: 0,
-				sourceEndSec: knownDuration,
-				timelineStartSec: 0,
-				timelineEndSec: knownDuration,
-				wordRefs: [],
-				origin: "user",
+				index,
 				reason: "Inserted from media panel",
-			};
-			const oldClips = currentDoc.timeline.clips;
-			const arr = [...oldClips];
-			const at = Math.max(0, Math.min(arr.length, index));
-			arr.splice(at, 0, newClip);
-			const newClips = resequenceClips(arr);
-			const next: AxcutDocument = {
-				...currentDoc,
-				timeline: { ...currentDoc.timeline, clips: newClips },
-			};
-			const finalDoc = rederiveRegionMs(next, newClips);
+			});
 			if (!(await saveDocument(finalDoc, { history: true }))) return;
-			setClipSelection(newClip.id);
+			setClipSelection(clipId);
 
 			// If we used the placeholder, kick off the probe in the background.
 			// Don't await — the drop is already responsive; the probe will
@@ -1099,7 +1083,7 @@ export function useTimeline() {
 				// that THROWS on a failed write. Losing a background duration correction
 				// is survivable — the clip keeps its placeholder length; an unhandled
 				// rejection is not.
-				void probeAndCorrectClip(assetId, newClip.id, asset.originalPath).catch((err) => {
+				void probeAndCorrectClip(assetId, clipId, asset.originalPath).catch((err) => {
 					console.warn("[timeline] background duration probe failed to save:", err);
 				});
 			}

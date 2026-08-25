@@ -777,6 +777,123 @@ export function moveClip(
 	return rederiveRegionMs(next, newClips);
 }
 
+/**
+ * Put a NEW asset's clip on the timeline — the one timeline op that brings in a file.
+ *
+ * Every other operation rearranges what is already there: trim narrows a clip,
+ * duplicate copies one, move reorders them, drop_range cuts a span out. None of
+ * them can introduce footage, so an agent asked to "put the logo sting on the
+ * front" or "cut to the B-roll here" had no operation that could do it.
+ * `insert_asset_clip` was declared in the schema and applied nowhere — the edit
+ * could be described, parsed, and then silently not performed.
+ *
+ * Here rather than in the store, for the reason `moveClip` gives above: the drop
+ * handler and the op dispatcher are two façades over one recipe (splice,
+ * resequence, rederive), and a second copy of it is how the two drift into
+ * disagreeing about clip widths and anchored pills.
+ *
+ * `index` is a position in the clip list, not a time. A caller holding a
+ * before/after clip id resolves it with `insertIndexFor` — laying clips
+ * back-to-back is `resequenceClips`'s job, and a timeline position passed in here
+ * would be overwritten by it anyway.
+ */
+export function insertAssetClip(
+	document: AxcutDocument,
+	{
+		assetId,
+		index,
+		sourceStartSec = 0,
+		sourceEndSec,
+		origin = "user",
+		reason = "",
+	}: {
+		assetId: string;
+		index: number;
+		sourceStartSec?: number;
+		sourceEndSec?: number;
+		origin?: "system" | "agent" | "user";
+		reason?: string;
+	},
+	/*
+	 * Returns the new clip's id beside the document, unlike its neighbours here
+	 * which return a bare one. The caller needs it: the drop handler selects what
+	 * it just inserted, and corrects its length when the duration probe lands.
+	 * Stapling the id onto the document instead would put a field on it that the
+	 * schema does not have — and that document gets parsed, and saved.
+	 */
+): { document: AxcutDocument; clipId: string } {
+	const asset = document.assets.find((a) => a.id === assetId);
+	if (!asset) {
+		throw new Error(`Unknown asset ${assetId}.`);
+	}
+
+	/*
+	 * An unprobed asset gets the placeholder, not zero.
+	 *
+	 * `durationSec` is filled in by a background probe, so a file dropped in and
+	 * inserted in the same breath has none yet — and `resequenceClips` floors a
+	 * clip at 0.001s, which is a clip you cannot see, select or drag. The drop
+	 * handler already corrects the length when the probe lands.
+	 */
+	const known = asset.durationSec ?? PLACEHOLDER_DURATION_SEC;
+	const from = Math.max(0, Math.min(sourceStartSec, known));
+	const to = Math.min(known, Math.max(from, sourceEndSec ?? known));
+	if (to <= from) {
+		throw new Error(`Empty source range for asset ${assetId}: ${from}s to ${to}s.`);
+	}
+
+	const clip: AxcutClip = {
+		id: createId("clip"),
+		assetId,
+		sourceStartSec: from,
+		sourceEndSec: to,
+		// Overwritten by resequenceClips; set so the clip is well-formed on its own.
+		timelineStartSec: 0,
+		timelineEndSec: to - from,
+		wordRefs: [],
+		origin,
+		reason,
+	};
+
+	const arr = [...document.timeline.clips];
+	arr.splice(Math.max(0, Math.min(index, arr.length)), 0, clip);
+	const newClips = resequenceClips(arr);
+	const next: AxcutDocument = {
+		...document,
+		timeline: { ...document.timeline, clips: newClips },
+	};
+	return { document: rederiveRegionMs(next, newClips), clipId: clip.id };
+}
+
+/**
+ * Where a before/after pair means, as an index.
+ *
+ * The schema names neighbours rather than a position, which is the right contract
+ * for an agent — "after the intro" survives the list changing under it, and an
+ * index does not. `beforeClipId` wins when both are given: it is the more specific
+ * of the two, and an agent that supplies a contradictory pair has said something
+ * about the earlier edge more deliberately.
+ */
+export function insertIndexFor(
+	document: AxcutDocument,
+	beforeClipId?: string | null,
+	afterClipId?: string | null,
+): number {
+	const clips = document.timeline.clips;
+	if (beforeClipId) {
+		const i = clips.findIndex((c) => c.id === beforeClipId);
+		if (i < 0) throw new Error(`Unknown clip ${beforeClipId}.`);
+		return i;
+	}
+	if (afterClipId) {
+		const i = clips.findIndex((c) => c.id === afterClipId);
+		if (i < 0) throw new Error(`Unknown clip ${afterClipId}.`);
+		return i + 1;
+	}
+	// Neither named: the end, which is what "add this footage" means.
+	return clips.length;
+}
+
 // ponytail: duplicate a clip (preserves the original). Used for "split this
 // clip into two" or "make a copy". Mirrors axcut's
 // apps/server/src/lib/timeline.ts#duplicateClip.

@@ -398,3 +398,130 @@ describe("applyTimelineOperation.update_clip_range", () => {
 		});
 	});
 });
+
+describe("applyTimelineOperation.insert_asset_clip", () => {
+	/** A second asset to bring in — the whole point of this operation. */
+	function withSting(): AxcutDocument {
+		const doc = makeDoc();
+		return {
+			...doc,
+			assets: [
+				...doc.assets,
+				{
+					id: "asset_sting",
+					kind: "video" as const,
+					label: "Title sting",
+					originalPath: "C:/videos/sting.mp4",
+					durationSec: 4,
+					cameraTrack: null,
+				},
+			],
+		};
+	}
+
+	it("puts the new clip before a named neighbour and pushes it later", () => {
+		const result = applyTimelineOperation(withSting(), {
+			type: "insert_asset_clip",
+			assetId: "asset_sting",
+			beforeClipId: "clip_1",
+			reason: "title sting on the front",
+		});
+		expect(result.summary).toMatch(/inserted Title sting at 0:00\.0/);
+		const clips = result.document.timeline.clips;
+		expect(clips).toHaveLength(2);
+		expect(clips[0]).toMatchObject({
+			assetId: "asset_sting",
+			timelineStartSec: 0,
+			timelineEndSec: 4,
+		});
+		// The recording did not move in its own source, only on the timeline.
+		expect(clips[1]).toMatchObject({ assetId: "asset_1", timelineStartSec: 4, sourceStartSec: 0 });
+	});
+
+	it("puts it after a named neighbour, and at the end when neither is named", () => {
+		const after = applyTimelineOperation(withSting(), {
+			type: "insert_asset_clip",
+			assetId: "asset_sting",
+			afterClipId: "clip_1",
+		}).document;
+		expect(after.timeline.clips[1]).toMatchObject({ assetId: "asset_sting", timelineStartSec: 60 });
+
+		const appended = applyTimelineOperation(withSting(), {
+			type: "insert_asset_clip",
+			assetId: "asset_sting",
+		}).document;
+		expect(appended.timeline.clips[1]).toMatchObject({
+			assetId: "asset_sting",
+			timelineStartSec: 60,
+		});
+	});
+
+	// The reason B-roll is possible at all: a span of a file, not the whole file.
+	it("inserts a trimmed span, and lays it out by the trimmed length", () => {
+		const result = applyTimelineOperation(withSting(), {
+			type: "insert_asset_clip",
+			assetId: "asset_1",
+			afterClipId: "clip_1",
+			sourceStartSec: 40,
+			sourceEndSec: 50,
+		});
+		const inserted = result.document.timeline.clips[1];
+		expect(inserted).toMatchObject({
+			sourceStartSec: 40,
+			sourceEndSec: 50,
+			timelineStartSec: 60,
+			timelineEndSec: 70,
+		});
+		expect(sourceLength(inserted)).toBe(10);
+	});
+
+	// The timeline shows the origin, and "user" would make a model's proposal look
+	// like a cut somebody made on purpose.
+	it("marks the clip as the agent's", () => {
+		const result = applyTimelineOperation(withSting(), {
+			type: "insert_asset_clip",
+			assetId: "asset_sting",
+		});
+		expect(result.document.timeline.clips[1].origin).toBe("agent");
+	});
+
+	// An edit that cannot be performed has to say so. Silently doing nothing is
+	// what `insert_asset_clip` did for its whole existence as a declared-only op.
+	it("refuses an unknown asset, an unknown neighbour and an empty range", () => {
+		expect(() =>
+			applyTimelineOperation(withSting(), { type: "insert_asset_clip", assetId: "nope" }),
+		).toThrow(/Unknown asset nope/);
+		expect(() =>
+			applyTimelineOperation(withSting(), {
+				type: "insert_asset_clip",
+				assetId: "asset_sting",
+				beforeClipId: "ghost",
+			}),
+		).toThrow(/Unknown clip ghost/);
+		expect(() =>
+			applyTimelineOperation(withSting(), {
+				type: "insert_asset_clip",
+				assetId: "asset_sting",
+				sourceStartSec: 3,
+				sourceEndSec: 3,
+			}),
+		).toThrow(/Empty source range/);
+	});
+
+	// An asset dropped in and inserted in the same breath has no probed duration.
+	// resequenceClips floors a clip at 0.001s, which is one you cannot see or grab.
+	it("gives an unprobed asset a visible length rather than none", () => {
+		const doc = withSting();
+		const unprobed: AxcutDocument = {
+			...doc,
+			assets: doc.assets.map((a) =>
+				a.id === "asset_sting" ? { ...a, durationSec: undefined } : a,
+			),
+		};
+		const inserted = applyTimelineOperation(unprobed, {
+			type: "insert_asset_clip",
+			assetId: "asset_sting",
+		}).document.timeline.clips[1];
+		expect(sourceLength(inserted)).toBeGreaterThan(1);
+	});
+});

@@ -13,6 +13,8 @@ import type { AxcutDocument } from "../schema";
 import { formatSec } from "../timeline/format";
 import {
 	duplicateClip,
+	insertAssetClip,
+	insertIndexFor,
 	moveClip,
 	normalizeIntervals,
 	primaryAssetDuration,
@@ -76,6 +78,23 @@ export type AxcutTimelineOperation =
 	| {
 			type: "duplicate_clip";
 			clipId: string;
+			reason?: string;
+	  }
+	| {
+			/*
+			 * The one operation that brings a file in.
+			 *
+			 * Everything else here rearranges what is already on the timeline, so an
+			 * agent asked to put a sting on the front or cut to B-roll had nothing that
+			 * could do it. Neighbours are named rather than an index, because "after the
+			 * intro" survives the list changing under it and a number does not.
+			 */
+			type: "insert_asset_clip";
+			assetId: string;
+			beforeClipId?: string | null;
+			afterClipId?: string | null;
+			sourceStartSec?: number;
+			sourceEndSec?: number;
 			reason?: string;
 	  };
 
@@ -305,6 +324,26 @@ export function applyTimelineOperation(
 		case "duplicate_clip": {
 			const next = duplicateClip(document, op.clipId, "user", op.reason ?? "");
 			return { document: next, summary: `duplicated clip ${op.clipId}` };
+		}
+		case "insert_asset_clip": {
+			const index = insertIndexFor(document, op.beforeClipId, op.afterClipId);
+			const { document: next, clipId } = insertAssetClip(document, {
+				assetId: op.assetId,
+				index,
+				sourceStartSec: op.sourceStartSec,
+				sourceEndSec: op.sourceEndSec,
+				// "agent", because this dispatcher is how a model's edits land. The
+				// timeline shows the origin, and calling it "user" makes a proposed cut
+				// look like one somebody made on purpose.
+				origin: "agent",
+				reason: op.reason ?? "",
+			});
+			const asset = next.assets.find((a) => a.id === op.assetId);
+			const clip = next.timeline.clips.find((c) => c.id === clipId);
+			return {
+				document: next,
+				summary: `inserted ${asset?.label ?? op.assetId} at ${formatSec(clip?.timelineStartSec ?? 0)}`,
+			};
 		}
 		default: {
 			// ponytail: exhaustive — TS errors here when a new variant is added.
