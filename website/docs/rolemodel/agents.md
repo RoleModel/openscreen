@@ -1,6 +1,6 @@
 ---
 title: AI agents
-sidebar_position: 5
+sidebar_position: 3
 ---
 
 # Which agent writes the words and the scenes

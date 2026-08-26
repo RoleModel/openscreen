@@ -1,13 +1,13 @@
 ---
 title: Development
-sidebar_position: 3
+sidebar_position: 2
 ---
 
 # Development
 
 What you need installed, what language each part is in, and how to run it.
 
-Read this after [KICKOFF.md](./pipeline.md), which covers installing and using the
+Read this after [KICKOFF.md](https://github.com/RoleModel/rolemodel-openscreen/blob/main/docs/KICKOFF.md), which covers installing and using the
 pipeline. This is about changing it.
 
 ---
