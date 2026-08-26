@@ -187,14 +187,40 @@ const waveBarCount = new Function(
 	"sourceEndSec",
 	`return ${lift(/const barCount = ([^;]+);/, "waveform barCount")};`,
 );
+/*
+ * The bar's amplitude, lifted with the expressions that use it.
+ *
+ * These lifted only the inner expressions and evaluated them with `h` — which
+ * worked until the component stopped using `h` directly. It clamps the gained
+ * sample first now (`const amplitude = Math.min(1, h * gain)`), so both
+ * expressions reference a name that was never in the lifted scope and the
+ * generator died with `amplitude is not defined`. The docs build has been red
+ * ever since, which is why the site has never deployed.
+ *
+ * Lifting the derivation too keeps the promise this file makes: the numbers come
+ * from running the component's own arithmetic, not from a paraphrase of it. A
+ * paraphrase is exactly what would have quietly kept working here, and been
+ * wrong by a factor of `gain`.
+ */
+const waveAmplitude = lift(/(const amplitude = [^;]+;)/, "waveform amplitude");
 const waveBarHeightPct = new Function(
 	"h",
-	`return ${lift(/height: `\$\{([^}]+)\}%`/, "waveform bar height")};`,
+	"gain",
+	`${waveAmplitude} return ${lift(/height: `\$\{([^}]+)\}%`/, "waveform bar height")};`,
 );
 const waveBarOpacity = new Function(
 	"h",
-	`return ${lift(/opacity: ([^,\n]+),\n/, "waveform bar opacity")};`,
+	"gain",
+	`${waveAmplitude} return ${lift(/opacity: ([^,\n]+),\n/, "waveform bar opacity")};`,
 );
+/*
+ * The vendored document carries no gain, and a missing gain is unity.
+ *
+ * Named rather than passed as a bare 1 at each call, so the assumption is
+ * visible: if the recreation ever documents a gained clip, this is the line that
+ * has to change.
+ */
+const WAVE_GAIN = 1;
 
 // ── the fixture ─────────────────────────────────────────────────────────
 if (ARGS.has("--vendor")) vendorFixture();
@@ -496,9 +522,9 @@ function buildWaveform() {
 	const buckets = OPACITY_BUCKETS.map(() => []);
 	for (let i = 0; i < amps.length; i++) {
 		const h = amps[i];
-		const exact = Number(waveBarOpacity(h));
+		const exact = Number(waveBarOpacity(h, WAVE_GAIN));
 		const bucket = Math.min(OPACITY_BUCKETS.length - 1, Math.floor((exact - 0.5) / 0.1 + 1e-9));
-		const heightPct = waveBarHeightPct(h);
+		const heightPct = waveBarHeightPct(h, WAVE_GAIN);
 		const y0 = (100 - heightPct) / 2;
 		const y1 = y0 + heightPct;
 		buckets[bucket].push(`M${i + 0.5} ${trimNum(y0)}V${trimNum(y1)}`);
@@ -702,9 +728,24 @@ const STAGE = {
 // `import { getAssetPath } from "@/lib/assetPath"`, and the resolver hook above
 // teaches Node relative extensionless specifiers, not the `@/` alias.
 const wallpaperSrc = readFileSync(resolve(APP, "src/lib/wallpaper.ts"), "utf8");
-const WALLPAPER_COUNT = Number(/WALLPAPER_COUNT\s*=\s*(\d+)/.exec(wallpaperSrc)?.[1]);
+/*
+ * Counted from the manifest, because the constant it used to read is gone.
+ *
+ * `wallpaper.ts` held a `WALLPAPER_COUNT` until the stock set was dropped for
+ * the brand's own; it now derives every list from `BRAND_WALLPAPERS`, which is
+ * generated in the rolemodel-openscreen toolkit and committed here. So the count
+ * is however many entries that manifest holds, and reading it there is reading
+ * the same thing the app reads rather than a number kept alongside it.
+ */
+const brandWallpaperSrc = readFileSync(resolve(APP, "src/lib/brandWallpapers.ts"), "utf8");
+const WALLPAPER_COUNT = (brandWallpaperSrc.match(/^\s*path:\s*"/gm) ?? []).length;
 if (!Number.isInteger(WALLPAPER_COUNT) || WALLPAPER_COUNT < 1) {
-	throw new Error("could not read WALLPAPER_COUNT out of src/lib/wallpaper.ts");
+	throw new Error("could not count BRAND_WALLPAPERS out of src/lib/brandWallpapers.ts");
+}
+if (!wallpaperSrc.includes("BRAND_WALLPAPERS")) {
+	// The two have to stay connected: if wallpaper.ts stops deriving from the
+	// manifest, this count is measuring something the app no longer uses.
+	throw new Error("src/lib/wallpaper.ts no longer derives from BRAND_WALLPAPERS");
 }
 
 /**
@@ -935,11 +976,64 @@ const TOOLBAR = {
 // Read out of the app's own dark block so the guard's contrast assertions are
 // made against the real values, not a copy of them.
 const TOKENS_SRC = readFileSync(resolve(APP, "src/styles/design-tokens.css"), "utf8");
-const darkBlock = TOKENS_SRC.slice(TOKENS_SRC.indexOf(':root[data-theme="dark"]'));
+const OPTICS_SRC = readFileSync(resolve(APP, "src/styles/optics-tokens.css"), "utf8");
+
+/*
+ * Resolve a token to a hex, following it wherever it now lives.
+ *
+ * These used to be hex literals in a `:root[data-theme="dark"]` block and this
+ * read them straight out. They are not any more: design-tokens.css maps each
+ * name onto an Optics token, and Optics computes both halves of every ramp with
+ * `light-dark()`, so which one applies is decided by `color-scheme` at runtime
+ * rather than by a selector. The dark block still exists and holds one bridging
+ * line, which is why the old lookup failed with "not found in the dark block"
+ * rather than with a missing token.
+ *
+ * So the chain is followed instead: name → Optics var → the dark half of
+ * `light-dark()` → `hsl()` with its own vars substituted → hex. Resolved rather
+ * than hardcoded for the same reason the rest of this file lifts instead of
+ * paraphrasing — a copy of these values is a copy that goes stale silently, and
+ * the assertions these feed are about contrast.
+ */
+const cssVar = (name, src) => new RegExp(`--${name}:\\s*([^;]+);`).exec(src)?.[1]?.trim() ?? null;
+
+function hslToHex(h, s, l) {
+	const a = (s / 100) * Math.min(l / 100, 1 - l / 100);
+	const f = (n) => {
+		const k = (n + h / 30) % 12;
+		const c = l / 100 - a * Math.max(-1, Math.min(k - 3, Math.min(9 - k, 1)));
+		return Math.round(255 * c)
+			.toString(16)
+			.padStart(2, "0");
+	};
+	return `#${f(0)}${f(8)}${f(4)}`;
+}
+
 function token(name) {
-	const m = darkBlock.match(new RegExp(`--${name}:\\s*(#[0-9a-fA-F]{3,8});`));
-	if (!m) throw new Error(`token --${name} not found in the dark block of design-tokens.css`);
-	return m[1];
+	let value = cssVar(name, TOKENS_SRC);
+	if (!value) throw new Error(`token --${name} is not defined in design-tokens.css`);
+	if (/^#[0-9a-fA-F]{3,8}$/.test(value)) return value;
+
+	const via = /^var\(\s*--([a-z0-9-]+)\s*\)$/i.exec(value);
+	if (!via) throw new Error(`token --${name} is ${value}, which this cannot resolve`);
+
+	const optics = cssVar(via[1], OPTICS_SRC);
+	if (!optics) throw new Error(`--${via[1]} is not in optics-tokens.css`);
+
+	// The dark half. Optics writes light first, dark second.
+	const pair = /light-dark\(([\s\S]*)\)/.exec(optics);
+	const dark = pair ? pair[1].split(/,(?![^(]*\))/)[1]?.trim() : optics;
+	if (!dark) throw new Error(`--${via[1]} has no dark half`);
+
+	// Substitute the vars inside the hsl() from the same file, one level being
+	// all Optics uses — and `--op-color-neutral-h` is itself a var, so twice.
+	let resolved = dark;
+	for (let pass = 0; pass < 3 && resolved.includes("var("); pass++) {
+		resolved = resolved.replace(/var\(\s*--([a-z0-9-]+)\s*\)/gi, (whole, ref) => cssVar(ref, OPTICS_SRC) ?? whole);
+	}
+	const hsl = /hsl\(\s*([\d.]+)\s+([\d.]+)%\s+([\d.]+)%\s*\)/.exec(resolved);
+	if (!hsl) throw new Error(`--${via[1]} resolved to ${resolved}, which is not an hsl()`);
+	return hslToHex(Number(hsl[1]), Number(hsl[2]), Number(hsl[3]));
 }
 const TOKENS = {
 	surface: token("surface"),
