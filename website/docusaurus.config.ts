@@ -20,6 +20,21 @@ const SITE_URL = process.env.DOCS_SITE_URL ?? "https://getopenscreen.com";
  * not working on Pages at all, because the page loads with no CSS.
  */
 const BASE_URL = process.env.DOCS_BASE_URL ?? "/";
+/*
+ * Whose site this build is.
+ *
+ * A fork publishing under its own name should say its own name — the pages this
+ * repo adds are about RoleModel Studio, and serving them under OpenScreen's
+ * title and mark tells a reader they are on the upstream project's site.
+ *
+ * Env-driven with upstream's values as the defaults, for the same reason the url
+ * is: a checkout with nothing set builds exactly what upstream builds, and the
+ * divergence stays in the workflow rather than in this file.
+ */
+const SITE_TITLE = process.env.DOCS_SITE_TITLE ?? "OpenScreen";
+const SITE_TAGLINE =
+	process.env.DOCS_SITE_TAGLINE ?? "A free, open-source screen recorder and editor.";
+const SITE_LOGO = process.env.DOCS_SITE_LOGO ?? "img/logo-icon.png";
 const REPO_SLUG = "getopenscreen/openscreen";
 const REPO_URL = `https://github.com/${REPO_SLUG}`;
 const UPSTREAM_REPO_URL = "https://github.com/siddharthvaddem/openscreen";
@@ -162,9 +177,9 @@ export default async function createConfig(): Promise<Config> {
 			: "";
 
 	return {
-		title: "OpenScreen",
-		tagline: "A free, open-source screen recorder and editor.",
-		favicon: "img/logo-icon.png",
+		title: SITE_TITLE,
+		tagline: SITE_TAGLINE,
+		favicon: SITE_LOGO,
 
 		// Pages serves this from the custom domain's root, not from
 		// getopenscreen.github.io/openscreen/, so baseUrl has to be "/" — a project
@@ -280,12 +295,12 @@ export default async function createConfig(): Promise<Config> {
 				respectPrefersColorScheme: false,
 			},
 			navbar: {
-				title: "OpenScreen",
+				title: SITE_TITLE,
 				logo: {
 					// Explicit intrinsic size: without it the navbar reserves no space
 					// for the mark and the whole bar reflows once the PNG decodes.
-					alt: "OpenScreen logo",
-					src: "img/logo-icon.png",
+					alt: `${SITE_TITLE} logo`,
+					src: SITE_LOGO,
 					width: 32,
 					height: 32,
 				},
