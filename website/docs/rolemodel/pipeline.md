@@ -1,6 +1,6 @@
 ---
 title: The video pipeline
-sidebar_position: 1
+sidebar_position: 2
 ---
 
 # Kickoff
@@ -65,6 +65,7 @@ call site, which is what keeps rebasing on upstream cheap. What they add:
 ## 1. Install
 
 ```bash
+brew trust --tap rolemodel/tap
 brew install rolemodel/tap/rm-video
 ```
 
@@ -93,6 +94,7 @@ promised seven.
 And the app:
 
 ```bash
+brew trust --tap rolemodel/tap
 brew install --cask rolemodel/tap/rolemodel-openscreen
 ```
 

@@ -12,18 +12,74 @@ export interface BrandWallpaper {
 }
 
 export const BRAND_WALLPAPERS: readonly BrandWallpaper[] = [
-	{ path: "/wallpapers/brand/rm-dark-dotgrid.jpg", thumb: "/wallpapers/brand/thumbs/rm-dark-dotgrid.jpg", label: "RoleModel · dark dot-grid board" },
-	{ path: "/wallpapers/brand/rm-framed.jpg", thumb: "/wallpapers/brand/thumbs/rm-framed.jpg", label: "RoleModel · framed board" },
-	{ path: "/wallpapers/brand/rm-grid.jpg", thumb: "/wallpapers/brand/thumbs/rm-grid.jpg", label: "RoleModel · fine line grid" },
-	{ path: "/wallpapers/brand/rm-ascii.jpg", thumb: "/wallpapers/brand/thumbs/rm-ascii.jpg", label: "RoleModel · ascii gradient panel" },
-	{ path: "/wallpapers/brand/rm-light.jpg", thumb: "/wallpapers/brand/thumbs/rm-light.jpg", label: "RoleModel · near-white board" },
-	{ path: "/wallpapers/brand/rm-brand.jpg", thumb: "/wallpapers/brand/thumbs/rm-brand.jpg", label: "RoleModel · brand-tinted board" },
-	{ path: "/wallpapers/brand/academy-ruby.jpg", thumb: "/wallpapers/brand/thumbs/academy-ruby.jpg", label: "Academy · Ruby unit" },
-	{ path: "/wallpapers/brand/academy-design.jpg", thumb: "/wallpapers/brand/thumbs/academy-design.jpg", label: "Academy · Design unit" },
-	{ path: "/wallpapers/brand/academy-rails.jpg", thumb: "/wallpapers/brand/thumbs/academy-rails.jpg", label: "Academy · Rails unit" },
-	{ path: "/wallpapers/brand/lcad-board.jpg", thumb: "/wallpapers/brand/thumbs/lcad-board.jpg", label: "LightningCAD · tinted board" },
-	{ path: "/wallpapers/brand/docks-board.jpg", thumb: "/wallpapers/brand/thumbs/docks-board.jpg", label: "Dock Designer · tinted board" },
-	{ path: "/wallpapers/brand/railing-board.jpg", thumb: "/wallpapers/brand/thumbs/railing-board.jpg", label: "Railing Designer · tinted board" },
-	{ path: "/wallpapers/brand/rolemodel-blue.jpg", thumb: "/wallpapers/brand/thumbs/rolemodel-blue.jpg", label: "Blue" },
-	{ path: "/wallpapers/brand/rolemodel.jpg", thumb: "/wallpapers/brand/thumbs/rolemodel.jpg", label: "Bright Blue" },
+	{
+		path: "/wallpapers/brand/rm-dark-dotgrid.jpg",
+		thumb: "/wallpapers/brand/thumbs/rm-dark-dotgrid.jpg",
+		label: "RoleModel · dark dot-grid board",
+	},
+	{
+		path: "/wallpapers/brand/rm-framed.jpg",
+		thumb: "/wallpapers/brand/thumbs/rm-framed.jpg",
+		label: "RoleModel · framed board",
+	},
+	{
+		path: "/wallpapers/brand/rm-grid.jpg",
+		thumb: "/wallpapers/brand/thumbs/rm-grid.jpg",
+		label: "RoleModel · fine line grid",
+	},
+	{
+		path: "/wallpapers/brand/rm-ascii.jpg",
+		thumb: "/wallpapers/brand/thumbs/rm-ascii.jpg",
+		label: "Academy · ascii gradient panel",
+	},
+	{
+		path: "/wallpapers/brand/rm-light.jpg",
+		thumb: "/wallpapers/brand/thumbs/rm-light.jpg",
+		label: "RoleModel · near-white board",
+	},
+	{
+		path: "/wallpapers/brand/rm-brand.jpg",
+		thumb: "/wallpapers/brand/thumbs/rm-brand.jpg",
+		label: "RoleModel · brand-tinted board",
+	},
+	{
+		path: "/wallpapers/brand/academy-ruby.jpg",
+		thumb: "/wallpapers/brand/thumbs/academy-ruby.jpg",
+		label: "Academy · Ruby unit",
+	},
+	{
+		path: "/wallpapers/brand/academy-design.jpg",
+		thumb: "/wallpapers/brand/thumbs/academy-design.jpg",
+		label: "Academy · Design unit",
+	},
+	{
+		path: "/wallpapers/brand/academy-rails.jpg",
+		thumb: "/wallpapers/brand/thumbs/academy-rails.jpg",
+		label: "Academy · Rails unit",
+	},
+	{
+		path: "/wallpapers/brand/lcad-board.jpg",
+		thumb: "/wallpapers/brand/thumbs/lcad-board.jpg",
+		label: "LightningCAD · tinted board",
+	},
+	{
+		path: "/wallpapers/brand/docks-board.jpg",
+		thumb: "/wallpapers/brand/thumbs/docks-board.jpg",
+		label: "Dock Designer · tinted board",
+	},
+	{
+		path: "/wallpapers/brand/railing-board.jpg",
+		thumb: "/wallpapers/brand/thumbs/railing-board.jpg",
+		label: "Railing Designer · tinted board",
+	},
+	{
+		path: "/wallpapers/brand/rolemodel-blue.jpg",
+		thumb: "/wallpapers/brand/thumbs/rolemodel-blue.jpg",
+		label: "Blue",
+	},
+	{
+		path: "/wallpapers/brand/rolemodel.jpg",
+		thumb: "/wallpapers/brand/thumbs/rolemodel.jpg",
+		label: "Bright Blue",
+	},
 ];

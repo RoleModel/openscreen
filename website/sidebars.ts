@@ -10,7 +10,13 @@ const sidebars: SidebarsConfig = {
 			type: "category",
 			label: "RoleModel pipeline",
 			collapsible: false,
-			items: ["rolemodel/pipeline", "rolemodel/development", "rolemodel/library"],
+			items: [
+				"rolemodel/using-the-studio",
+				"rolemodel/pipeline",
+				"rolemodel/development",
+				"rolemodel/library",
+				"rolemodel/agents",
+			],
 		},
 		{
 			type: "category",

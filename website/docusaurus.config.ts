@@ -4,7 +4,22 @@ import { themes as prismThemes } from "prism-react-renderer";
 
 import type { LatestRelease } from "./src/lib/release";
 
-const SITE_URL = "https://getopenscreen.com";
+/*
+ * Where this build is served from.
+ *
+ * Read from the environment with upstream's values as the default, so this fork
+ * can publish to its own GitHub Pages URL without the file diverging by more
+ * than these two lines. A hardcoded swap here is a merge conflict on every
+ * upstream change to this config; a default that IS upstream's value is not.
+ */
+const SITE_URL = process.env.DOCS_SITE_URL ?? "https://getopenscreen.com";
+/*
+ * "/" is right for a custom domain at the root; a project Pages site is served
+ * from <org>.github.io/<repo>/ and needs that prefix, or every asset URL points
+ * at a path the server has nothing at — the failure that looks like Docusaurus
+ * not working on Pages at all, because the page loads with no CSS.
+ */
+const BASE_URL = process.env.DOCS_BASE_URL ?? "/";
 const REPO_SLUG = "getopenscreen/openscreen";
 const REPO_URL = `https://github.com/${REPO_SLUG}`;
 const UPSTREAM_REPO_URL = "https://github.com/siddharthvaddem/openscreen";
@@ -155,7 +170,7 @@ export default async function createConfig(): Promise<Config> {
 		// getopenscreen.github.io/openscreen/, so baseUrl has to be "/" — a project
 		// baseUrl would prefix every asset URL with a path the server has nothing at.
 		url: SITE_URL,
-		baseUrl: "/",
+		baseUrl: BASE_URL,
 
 		// Every page is emitted as <route>/index.html, and GitHub Pages 301s the
 		// extensionless form to the trailing-slash one. Leaving this unset makes
