@@ -41,7 +41,12 @@ import {
 } from "./globalShortcut";
 import { mainT, setMainLocale } from "./i18n";
 import { getInstallChannel, offersUpdateCheck, platformOwnsUpdates } from "./install-channel";
-import { getSelectedDesktopSource, registerIpcHandlers } from "./ipc/handlers";
+import {
+	getSelectedDesktopSource,
+	onStudioCaptureSaved,
+	registerIpcHandlers,
+	setStudioCaptureTarget,
+} from "./ipc/handlers";
 import { installMainProcessErrorGuards } from "./main-process-errors";
 import { registerSttIpc, shutdownStt } from "./stt";
 import {
@@ -275,16 +280,17 @@ function openProjectPath(projectPath: string) {
 	 * The embedded editor first, when it is on screen.
 	 *
 	 * This is what makes "open in the editor" stay in the Studio window instead of
-	 * spawning a second one. `pendingOpenPath` is set either way, because the view
-	 * may still be loading — the renderer collects it through
+	 * spawning a second one. A path stays pending only while the view is still
+	 * loading — the renderer collects it through
 	 * `take-pending-open-path` on mount, which is the same mechanism a handed-in
 	 * document at launch uses and for the same reason: `did-finish-load` fires
 	 * before React is listening.
 	 */
 	if (embeddedEditorAttached()) {
-		pendingOpenPath = projectPath;
 		const contents = embeddedEditorContents();
-		if (contents) contents.send("open-project-path", projectPath);
+		if (contents?.isLoading()) pendingOpenPath = projectPath;
+		else pendingOpenPath = null;
+		contents?.send("open-project-path", projectPath);
 		studioWindow?.show();
 		studioWindow?.focus();
 		return;
@@ -1419,6 +1425,38 @@ appReady?.then(async () => {
 			? studioWindow
 			: null;
 
+	/*
+	 * Studio and the recording HUD are separate renderer processes. The selected
+	 * library project belongs to Studio, so hand its Footage folder to the recorder
+	 * explicitly instead of having the HUD guess from whichever document was last
+	 * open. Sender-check this just like the rest of the Studio bridge.
+	 */
+	ipcMain.handle("studio:set-capture-target", (event, value: unknown) => {
+		if (!fromStudio(event)) return { ok: false, error: "only the Studio window can set capture" };
+		if (value === null) {
+			setStudioCaptureTarget(null);
+			return { ok: true };
+		}
+		if (!value || typeof value !== "object") return { ok: false, error: "no capture target" };
+		const target = value as Record<string, unknown>;
+		const directory = typeof target.directory === "string" ? target.directory.trim() : "";
+		const projectId = typeof target.projectId === "string" ? target.projectId.trim() : "";
+		const projectName = typeof target.projectName === "string" ? target.projectName.trim() : "";
+		if (!directory || !path.isAbsolute(directory) || !projectId || !projectName) {
+			return { ok: false, error: "invalid capture target" };
+		}
+		setStudioCaptureTarget({ directory, projectId, projectName });
+		return { ok: true };
+	});
+
+	// The capture helper writes straight into Studio's Footage directory. Let the
+	// page refresh its own catalogue; the recorder deliberately has no HTTP or
+	// library knowledge beyond the destination it was handed.
+	onStudioCaptureSaved((capture) => {
+		if (!studioWindow || studioWindow.isDestroyed()) return;
+		studioWindow.webContents.send("studio:capture-saved", capture);
+	});
+
 	/**
 	 * Put text on the clipboard for the Studio page.
 	 *
@@ -1457,8 +1495,15 @@ appReady?.then(async () => {
 		try {
 			mountEmbeddedEditor(win, rect);
 			// A document opened before the view existed is still parked; push it now
-			// that there is something to push it to.
-			if (pendingOpenPath) embeddedEditorContents()?.send("open-project-path", pendingOpenPath);
+			// that there is something to push it to. Once the view has loaded, a
+			// pending value would be stale editor state, so leave the current document
+			// alone instead of reopening the last video.
+			const contents = embeddedEditorContents();
+			if (pendingOpenPath && contents?.isLoading()) {
+				contents.send("open-project-path", pendingOpenPath);
+			} else if (pendingOpenPath) {
+				pendingOpenPath = null;
+			}
 			return { ok: true };
 		} catch (err) {
 			return { ok: false, error: err instanceof Error ? err.message : String(err) };

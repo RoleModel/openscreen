@@ -105,13 +105,9 @@ function create(): WebContentsView {
 	// area flashes white before React mounts, and here that flash is inside an
 	// otherwise dark page rather than in a window of its own.
 	created.webContents.on("dom-ready", () => {
-		created.webContents
-			.insertCSS(
-				":root { --titlebar-inset-left: 0px; }",
-			)
-			.catch(() => {
-				/* cosmetic, and the page may be mid-teardown */
-			});
+		created.webContents.insertCSS(":root { --titlebar-inset-left: 0px; }").catch(() => {
+			/* cosmetic, and the page may be mid-teardown */
+		});
 	});
 
 	return created;

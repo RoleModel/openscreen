@@ -1,4 +1,14 @@
-import { ArrowLeft, Check, Film, Loader2, MessageSquare, Plus, Search, X } from "lucide-react";
+import {
+	ArrowLeft,
+	Check,
+	Film,
+	Loader2,
+	MessageSquare,
+	Music,
+	Plus,
+	Search,
+	X,
+} from "lucide-react";
 import { useCallback, useEffect, useRef, useState } from "react";
 import { createPortal } from "react-dom";
 import { toast } from "sonner";
@@ -102,8 +112,9 @@ function MediaList({
 						className={styles.mediaCard}
 						key={asset.id}
 						title={asset.originalPath}
-						draggable
+						draggable={asset.kind === "video"}
 						onDragStart={(e) => {
+							if (asset.kind !== "video") return;
 							e.dataTransfer.setData("application/x-axcut-asset", asset.id);
 							e.dataTransfer.effectAllowed = "copy";
 						}}
@@ -124,7 +135,7 @@ function MediaList({
 							onClick={() => onOpenTranscript?.(asset)}
 						>
 							<div className={`${styles.thumb} ${styles[palette]}`} aria-hidden>
-								<Film size={22} />
+								{asset.kind === "audio" ? <Music size={22} /> : <Film size={22} />}
 							</div>
 							<div className={styles.mediaMeta}>
 								<div className={styles.name}>{label}</div>
@@ -163,7 +174,7 @@ export function MediaPane() {
 			toast.error(t("mediaStage.openProjectFirst"));
 			return;
 		}
-		const picker = await window.electronAPI?.openVideoFilePicker();
+		const picker = await window.electronAPI?.openMediaFilePicker();
 		if (!picker?.success || !picker.path) return;
 		setBusy(true);
 		try {

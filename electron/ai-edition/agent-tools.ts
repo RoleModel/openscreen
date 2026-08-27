@@ -335,17 +335,42 @@ function droppedByEdit(before: AxcutDocument, after: AxcutDocument) {
 // objects to build its `tool()`s, so the two can never advertise a different shape than the
 // one we actually validate. (The primitives `secondsSchema`/`depthSchema`/`focusSchema` stay
 // private — callers only ever need the composed `*Args`.)
+/**
+ * Optional, and tolerant of an explicit `null` — normalised to `undefined`.
+ *
+ * `.optional()` accepts `undefined` and REJECTS `null`, and a model asked for an
+ * optional parameter through a JSON Schema routinely sends an explicit null to
+ * mean "not specified". That is not a malformed call; it is the ordinary
+ * spelling. It arrived as:
+ *
+ *   Tool call validation failed: parameters for tool getTranscript did not
+ *   match schema: errors: [`/assetId`: expected string, but got null]
+ *
+ * and the user saw "Empty response from model", because validation runs before
+ * the executor and the run dies at the gate. Every executor already coalesces
+ * the missing case with `??`, which treats null and undefined the same — so the
+ * value was always fine and only the gate objected.
+ *
+ * The `.transform` matters as much as the `.nullish`: without it, null reaches
+ * call sites typed `number | undefined` and the failure moves from runtime to
+ * the compiler. Normalising here keeps every consumer unchanged.
+ *
+ * `moveClipArgs` used `.nullish()` already, which is how this was found.
+ */
+const maybe = <T extends z.ZodTypeAny>(schema: T) =>
+	schema.nullish().transform((v) => v ?? undefined);
+
 const secondsSchema = z.number().finite().nonnegative();
 
 export const addTrimArgs = z.object({
 	startSec: secondsSchema,
 	endSec: secondsSchema,
-	assetId: z.string().min(1).optional(),
+	assetId: maybe(z.string().min(1)),
 	// A cut belongs to ONE clip. Without this, a project where two clips draw from the same
 	// asset (a duplicated clip) cannot say which of them the model meant, and the cut lands
 	// on both. Resolved from the source range when the model omits it and only one clip
 	// matches; ambiguity is reported back rather than guessed.
-	clipId: z.string().min(1).optional(),
+	clipId: maybe(z.string().min(1)),
 	reason: z.string().default(""),
 });
 
@@ -412,8 +437,25 @@ export const moveClipArgs = z.object({
 	beforeClipId: z.string().min(1).nullish(),
 });
 
+/*
+ * (superseded note kept out of the way)
+ *
+ * `.optional()` accepts `undefined` and REJECTS `null` — and a model asked for
+ * an optional parameter through a JSON Schema routinely sends an explicit null
+ * to mean "not specified". That is not a malformed call; it is the ordinary
+ * spelling. It arrived as:
+ *
+ *   Tool call validation failed: parameters for tool getTranscript did not
+ *   match schema: errors: [`/assetId`: expected string, but got null]
+ *
+ * and the user saw "Empty response from model", because validation runs before
+ * the executor and the run dies at the gate. Every executor below already
+ * coalesces the missing case with `??`, which treats null and undefined the
+ * same — so the value was always fine and only the gate objected.
+ *
+ */
 export const getTranscriptArgs = z.object({
-	assetId: z.string().min(1).optional(),
+	assetId: maybe(z.string().min(1)),
 });
 
 // ponytail: an assetId, never a path. The model names a row of the document and
@@ -421,7 +463,7 @@ export const getTranscriptArgs = z.object({
 // it name a file instead would turn a read-only reporting tool into an arbitrary
 // JSON reader on the user's disk.
 export const getCursorTrackArgs = z.object({
-	assetId: z.string().min(1).optional(),
+	assetId: maybe(z.string().min(1)),
 });
 
 // Effects (zoom / speed / annotation) are authored in *virtual* (edited-
@@ -459,9 +501,9 @@ export const addSpeedArgs = z.object({
 
 export const setSpeedArgs = z.object({
 	speedId: z.string().min(1),
-	startSec: secondsSchema.optional(),
-	endSec: secondsSchema.optional(),
-	speed: z.number().positive().optional(),
+	startSec: maybe(secondsSchema),
+	endSec: maybe(secondsSchema),
+	speed: maybe(z.number().positive()),
 });
 
 export const addAnnotationArgs = z.object({
@@ -474,9 +516,9 @@ export const addAnnotationArgs = z.object({
 
 export const setAnnotationArgs = z.object({
 	annotationId: z.string().min(1),
-	startSec: secondsSchema.optional(),
-	endSec: secondsSchema.optional(),
-	text: z.string().optional(),
+	startSec: maybe(secondsSchema),
+	endSec: maybe(secondsSchema),
+	text: maybe(z.string()),
 });
 
 export const addCameraFullscreenArgs = z.object({

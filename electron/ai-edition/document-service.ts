@@ -66,10 +66,22 @@ const SUPPORTED_VIDEO_EXTENSIONS = new Set([
 	".avi",
 	".wmv",
 ]);
+const SUPPORTED_AUDIO_EXTENSIONS = new Set([
+	".wav",
+	".mp3",
+	".m4a",
+	".aac",
+	".flac",
+	".ogg",
+	".aif",
+	".aiff",
+]);
 
-function isSupportedVideoPath(filePath: string): boolean {
-	const ext = path.extname(filePath).toLowerCase();
-	return SUPPORTED_VIDEO_EXTENSIONS.has(ext);
+function assetKindForPath(filePath: string): "video" | "audio" | null {
+	const extension = path.extname(filePath).toLowerCase();
+	if (SUPPORTED_VIDEO_EXTENSIONS.has(extension)) return "video";
+	if (SUPPORTED_AUDIO_EXTENSIONS.has(extension)) return "audio";
+	return null;
 }
 
 function safeProjectId(raw: string): string {
@@ -283,9 +295,10 @@ export class DocumentService {
 		if (!input.path) {
 			throw new ProjectFileError("Asset path is required.", projectId);
 		}
-		if (!isSupportedVideoPath(input.path)) {
+		const kind = assetKindForPath(input.path);
+		if (!kind) {
 			throw new ProjectFileError(
-				`Unsupported video extension: ${path.extname(input.path)} (supported: ${[...SUPPORTED_VIDEO_EXTENSIONS].join(", ")})`,
+				`Unsupported media extension: ${path.extname(input.path)}`,
 				projectId,
 			);
 		}
@@ -300,7 +313,7 @@ export class DocumentService {
 		}
 		const asset: AxcutAsset = {
 			id: createId("asset"),
-			kind: "video",
+			kind,
 			label: input.label?.trim() || path.basename(absolutePath),
 			originalPath: absolutePath,
 			sizeBytes,
@@ -311,7 +324,7 @@ export class DocumentService {
 			assets: [...doc.assets, asset],
 			project: {
 				...doc.project,
-				...(doc.project.primaryAssetId ? {} : { primaryAssetId: asset.id }),
+				...(doc.project.primaryAssetId || kind !== "video" ? {} : { primaryAssetId: asset.id }),
 				updatedAt: new Date().toISOString(),
 			},
 		};

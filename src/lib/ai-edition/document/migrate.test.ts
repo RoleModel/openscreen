@@ -22,7 +22,7 @@ function makeV2Project(overrides: Partial<EditorProjectData> = {}): EditorProjec
 			cropRegion: { x: 0, y: 0, width: 1, height: 1 },
 			zoomRegions: [],
 			cameraFullscreenRegions: [],
-			autoZoomEnabled: false,
+			autoZoomEnabled: true,
 			autoFocusAll: false,
 			trimRegions: [],
 			speedRegions: [],
@@ -172,7 +172,7 @@ describe("migrateProjectDataToAxcutDocument", () => {
 		expect(doc.legacyEditor).toMatchObject({
 			wallpaper: "/wallpapers/wallpaper1.jpg",
 			cursorTheme: "default",
-			autoZoomEnabled: false,
+			autoZoomEnabled: true,
 		});
 	});
 

@@ -41,11 +41,23 @@ const die = (msg, fix) => {
 
 // The renderer and the main process are built by vite, not by Electron. Without
 // them the window opens on nothing at all, which looks like a hang.
-if (!existsSync(join(ROOT, "dist-electron", "main.js")) || !existsSync(join(ROOT, "dist", "index.html"))) {
+if (
+	!existsSync(join(ROOT, "dist-electron", "main.js")) ||
+	!existsSync(join(ROOT, "dist", "index.html"))
+) {
 	die("this checkout has not been built yet", "npx vite build     # then try again");
 }
 
-const electron = join(ROOT, "node_modules", "electron", "dist", "Electron.app", "Contents", "MacOS", "Electron");
+const electron = join(
+	ROOT,
+	"node_modules",
+	"electron",
+	"dist",
+	"Electron.app",
+	"Contents",
+	"MacOS",
+	"Electron",
+);
 if (!existsSync(electron)) {
 	die(
 		"Electron is not installed in this checkout",
@@ -62,7 +74,8 @@ if (!existsSync(electron)) {
  */
 const studioFromEnv = process.env.RM_STUDIO_BIN;
 const sibling = resolve(ROOT, "..", "rolemodel-openscreen", "bin", "rm-studio.mjs");
-const studio = studioFromEnv && existsSync(studioFromEnv) ? studioFromEnv : existsSync(sibling) ? sibling : null;
+const studio =
+	studioFromEnv && existsSync(studioFromEnv) ? studioFromEnv : existsSync(sibling) ? sibling : null;
 
 const env = { ...process.env, NODE_ENV: "development" };
 // Stripped, not overridden: Electron checks for the variable's presence.
@@ -76,7 +89,11 @@ console.log(`  studio  ${studio ?? "not found — the Studio window will report 
 console.log("");
 
 const startedAt = Date.now();
-const child = spawn(electron, [".", ...process.argv.slice(2)], { cwd: ROOT, env, stdio: "inherit" });
+const child = spawn(electron, [".", ...process.argv.slice(2)], {
+	cwd: ROOT,
+	env,
+	stdio: "inherit",
+});
 child.on("exit", (code, signal) => {
 	/*
 	 * A second instance is not a crash, and it used to look exactly like one.

@@ -103,6 +103,16 @@ const ALLOWED_IMPORT_VIDEO_EXTENSIONS = new Set([
 	".flv",
 	".ts",
 ]);
+const ALLOWED_IMPORT_AUDIO_EXTENSIONS = new Set([
+	".wav",
+	".mp3",
+	".m4a",
+	".aac",
+	".flac",
+	".ogg",
+	".aif",
+	".aiff",
+]);
 const PREVIEW_AUDIO_DIR = path.join(app.getPath("userData"), "preview-audio");
 const nativeMacCaptureEvents = new EventEmitter();
 
@@ -181,6 +191,13 @@ function buildDialogOptions<T extends Electron.OpenDialogOptions | Electron.Save
 
 function hasAllowedImportVideoExtension(filePath: string): boolean {
 	return ALLOWED_IMPORT_VIDEO_EXTENSIONS.has(path.extname(filePath).toLowerCase());
+}
+
+function hasAllowedImportMediaExtension(filePath: string): boolean {
+	const extension = path.extname(filePath).toLowerCase();
+	return (
+		ALLOWED_IMPORT_VIDEO_EXTENSIONS.has(extension) || ALLOWED_IMPORT_AUDIO_EXTENSIONS.has(extension)
+	);
 }
 
 function runProcess(
@@ -311,6 +328,34 @@ async function approveReadableVideoPath(
 		if (!stats.isFile()) {
 			return null;
 		}
+	} catch {
+		return null;
+	}
+
+	approveFilePath(normalizedPath);
+	return normalizedPath;
+}
+
+/** The editor's source library can hold voice recordings as well as footage.
+ * Keep this separate from `approveReadableVideoPath`: callers that render a
+ * visual clip must still be unable to mistake a WAV for a video. */
+async function approveReadableMediaPath(
+	filePath?: string | null,
+	trustedDirs?: string[],
+): Promise<string | null> {
+	const normalizedPath = normalizeVideoSourcePath(filePath);
+	if (!normalizedPath) return null;
+
+	if (isPathAllowed(normalizedPath)) return normalizedPath;
+	if (!hasAllowedImportMediaExtension(normalizedPath)) return null;
+
+	if (trustedDirs) {
+		const resolved = path.resolve(normalizedPath);
+		if (!trustedDirs.some((dir) => isPathWithinDir(resolved, dir))) return null;
+	}
+
+	try {
+		if (!(await fs.stat(normalizedPath)).isFile()) return null;
 	} catch {
 		return null;
 	}
@@ -491,6 +536,85 @@ let selectedDesktopSource: DesktopCapturerSource | null = null;
 let lastEnumeratedSources = new Map<string, DesktopCapturerSource>();
 let currentProjectPath: string | null = null;
 let currentRecordingSession: RecordingSession | null = null;
+
+/**
+ * The RoleModel Studio project the HUD should capture into.
+ *
+ * Studio has its own library and project picker; the HUD is a separate renderer.
+ * Keeping this small bit of shared state here lets the picker name a destination
+ * once, while every native recorder still owns its own file lifecycle.
+ */
+export interface StudioCaptureTarget {
+	directory: string;
+	projectId: string;
+	projectName: string;
+}
+
+let studioCaptureTarget: StudioCaptureTarget | null = null;
+type StudioCaptureSavedListener = (capture: StudioCaptureTarget & { path: string }) => void;
+let studioCaptureSavedListener: StudioCaptureSavedListener | null = null;
+
+export function setStudioCaptureTarget(target: StudioCaptureTarget | null) {
+	if (!target) {
+		studioCaptureTarget = null;
+		return;
+	}
+
+	studioCaptureTarget = {
+		directory: path.resolve(target.directory),
+		projectId: target.projectId,
+		projectName: target.projectName,
+	};
+}
+
+export function onStudioCaptureSaved(listener: StudioCaptureSavedListener) {
+	studioCaptureSavedListener = listener;
+}
+
+function notifyStudioCaptureSaved(videoPath: string) {
+	const target = studioCaptureTarget;
+	if (!target || !isPathWithinDir(videoPath, target.directory)) return;
+	studioCaptureSavedListener?.({ ...target, path: videoPath });
+}
+
+function recordingOutputDirectory() {
+	return studioCaptureTarget?.directory ?? RECORDINGS_DIR;
+}
+
+function recordingOutputPath(recordingId: number, suffix = "") {
+	return path.join(
+		recordingOutputDirectory(),
+		`${RECORDING_FILE_PREFIX}${recordingId}${suffix}.mp4`,
+	);
+}
+
+function recordingSessionManifestPath(videoPath: string) {
+	return path.join(
+		path.dirname(videoPath),
+		`${path.parse(videoPath).name}${RECORDING_SESSION_SUFFIX}`,
+	);
+}
+
+/**
+ * Start the editor's media chooser at the surrounding Studio `media` folder
+ * whenever the open document came from one. It keeps footage, Audio and Stills
+ * one click away instead of marooning the picker in OpenScreen's own recordings.
+ */
+function projectMediaPickerStartDirectory() {
+	if (studioCaptureTarget) return path.dirname(studioCaptureTarget.directory);
+	const activePath =
+		currentProjectPath ?? currentRecordingSession?.screenVideoPath ?? currentVideoPath;
+	if (!activePath) return RECORDINGS_DIR;
+
+	let directory = path.dirname(activePath);
+	for (let depth = 0; depth < 5; depth += 1) {
+		if (path.basename(directory).toLowerCase() === "media") return directory;
+		const parent = path.dirname(directory);
+		if (parent === directory) break;
+		directory = parent;
+	}
+	return path.dirname(activePath);
+}
 
 // single source of truth for the mic/camera/system-audio/cursor
 // choices a user makes in the editor's Rec-mode stage, so the HUD window's
@@ -1126,7 +1250,7 @@ async function registerRecordingMediaLinks(
 			.access(cursorTelemetryPath, fsConstants.F_OK)
 			.then(() => true)
 			.catch(() => false);
-		await registerMediaLinks(RECORDINGS_DIR, screenVideoPath, {
+		await registerMediaLinks(path.dirname(screenVideoPath), screenVideoPath, {
 			...(options.webcamVideoPath ? { webcamVideoPath: options.webcamVideoPath } : {}),
 			...(options.webcamVideoPath && Number.isFinite(options.webcamOffsetMs)
 				? { webcamOffsetMs: options.webcamOffsetMs }
@@ -2349,11 +2473,8 @@ export function registerIpcHandlers(
 					typeof request.recordingId === "number" && Number.isFinite(request.recordingId)
 						? request.recordingId
 						: Date.now();
-				const outputPath = path.join(RECORDINGS_DIR, `${RECORDING_FILE_PREFIX}${recordingId}.mp4`);
-				const webcamOutputPath = path.join(
-					RECORDINGS_DIR,
-					`${RECORDING_FILE_PREFIX}${recordingId}-webcam.mp4`,
-				);
+				const outputPath = recordingOutputPath(recordingId);
+				const webcamOutputPath = recordingOutputPath(recordingId, "-webcam");
 				const sourceDisplay =
 					request.source.type === "display" && typeof request.source.displayId === "number"
 						? (screen.getAllDisplays().find((display) => display.id === request.source.displayId) ??
@@ -2447,7 +2568,7 @@ export function registerIpcHandlers(
 					outputPath,
 				});
 
-				await fs.mkdir(RECORDINGS_DIR, { recursive: true });
+				await fs.mkdir(path.dirname(outputPath), { recursive: true });
 				nativeWindowsCaptureOutput = "";
 				nativeWindowsCaptureTargetPath = outputPath;
 				nativeWindowsCaptureWebcamTargetPath = request.webcam.enabled ? webcamOutputPath : null;
@@ -2472,7 +2593,7 @@ export function registerIpcHandlers(
 				}
 
 				const proc = spawn(helperPath, [JSON.stringify(config)], {
-					cwd: RECORDINGS_DIR,
+					cwd: path.dirname(outputPath),
 					stdio: ["pipe", "pipe", "pipe"],
 					windowsHide: true,
 				});
@@ -2574,7 +2695,7 @@ export function registerIpcHandlers(
 				typeof request.recordingId === "number" && Number.isFinite(request.recordingId)
 					? request.recordingId
 					: Date.now();
-			const outputPath = path.join(RECORDINGS_DIR, `${RECORDING_FILE_PREFIX}${recordingId}.mp4`);
+			const outputPath = recordingOutputPath(recordingId);
 			const cursorCaptureMode =
 				normalizeCursorCaptureMode(request.cursor?.mode) ?? "editable-overlay";
 			try {
@@ -2618,10 +2739,7 @@ export function registerIpcHandlers(
 				},
 				outputs: {
 					screenPath: outputPath,
-					manifestPath: path.join(
-						RECORDINGS_DIR,
-						`${RECORDING_FILE_PREFIX}${recordingId}${RECORDING_SESSION_SUFFIX}`,
-					),
+					manifestPath: recordingSessionManifestPath(outputPath),
 				},
 			};
 
@@ -2634,7 +2752,7 @@ export function registerIpcHandlers(
 				outputPath,
 			});
 
-			await fs.mkdir(RECORDINGS_DIR, { recursive: true });
+			await fs.mkdir(path.dirname(outputPath), { recursive: true });
 			nativeMacCaptureOutput = "";
 			nativeMacCaptureTargetPath = outputPath;
 			nativeMacCaptureRecordingId = recordingId;
@@ -2655,7 +2773,7 @@ export function registerIpcHandlers(
 			}
 
 			const proc = spawn(helperPath, [JSON.stringify(config)], {
-				cwd: RECORDINGS_DIR,
+				cwd: path.dirname(outputPath),
 				stdio: ["pipe", "pipe", "pipe"],
 			});
 			nativeMacCaptureProcess = proc;
@@ -2956,12 +3074,10 @@ export function registerIpcHandlers(
 			setCurrentRecordingSessionState(session);
 			currentProjectPath = null;
 
-			const sessionManifestPath = path.join(
-				RECORDINGS_DIR,
-				`${path.parse(screenVideoPath).name}${RECORDING_SESSION_SUFFIX}`,
-			);
+			const sessionManifestPath = recordingSessionManifestPath(screenVideoPath);
 			await fs.writeFile(sessionManifestPath, JSON.stringify(session, null, 2), "utf-8");
 			await registerRecordingMediaLinks(screenVideoPath, { webcamVideoPath, cursorCaptureMode });
+			notifyStudioCaptureSaved(screenVideoPath);
 
 			return {
 				success: true,
@@ -3045,12 +3161,10 @@ export function registerIpcHandlers(
 			setCurrentRecordingSessionState(session);
 			currentProjectPath = null;
 
-			const sessionManifestPath = path.join(
-				RECORDINGS_DIR,
-				`${path.parse(screenVideoPath).name}${RECORDING_SESSION_SUFFIX}`,
-			);
+			const sessionManifestPath = recordingSessionManifestPath(screenVideoPath);
 			await fs.writeFile(sessionManifestPath, JSON.stringify(session, null, 2), "utf-8");
 			await registerRecordingMediaLinks(screenVideoPath, { cursorCaptureMode });
+			notifyStudioCaptureSaved(screenVideoPath);
 
 			return {
 				success: true,
@@ -3519,7 +3633,7 @@ export function registerIpcHandlers(
 			const dialogOptions = buildDialogOptions(
 				{
 					title: mainT("dialogs", "fileDialogs.selectVideo"),
-					defaultPath: RECORDINGS_DIR,
+					defaultPath: projectMediaPickerStartDirectory(),
 					filters: [
 						{
 							name: mainT("dialogs", "fileDialogs.videoFiles"),
@@ -3557,6 +3671,62 @@ export function registerIpcHandlers(
 				message: "Failed to open file picker",
 				error: String(error),
 			};
+		}
+	});
+
+	// The editor Media page is a project source browser, not just a video
+	// importer. Start it in the current Studio project's `media` directory so
+	// Footage and Audio are immediately available, while keeping the empty
+	// editor's video-only picker strict.
+	ipcMain.handle("open-media-file-picker", async () => {
+		try {
+			const dialogOptions = buildDialogOptions(
+				{
+					title: "Add project media",
+					defaultPath: projectMediaPickerStartDirectory(),
+					filters: [
+						{
+							name: "Video and audio files",
+							extensions: [
+								"webm",
+								"mp4",
+								"mov",
+								"avi",
+								"mkv",
+								"m4v",
+								"wmv",
+								"flv",
+								"ts",
+								"wav",
+								"mp3",
+								"m4a",
+								"aac",
+								"flac",
+								"ogg",
+								"aif",
+								"aiff",
+							],
+						},
+						{ name: mainT("dialogs", "fileDialogs.allFiles"), extensions: ["*"] },
+					],
+					properties: ["openFile"],
+				},
+				getMainWindow(),
+			);
+			const result = await dialog.showOpenDialog(dialogOptions);
+			if (result.canceled || result.filePaths.length === 0) {
+				return { success: false, canceled: true };
+			}
+
+			const normalizedPath = await approveReadableMediaPath(result.filePaths[0]);
+			if (!normalizedPath) {
+				return { success: false, message: "Selected file is not a supported readable media file" };
+			}
+
+			return { success: true, path: normalizedPath };
+		} catch (error) {
+			console.error("Failed to open media file picker:", error);
+			return { success: false, message: "Failed to open media picker", error: String(error) };
 		}
 	});
 

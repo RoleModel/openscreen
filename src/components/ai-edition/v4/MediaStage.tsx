@@ -1,4 +1,4 @@
-import { ArrowDown, Film, Plus, RotateCw, Search, X } from "lucide-react";
+import { ArrowDown, Film, Music, Plus, RotateCw, Search, X } from "lucide-react";
 import { useMemo, useState } from "react";
 import { toast } from "sonner";
 import { useI18n, useScopedT } from "@/contexts/I18nContext";
@@ -97,7 +97,7 @@ export function MediaStage({
 			toast.error(t("mediaStage.openProjectFirst"));
 			return;
 		}
-		const picker = await window.electronAPI?.openVideoFilePicker();
+		const picker = await window.electronAPI?.openMediaFilePicker();
 		if (!picker?.success || !picker.path) return;
 		setBusy(true);
 		try {
@@ -119,6 +119,7 @@ export function MediaStage({
 	};
 
 	const addSelectedToTimeline = () => {
+		if (selected?.kind !== "video") return;
 		void addSelectedAssetToTimeline(selected, onAddToTimeline, (label) => {
 			toast.success(t("mediaStage.addedToTimeline", { label }));
 		}).catch(() => undefined);
@@ -150,12 +151,13 @@ export function MediaStage({
 									<button
 										type="button"
 										key={asset.id}
-										draggable
+										draggable={asset.kind === "video"}
 										className={`${styles.mediaCard}${
 											asset.id === selectedId ? ` ${styles.selected}` : ""
 										}`}
 										title={asset.originalPath}
 										onDragStart={(e) => {
+											if (asset.kind !== "video") return;
 											e.dataTransfer.setData(ASSET_MIME, asset.id);
 											e.dataTransfer.effectAllowed = "copy";
 										}}
@@ -165,7 +167,11 @@ export function MediaStage({
 											className={styles.mediaThumb}
 											style={{ background: THUMB_GRADIENTS[i % THUMB_GRADIENTS.length] }}
 										>
-											<Film size={30} strokeWidth={1.8} />
+											{asset.kind === "audio" ? (
+												<Music size={30} strokeWidth={1.8} />
+											) : (
+												<Film size={30} strokeWidth={1.8} />
+											)}
 										</div>
 										<div className={styles.mediaCardMeta}>
 											{asset.id === selectedId ? (
@@ -186,7 +192,9 @@ export function MediaStage({
 												</div>
 												<div className={styles.mediaCardStats}>
 													<span className={styles.dur}>
-														{formatSeconds(asset.durationSec ?? 0)}
+														{asset.kind === "audio"
+															? "Audio"
+															: formatSeconds(asset.durationSec ?? 0)}
 													</span>
 													<span className={styles.size}>{formatBytes(asset.sizeBytes)}</span>
 												</div>
@@ -271,29 +279,43 @@ export function MediaStage({
 							>
 								{selected.label || basename(selected.originalPath)}
 							</div>
-							<button
-								type="button"
-								onClick={addSelectedToTimeline}
-								style={{
-									width: "100%",
-									height: 36,
-									display: "inline-flex",
-									alignItems: "center",
-									justifyContent: "center",
-									gap: 7,
-									marginBottom: 16,
-									borderRadius: 9,
-									border: "1px solid var(--accent)",
-									background: "var(--accent)",
-									color: "var(--accent-on)",
-									fontSize: 12.5,
-									fontWeight: 650,
-									cursor: "pointer",
-								}}
-							>
-								<Plus size={14} />
-								{t("mediaStage.addToTimeline")}
-							</button>
+							{selected.kind === "video" ? (
+								<button
+									type="button"
+									onClick={addSelectedToTimeline}
+									style={{
+										width: "100%",
+										height: 36,
+										display: "inline-flex",
+										alignItems: "center",
+										justifyContent: "center",
+										gap: 7,
+										marginBottom: 16,
+										borderRadius: 9,
+										border: "1px solid var(--accent)",
+										background: "var(--accent)",
+										color: "var(--accent-on)",
+										fontSize: 12.5,
+										fontWeight: 650,
+										cursor: "pointer",
+									}}
+								>
+									<Plus size={14} />
+									{t("mediaStage.addToTimeline")}
+								</button>
+							) : (
+								<p
+									style={{
+										margin: "0 0 16px",
+										fontSize: 12,
+										color: "var(--muted)",
+										lineHeight: 1.5,
+									}}
+								>
+									Audio is saved with this project and ready to transcribe. Add it to a screen
+									recording from Assembly, not the visual timeline.
+								</p>
+							)}
 
 							<div style={{ marginBottom: 16 }}>
 								<span

@@ -116,7 +116,7 @@ export const DEFAULT_EDITOR_SETTINGS: EditorSettingsSnapshot = {
 	showBlur: false,
 	motionBlurAmount: 0.2,
 	borderRadius: 40,
-	padding: 50,
+	padding: 0,
 	cropRegion: DEFAULT_CROP_REGION,
 	webcamLayoutPreset: DEFAULT_WEBCAM_LAYOUT_PRESET,
 	webcamMaskShape: DEFAULT_WEBCAM_MASK_SHAPE,

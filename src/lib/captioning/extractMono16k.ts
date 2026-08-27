@@ -45,6 +45,27 @@ async function loadSourceVideoFile(videoUrl: string, signal?: AbortSignal): Prom
 		return materializeLocalSourceFile(videoUrl, filename, { signal });
 	}
 
+	/*
+	 * A local path with no bridge to read it is a precondition, not a fetch.
+	 *
+	 * Falling through here handed `fetch()` an absolute filesystem path —
+	 * "/Users/me/Library/.../take.mp4" — which the browser resolves against the
+	 * page origin and requests as a relative URL. Nothing serves it, so fetch
+	 * rejects with a bare `TypeError: Failed to fetch` BEFORE the `!response.ok`
+	 * branch below that would have said something useful.
+	 *
+	 * What the user then sees is "Transcription failed / Failed to fetch", with
+	 * nothing in the console, against a whisper server that is running and
+	 * healthy — three days of looking in the wrong place. The condition that
+	 * actually failed is knowable right here, so it is said right here.
+	 */
+	if (!isRemoteUrl) {
+		throw new Error(
+			"Captions need the desktop app to read a local file, and this window has no file bridge " +
+				"(window.electronAPI is undefined). Open the project in the OpenScreen app rather than in a browser tab.",
+		);
+	}
+
 	const response = await fetchWithTimeout(videoUrl, signal);
 	if (!response.ok) {
 		throw new Error(`Failed to load video for captions: ${response.status} ${response.statusText}`);

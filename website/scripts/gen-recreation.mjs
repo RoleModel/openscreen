@@ -1029,7 +1029,10 @@ function token(name) {
 	// all Optics uses — and `--op-color-neutral-h` is itself a var, so twice.
 	let resolved = dark;
 	for (let pass = 0; pass < 3 && resolved.includes("var("); pass++) {
-		resolved = resolved.replace(/var\(\s*--([a-z0-9-]+)\s*\)/gi, (whole, ref) => cssVar(ref, OPTICS_SRC) ?? whole);
+		resolved = resolved.replace(
+			/var\(\s*--([a-z0-9-]+)\s*\)/gi,
+			(whole, ref) => cssVar(ref, OPTICS_SRC) ?? whole,
+		);
 	}
 	const hsl = /hsl\(\s*([\d.]+)\s+([\d.]+)%\s+([\d.]+)%\s*\)/.exec(resolved);
 	if (!hsl) throw new Error(`--${via[1]} resolved to ${resolved}, which is not an hsl()`);

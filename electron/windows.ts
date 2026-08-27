@@ -67,17 +67,17 @@ function applyContentProtection(win: BrowserWindow, label: string) {
 	if (CONTENT_PROTECTION_DISABLED) {
 		console.warn(
 			`[content-protection] OFF for the ${label} window ` +
-			"(OPENSCREEN_DISABLE_CONTENT_PROTECTION=1) — it will appear in screen captures, " +
-			"including recordings. Unset it for anything but automated testing.",
+				"(OPENSCREEN_DISABLE_CONTENT_PROTECTION=1) — it will appear in screen captures, " +
+				"including recordings. Unset it for anything but automated testing.",
 		);
 		return;
 	}
 	if (CONTENT_PROTECTION_BREAKS_DISPLAY && !CONTENT_PROTECTION_FORCED) {
 		console.warn(
 			`[content-protection] OFF for the ${label} window — macOS ` +
-			`${process.getSystemVersion()} never displays a content-protected window, so ` +
-			"enabling it would make this window permanently invisible. It may therefore appear " +
-			"in screen captures. Set OPENSCREEN_FORCE_CONTENT_PROTECTION=1 to re-test.",
+				`${process.getSystemVersion()} never displays a content-protected window, so ` +
+				"enabling it would make this window permanently invisible. It may therefore appear " +
+				"in screen captures. Set OPENSCREEN_FORCE_CONTENT_PROTECTION=1 to re-test.",
 		);
 		return;
 	}
@@ -446,9 +446,7 @@ export function createEditorWindow(query: Record<string, string> = {}): BrowserW
 		// `--titlebar-inset-left` reserves room for the macOS traffic lights; on
 		// Windows/Linux the topbar uses the `titlebar-area-*` env vars instead.
 		win.webContents
-			.insertCSS(
-				`:root { --titlebar-inset-left: ${isMac ? "68px" : "0px"}; }`,
-			)
+			.insertCSS(`:root { --titlebar-inset-left: ${isMac ? "68px" : "0px"}; }`)
 			.catch(() => {
 				// Best-effort cosmetic; ignore if the page is mid-teardown.
 			});

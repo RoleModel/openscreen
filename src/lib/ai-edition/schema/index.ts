@@ -150,7 +150,10 @@ export const assetTranscriptionFailureSchema = z.object({
 
 export const assetSchema = z.object({
 	id: z.string().min(1),
-	kind: z.literal("video"),
+	// Audio sources live in the same project library as footage. They are
+	// intentionally not timeline clips yet: a visual timeline needs an explicit
+	// audio-track model before an audio source can be dragged onto it.
+	kind: z.enum(["video", "audio"]),
 	label: z.string().min(1),
 	originalPath: z.string().min(1),
 	proxyPath: z.string().optional(),

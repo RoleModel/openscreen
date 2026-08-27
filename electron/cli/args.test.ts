@@ -254,7 +254,11 @@ describe("open", () => {
 	});
 
 	it("refuses a second path", () => {
-		const command = parseCliArgs(["node", "app", "open", "a.openscreen", "b.openscreen"], 2, "/work");
+		const command = parseCliArgs(
+			["node", "app", "open", "a.openscreen", "b.openscreen"],
+			2,
+			"/work",
+		);
 		expect(command).toMatchObject({ kind: "error" });
 	});
 

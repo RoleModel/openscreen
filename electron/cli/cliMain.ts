@@ -251,7 +251,10 @@ export function runCli(command: CliCommand): void {
 	// verb wants. Guarding here keeps the narrowing below honest rather than
 	// relying on a caller to remember.
 	if (command.kind === "open") {
-		safeWrite(process.stderr, "openscreen: `open` is handled by the GUI path, not the CLI runner\n");
+		safeWrite(
+			process.stderr,
+			"openscreen: `open` is handled by the GUI path, not the CLI runner\n",
+		);
 		app.exit(1);
 		return;
 	}

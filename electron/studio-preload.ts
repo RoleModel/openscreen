@@ -39,6 +39,16 @@ contextBridge.exposeInMainWorld("rmStudio", {
 	copyText: (text: string): Promise<{ ok: boolean; error?: string }> =>
 		ipcRenderer.invoke("studio:copy-text", text),
 
+	/**
+	 * Tell the separate recording HUD where the project currently open in Studio
+	 * keeps its source footage. The page gets no general filesystem access; it can
+	 * only set this one destination for the selected library project.
+	 */
+	setCaptureTarget: (
+		target: StudioCaptureTarget | null,
+	): Promise<{ ok: boolean; error?: string }> =>
+		ipcRenderer.invoke("studio:set-capture-target", target),
+
 	/*
 	 * The editor as a view inside this window, rather than a window of its own.
 	 *
@@ -69,6 +79,18 @@ contextBridge.exposeInMainWorld("rmStudio", {
 		ipcRenderer.on("studio:show-editor-view", listener);
 		return () => ipcRenderer.removeListener("studio:show-editor-view", listener);
 	},
+
+	/** Let Studio quietly refresh its catalogue when the HUD saves into a project. */
+	onCaptureSaved: (
+		callback: (capture: StudioCaptureTarget & { path: string }) => void,
+	): (() => void) => {
+		const listener = (
+			_event: Electron.IpcRendererEvent,
+			capture: StudioCaptureTarget & { path: string },
+		) => callback(capture);
+		ipcRenderer.on("studio:capture-saved", listener);
+		return () => ipcRenderer.removeListener("studio:capture-saved", listener);
+	},
 });
 
 interface EditorRect {
@@ -81,4 +103,10 @@ interface EditorRect {
 interface Mounted {
 	ok: boolean;
 	error?: string;
+}
+
+interface StudioCaptureTarget {
+	directory: string;
+	projectId: string;
+	projectName: string;
 }

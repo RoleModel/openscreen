@@ -266,10 +266,20 @@ describe("DocumentService", () => {
 			expect(path.isAbsolute(updated.assets[0]?.originalPath ?? "")).toBe(true);
 		});
 
-		it("rejects unsupported video extensions", async () => {
+		it("adds a WAV as an audio source", async () => {
+			const doc = await service.createProject("P");
+			const updated = await service.addAsset(doc.project.id, { path: "/tmp/voiceover.wav" });
+			expect(updated.assets[0]).toMatchObject({
+				kind: "audio",
+				originalPath: "/tmp/voiceover.wav",
+			});
+			expect(updated.project.primaryAssetId).toBeUndefined();
+		});
+
+		it("rejects unsupported media extensions", async () => {
 			const doc = await service.createProject("P");
 			await expect(
-				service.addAsset(doc.project.id, { path: "/tmp/audio.mp3" }),
+				service.addAsset(doc.project.id, { path: "/tmp/notes.txt" }),
 			).rejects.toBeInstanceOf(ProjectFileError);
 		});
 

@@ -72,20 +72,19 @@ let shimRecordingPrefs: ShimRecordingPrefs = {
 // playable video without any native bridge — NewEditorShell/toFileUrl
 // already special-case blob:/http(s):/data: asset paths and pass them
 // through untouched, so this just has to produce one.
-type PickVideoResult =
+type PickMediaResult =
 	| { success: true; canceled: false; path: string; name: string }
 	| { success: false; canceled: true };
 
-function pickVideoFileViaInput(): Promise<PickVideoResult> {
+function pickMediaFileViaInput(accept: string): Promise<PickMediaResult> {
 	return new Promise((resolve) => {
 		const input = document.createElement("input");
 		input.type = "file";
-		input.accept =
-			"video/mp4,video/quicktime,video/webm,video/x-matroska,video/x-msvideo,video/x-ms-wmv,video/*";
+		input.accept = accept;
 		input.style.position = "fixed";
 		input.style.top = "-9999px";
 		let settled = false;
-		const finish = (result: PickVideoResult) => {
+		const finish = (result: PickMediaResult) => {
 			if (settled) return;
 			settled = true;
 			input.remove();
@@ -106,10 +105,23 @@ function pickVideoFileViaInput(): Promise<PickVideoResult> {
 	});
 }
 
+function pickVideoFileViaInput(): Promise<PickMediaResult> {
+	return pickMediaFileViaInput(
+		"video/mp4,video/quicktime,video/webm,video/x-matroska,video/x-msvideo,video/x-ms-wmv,video/*",
+	);
+}
+
+function pickProjectMediaViaInput(): Promise<PickMediaResult> {
+	return pickMediaFileViaInput(
+		"video/*,audio/wav,audio/mpeg,audio/mp4,audio/aac,audio/flac,audio/ogg,audio/*",
+	);
+}
+
 function createShimElectronAPI() {
 	return {
 		assetBaseUrl: "",
 		openVideoFilePicker: pickVideoFileViaInput,
+		openMediaFilePicker: pickProjectMediaViaInput,
 		openProjectFile: () => Promise.resolve({ success: false, canceled: true }),
 		pickExportSavePath: () => Promise.resolve({ success: false, canceled: true }),
 		writeExportToPath: () => Promise.resolve({ success: false }),
@@ -186,7 +198,7 @@ function createShimBridgeClient() {
 			updatedAt: string;
 			primaryAssetId?: string;
 		};
-		assets: Array<{ id: string; kind: "video"; label: string; originalPath: string }>;
+		assets: Array<{ id: string; kind: "video" | "audio"; label: string; originalPath: string }>;
 		[key: string]: unknown;
 	};
 	const projectsStorageKey = "browser-shim-projects-v2";
@@ -413,14 +425,21 @@ function createShimBridgeClient() {
 				const assetId = `asset_${Math.random().toString(36).slice(2, 10)}`;
 				const asset = {
 					id: assetId,
-					kind: "video" as const,
+					kind: /\.(wav|mp3|m4a|aac|flac|ogg|aiff?)$/i.test(path)
+						? ("audio" as const)
+						: ("video" as const),
 					label: label || path.split(/[\\/]/).pop() || "Recording",
 					originalPath: path,
 				};
 				const next: ShimDocument = {
 					...doc,
 					assets: [...doc.assets, asset],
-					project: { ...doc.project, primaryAssetId: doc.project.primaryAssetId ?? assetId },
+					project: {
+						...doc.project,
+						...(doc.project.primaryAssetId || asset.kind !== "video"
+							? {}
+							: { primaryAssetId: assetId }),
+					},
 				};
 				documentsByProject[projectId] = next;
 				saveProjectsState();

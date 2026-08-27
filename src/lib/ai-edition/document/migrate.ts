@@ -149,7 +149,8 @@ export function migrateProjectDataToAxcutDocument(
 	 * untouched clips stay lean.
 	 */
 	const rawCrop = input.editor?.cropRegion;
-	const isFraction = (n: unknown): n is number => typeof n === "number" && Number.isFinite(n) && n >= 0 && n <= 1;
+	const isFraction = (n: unknown): n is number =>
+		typeof n === "number" && Number.isFinite(n) && n >= 0 && n <= 1;
 	const cropRegion =
 		rawCrop &&
 		isFraction(rawCrop.x) &&
@@ -333,7 +334,7 @@ export function migrateAxcutDocumentToProjectData(input: AxcutDocument): EditorP
 		cropRegion: (primaryClipCrop ?? { x: 0, y: 0, width: 1, height: 1 }) as CropRegion,
 		zoomRegions: [],
 		cameraFullscreenRegions: [],
-		autoZoomEnabled: false,
+		autoZoomEnabled: true,
 		autoFocusAll: false,
 		trimRegions,
 		speedRegions: [],
