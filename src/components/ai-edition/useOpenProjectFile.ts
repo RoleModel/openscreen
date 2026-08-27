@@ -13,7 +13,7 @@
 // the subscription is a separate hook mounted by the shell, which stays up for
 // the life of the window.
 
-import { useCallback, useEffect } from "react";
+import { useCallback, useEffect, useState } from "react";
 import {
 	migrateProjectDataToAxcutDocument,
 	migrateRawDocumentToCurrent,
@@ -84,14 +84,44 @@ export function useOpenProjectFromPath(onError?: () => void) {
  * every hand-over after that, which is why this must be mounted by something
  * that outlives the empty state.
  */
-export function useIncomingProjectPath(onError?: () => void) {
+export interface IncomingProjectPathState {
+	/** The first pending-path check has completed, so startup may restore recents. */
+	ready: boolean;
+	/** A Studio/CLI handoff owns the initial editor selection. */
+	hasIncomingProject: boolean;
+}
+
+export function useIncomingProjectPath(onError?: () => void): IncomingProjectPathState {
 	const openFromPath = useOpenProjectFromPath(onError);
+	const [ready, setReady] = useState(false);
+	const [hasIncomingProject, setHasIncomingProject] = useState(false);
 	useEffect(() => {
 		const api = window.electronAPI;
 		if (!api) return;
-		void api.takePendingOpenPath?.().then((filePath) => {
-			if (filePath) void openFromPath(filePath);
-		});
-		return api.onOpenProjectPath?.((filePath: string) => void openFromPath(filePath));
+		let cancelled = false;
+		const openIncoming = (filePath: string) => {
+			if (!filePath || cancelled) return;
+			// Claim the editor before the asynchronous disk read starts.  Startup also
+			// restores the most recent local project, and without this synchronous
+			// marker that restore can win the race and replace the video Studio asked
+			// us to open with yesterday's project.
+			setHasIncomingProject(true);
+			void openFromPath(filePath);
+		};
+		void api.takePendingOpenPath?.().then(
+			(filePath) => {
+				openIncoming(filePath ?? "");
+				if (!cancelled) setReady(true);
+			},
+			() => {
+				if (!cancelled) setReady(true);
+			},
+		);
+		const unsubscribe = api.onOpenProjectPath?.(openIncoming);
+		return () => {
+			cancelled = true;
+			unsubscribe?.();
+		};
 	}, [openFromPath]);
+	return { ready, hasIncomingProject };
 }

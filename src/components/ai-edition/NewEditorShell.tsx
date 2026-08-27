@@ -96,7 +96,7 @@ export function NewEditorShell() {
 	// file association. Mounted here rather than in EditorEmptyState because the
 	// empty state unmounts as soon as a document is open, which silently dropped
 	// every hand-over after the first (see useOpenProjectFile).
-	useIncomingProjectPath();
+	const incomingProject = useIncomingProjectPath();
 	const document = useProjectStore((s) => s.document);
 	const projectId = useProjectStore((s) => s.projectId);
 	const dirty = useProjectStore((s) => s.dirty);
@@ -235,8 +235,12 @@ export function NewEditorShell() {
 		})();
 	}, [openProjectOpen]);
 
-	// Auto-load project recording session on mount
+	// Auto-load a pending recording or the most recent local project only after
+	// checking whether Studio handed us a specific document.  The two effects run
+	// on the same first paint; letting the recent-project restore run immediately
+	// made a successful Studio click quietly reopen the previously edited video.
 	useEffect(() => {
+		if (!incomingProject.ready || incomingProject.hasIncomingProject) return;
 		if (initRef.current) return;
 		initRef.current = true;
 		void (async () => {
@@ -280,7 +284,7 @@ export function NewEditorShell() {
 				console.warn("[editor] auto-load failed", e);
 			}
 		})();
-	}, [loadProject]);
+	}, [incomingProject.hasIncomingProject, incomingProject.ready, loadProject]);
 
 	// Warn on close when dirty
 	useEffect(() => {
