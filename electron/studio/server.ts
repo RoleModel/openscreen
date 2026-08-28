@@ -61,6 +61,30 @@ export function findStudio(): string | null {
 	return candidates.find((candidate) => existsSync(candidate)) ?? null;
 }
 
+/**
+ * Finder gives an app a deliberately small PATH. That was enough to find the
+ * Homebrew `rm-studio` shim above, but not the `node` its shebang asks `env` to
+ * find — so the server died with the unhelpful exit 127 before it could speak.
+ *
+ * Run the module with a resolved Node binary instead, and pass the same practical
+ * PATH through to the Studio for the helpers it starts later.
+ */
+export function findNode(): string | null {
+	const fromEnv = process.env.RM_NODE_BIN;
+	if (fromEnv && existsSync(fromEnv)) return fromEnv;
+
+	const candidates = [
+		"/opt/homebrew/bin/node", // Apple Silicon Homebrew
+		"/opt/homebrew/opt/node/bin/node", // Homebrew's stable opt link
+		"/usr/local/bin/node", // Intel Homebrew and older installs
+		...(process.env.PATH ?? "")
+			.split(path.delimiter)
+			.filter(Boolean)
+			.map((dir) => path.join(dir, "node")),
+	];
+	return candidates.find((candidate) => existsSync(candidate)) ?? null;
+}
+
 /** A port nobody is on. Asking the OS beats guessing and beats a fixed default. */
 function freePort(): Promise<number> {
 	return new Promise((resolve, reject) => {
@@ -113,15 +137,24 @@ export async function startStudio(): Promise<StudioHandle> {
 	const env = { ...process.env };
 	delete env.ELECTRON_RUN_AS_NODE;
 	delete env.ELECTRON_NO_ATTACH_CONSOLE;
+	const node = findNode();
+	const homebrewPath = ["/opt/homebrew/bin", "/opt/homebrew/opt/node/bin", "/usr/local/bin"];
+	env.PATH = [
+		...new Set([...homebrewPath, ...(env.PATH ?? "").split(path.delimiter).filter(Boolean)]),
+	].join(path.delimiter);
+	const args = ["--port", String(port), "--no-open"];
 
-	child = spawn(bin, ["--port", String(port), "--no-open"], {
+	child = spawn(node ?? bin, node ? [bin, ...args] : args, {
 		stdio: ["ignore", "pipe", "pipe"],
 		env,
 	});
 
+	let recentOutput = "";
 	const log = (stream: "out" | "err") => (buf: Buffer) => {
 		for (const line of buf.toString().split("\n")) {
-			if (line.trim()) console.log(`[studio:${stream}] ${line}`);
+			if (!line.trim()) continue;
+			recentOutput = `${recentOutput}${recentOutput ? "\n" : ""}${line}`.slice(-2000);
+			console.log(`[studio:${stream}] ${line}`);
 		}
 	};
 	child.stdout?.on("data", log("out"));
@@ -129,7 +162,7 @@ export async function startStudio(): Promise<StudioHandle> {
 
 	let exited: string | null = null;
 	child.on("exit", (code, signal) => {
-		exited = `rm-studio exited ${code ?? signal}`;
+		exited = `rm-studio exited ${code ?? signal}${recentOutput ? `\n\n${recentOutput}` : ""}`;
 		child = null;
 		running = null;
 	});
