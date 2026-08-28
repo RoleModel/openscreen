@@ -46,6 +46,16 @@ export async function transcribeAsset(
 	const audioResult = await extractMono16kFromVideoUrl(videoUrl, {
 		signal: options.signal,
 	});
+	// Do not hand an empty decode to Whisper. It can otherwise return a blank
+	// transcript, which looks like a transcription failure even though the
+	// source recording simply has no usable audio stream.
+	if (
+		!Number.isFinite(audioResult.durationSec) ||
+		audioResult.durationSec <= 0 ||
+		audioResult.samples.length < 800
+	) {
+		throw new Error("No audio track found in this media.");
+	}
 
 	options.onStatus?.({ phase: "transcribing" });
 	// Only pass `language` to the worker when the caller forced a specific

@@ -250,7 +250,11 @@ export function migrateProjectDataToAxcutDocument(
 			...(region.blurData ? { blurData: region.blurData } : {}),
 		}));
 
-	const legacyEditor: AxcutLegacyEditor = input.editor ? { ...input.editor } : null;
+	// The old editor wrote a visible frame by default (usually 50px). Its
+	// project shape has no way to tell that default apart from an intentional
+	// choice, so opening a legacy document in the current editor always starts
+	// flush with the canvas. A user can still add padding deliberately here.
+	const legacyEditor: AxcutLegacyEditor = input.editor ? { ...input.editor, padding: 0 } : null;
 
 	// Emits the **v4** shape (per-asset cameraTrack + RAW-virtual-ms regions) and lets
 	// `migrateRawDocumentToCurrent` perform the v4→v5 clip-anchoring, so the
@@ -327,7 +331,7 @@ export function migrateAxcutDocumentToProjectData(input: AxcutDocument): EditorP
 		showBlur: false,
 		motionBlurAmount: 0,
 		borderRadius: 0,
-		padding: 50,
+		padding: 0,
 		// Round-trip the crop the other way too. It lives on the clip now, so read
 		// it back off the primary clip rather than inventing the identity — a
 		// document that went v2 -> current -> v2 would otherwise lose it.

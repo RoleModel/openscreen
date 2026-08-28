@@ -8,13 +8,17 @@ vi.mock("@/components/video-editor/projectPersistence", () => ({
 
 vi.mock("@/lib/captioning", () => ({
 	extractMono16kFromVideoUrl: vi.fn(async () => ({
-		samples: new Float32Array([0, 0, 0]),
+		samples: new Float32Array(800),
 		sampleRate: 16_000,
+		durationSec: 0.05,
 	})),
 	transcribeMono16kToSegments: vi.fn(),
 }));
 
-const { transcribeMono16kToSegments } = await import("@/lib/captioning");
+const { extractMono16kFromVideoUrl, transcribeMono16kToSegments } = await import(
+	"@/lib/captioning"
+);
+const extractAudioMock = vi.mocked(extractMono16kFromVideoUrl);
 const transcribeMock = vi.mocked(transcribeMono16kToSegments);
 
 function makeDoc(): AxcutDocument {
@@ -125,6 +129,19 @@ describe("toAxcutTranscriptDsl", () => {
 });
 
 describe("transcribeAsset language handling", () => {
+	it("reports a missing audio stream instead of creating an empty transcript", async () => {
+		extractAudioMock.mockResolvedValueOnce({
+			samples: new Float32Array(),
+			sampleRate: 16_000,
+			durationSec: 0,
+		});
+
+		await expect(transcribeAsset(makeDoc(), "asset_1")).rejects.toThrow(
+			"No audio track found in this media.",
+		);
+		expect(transcribeMock).not.toHaveBeenCalled();
+	});
+
 	it("forwards a forced language to the worker and stores it on the transcript", async () => {
 		transcribeMock.mockResolvedValueOnce({
 			segments: [{ startSec: 0, endSec: 1, text: "bonjour" }],

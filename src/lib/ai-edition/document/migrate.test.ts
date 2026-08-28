@@ -176,6 +176,13 @@ describe("migrateProjectDataToAxcutDocument", () => {
 		});
 	});
 
+	it("opens legacy projects with zero padding", () => {
+		const doc = migrateProjectDataToAxcutDocument(makeV2Project());
+
+		expect(getEditorSettings(doc).padding).toBe(0);
+		expect(doc.legacyEditor?.padding).toBe(0);
+	});
+
 	it("keeps migrating a project saved with the retired showTrimWaveform key", () => {
 		const v2 = makeV2Project();
 		// Projects saved before the setting was removed still carry it.
