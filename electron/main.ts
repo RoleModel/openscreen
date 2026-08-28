@@ -1159,10 +1159,14 @@ appReady?.then(async () => {
 		console.info("[diagnostic] OPENSCREEN_DIAGNOSTIC=1, capturing console.* into ring buffer");
 	}
 
-	// Force "regular" activation policy so the Dock icon appears. The HUD overlay
-	// (transparent, frameless, skipTaskbar) is the first window, and AppKit would
-	// otherwise classify us as an accessory app.
+	// The HUD overlay (transparent, frameless, skipTaskbar) is the first window,
+	// which makes AppKit treat the process as an accessory app. `dock.show()` adds
+	// an icon to the Dock but does not change that classification, so the app was
+	// still missing from Command-Tab. Set the process policy first, then show the
+	// icon — Studio is a regular app even when its recorder HUD is all that is
+	// currently visible.
 	if (process.platform === "darwin") {
+		app.setActivationPolicy("regular");
 		app.dock?.show();
 	}
 
