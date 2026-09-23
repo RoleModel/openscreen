@@ -1,14 +1,18 @@
 import path from "node:path";
 import { app, type IpcMain } from "electron";
 import { planChunks } from "./chunking";
+import { extractMono16kPcm } from "./extractAudio";
 import { ensureModels, modelPaths } from "./modelManager";
-import type {
-	SttPhraseSegment,
-	SttStatusEvent,
-	SttTiming,
-	SttTranscribeRequest,
-	SttTranscribeResponse,
-	SttWordSegment,
+import {
+	STT_VAD_UNAVAILABLE,
+	type SttPhraseSegment,
+	type SttStatusEvent,
+	type SttTiming,
+	type SttTranscribeRequest,
+	type SttTranscribeResponse,
+	type SttVadResponse,
+	type SttVadSegment,
+	type SttWordSegment,
 } from "./transcriptionContract";
 import { WhisperServerManager } from "./whisperServer";
 
@@ -96,12 +100,20 @@ export class SttManager {
 	private initPromise: Promise<void> | null = null;
 	/** Kept from `prepare()` so a chunk retry can respawn a helper that died mid-run. */
 	private modelPath: string | null = null;
+	private vadModelPath: string | null = null;
 	/**
 	 * Bumped by `cancel()`. The chunk loop compares it against the value it
 	 * captured on entry, so a cancel that lands after a new run started cannot
 	 * kill that new run.
 	 */
 	private cancelEpoch = 0;
+
+	/**
+	 * The extraction in flight, if any. `cancelEpoch` alone stops the CHUNK loop, which is
+	 * checked between chunks — so a cancel during the decode left ffmpeg running to
+	 * completion on a file that can be hours long, and the user saw nothing stop.
+	 */
+	private extraction: AbortController | null = null;
 
 	/**
 	 * Attach a sink for the renderer status channel; returns its detach function.
@@ -134,6 +146,7 @@ export class SttManager {
 	 */
 	cancel(): void {
 		this.cancelEpoch++;
+		this.extraction?.abort();
 	}
 
 	/**
@@ -185,8 +198,12 @@ export class SttManager {
 
 		const paths = modelPaths(modelsDir);
 		this.modelPath = paths.whisper;
+		this.vadModelPath = paths["silero-vad"];
 		try {
-			await this.server.start({ modelPath: paths.whisper });
+			await this.server.start({
+				modelPath: paths.whisper,
+				vadModelPath: paths["silero-vad"],
+			});
 		} catch (error) {
 			if (this.shuttingDown) throw cancelledError();
 			throw error;
@@ -227,7 +244,9 @@ export class SttManager {
 				if (this.shuttingDown) throw cancelledError();
 				if (attempt === CHUNK_ATTEMPTS) break;
 				if (this.modelPath) {
-					await this.server.start({ modelPath: this.modelPath }).catch(() => undefined);
+					await this.server
+						.start({ modelPath: this.modelPath, vadModelPath: this.vadModelPath })
+						.catch(() => undefined);
 				}
 				if (this.shuttingDown) throw cancelledError();
 				await new Promise((resolve) => setTimeout(resolve, 500 * attempt));
@@ -237,12 +256,34 @@ export class SttManager {
 	}
 
 	/** Transcribe a whole recording, chunk by chunk, reporting progress as it goes. */
+	/** Decode `sourcePath` into the samples `transcribe` needs. */
+	private async extract(req: SttTranscribeRequest): Promise<Float32Array> {
+		if (!req.sourcePath) {
+			throw new Error("stt:transcribe needs either `samples` or `sourcePath`");
+		}
+		const controller = new AbortController();
+		this.extraction = controller;
+		try {
+			return await extractMono16kPcm(req.sourcePath, { signal: controller.signal });
+		} finally {
+			// Only if it is still ours: a cancel that started a new run must not have its
+			// controller cleared by the old one unwinding.
+			if (this.extraction === controller) this.extraction = null;
+		}
+	}
+
 	async transcribe(req: SttTranscribeRequest): Promise<SttTranscribeResponse> {
 		await this.init();
 
 		const epoch = this.cancelEpoch;
-		const totalSec = req.samples.length / SAMPLE_RATE;
-		const chunks = planChunks(req.samples, SAMPLE_RATE);
+		// Extraction is part of the run, and on a long file it is the part the user used
+		// to watch the editor freeze through. Doing it here means the renderer hands over
+		// a path and gets segments back, holding none of the audio. No new status phase:
+		// the caller already reports "extracting-audio" around this call, and the work
+		// simply moved to the other side of the IPC.
+		const samples = req.samples ?? (await this.extract(req));
+		const totalSec = samples.length / SAMPLE_RATE;
+		const chunks = planChunks(samples, SAMPLE_RATE);
 		this.emit({ phase: "transcribe", completedSec: 0, totalSec });
 
 		const segments: SttPhraseSegment[] = [];
@@ -285,7 +326,7 @@ export class SttManager {
 			if (this.cancelEpoch !== epoch) throw cancelledError();
 			const offsetSec = chunk.startSample / SAMPLE_RATE;
 			const result = await this.transcribeChunk(
-				req.samples.subarray(chunk.startSample, chunk.endSample),
+				samples.subarray(chunk.startSample, chunk.endSample),
 				language,
 			).catch((error) => {
 				if (error instanceof Error && error.name === "AbortError") throw error;
@@ -402,6 +443,23 @@ export class SttManager {
 		this.cancelEpoch++;
 		await this.server.shutdown();
 	}
+
+	/** True when the helper reported Silero VAD loaded and ready. */
+	isVadAvailable(): boolean {
+		return this.server.status.vadAvailable;
+	}
+
+	/**
+	 * Run Voice Activity Detection (Silero VAD) to detect speech segments in samples.
+	 */
+	async detectSpeech(samples: Float32Array): Promise<SttVadSegment[]> {
+		if (this.shuttingDown) throw cancelledError();
+		await this.init();
+		if (!this.server.status.vadAvailable) {
+			throw new Error(STT_VAD_UNAVAILABLE);
+		}
+		return this.server.detectVadSegments({ samples });
+	}
 }
 
 let singleton: SttManager | null = null;
@@ -506,6 +564,13 @@ export function registerSttIpc(ipcMain: IpcMain): void {
 			} finally {
 				detach();
 			}
+		},
+	);
+	ipcMain.handle(
+		"stt:vad",
+		async (_event, req: { samples: Float32Array }): Promise<SttVadResponse> => {
+			const segments = await manager.detectSpeech(req.samples);
+			return { segments };
 		},
 	);
 	ipcMain.handle("stt:cancel", () => {

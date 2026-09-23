@@ -1,4 +1,4 @@
-import { ipcMain } from "electron";
+import { ipcMain, shell } from "electron";
 import type { AiEditionChatEvent } from "../../src/native/contracts";
 import {
 	NATIVE_BRIDGE_CHANNEL,
@@ -12,6 +12,7 @@ import {
 } from "../../src/native/contracts";
 import type { ChatEventSink } from "../ai-edition/chat-service";
 import type { DocumentService } from "../ai-edition/document-service";
+import { StylePresetError, type StylePresetService } from "../ai-edition/style-preset-service";
 import {
 	type CursorTelemetryLoadResult,
 	TelemetryCursorAdapter,
@@ -22,6 +23,7 @@ import { CursorService } from "../native-bridge/services/cursorService";
 import { ProjectService } from "../native-bridge/services/projectService";
 import { SystemService } from "../native-bridge/services/systemService";
 import { createNativeBridgeState } from "../native-bridge/store";
+import { GifExportJobs, isGifExportId } from "./gifExportJobs";
 
 export interface NativeBridgeContext {
 	getPlatform: () => NodeJS.Platform;
@@ -53,6 +55,8 @@ export interface NativeBridgeContext {
 	 */
 	getNativeWindowHandle?: (sender: import("electron").WebContents) => Buffer | null;
 	getAiEditionDocuments: () => DocumentService;
+	/** The one shared style preset service — it serialises writes per instance. */
+	getStylePresets: () => StylePresetService;
 	getAiEditionLlmConfig: () => import("../ai-edition/llm-config-store").LlmConfigStore;
 	runAiEditionChat: (
 		projectId: string,
@@ -238,6 +242,7 @@ export function registerNativeBridgeHandlers(context: NativeBridgeContext) {
 		deleteSession: context.deleteAiEditionChatSession,
 	});
 
+	const gifExportJobs = new GifExportJobs();
 	ipcMain.handle(NATIVE_BRIDGE_CHANNEL, async (event, request: unknown) => {
 		if (!isBridgeRequest(request)) {
 			return createErrorResponse(undefined, "INVALID_REQUEST", "Invalid native bridge request.");
@@ -353,6 +358,12 @@ export function registerNativeBridgeHandlers(context: NativeBridgeContext) {
 							return createSuccessResponse(requestId, {
 								backend: compositorViewService.probeBackend(),
 							});
+						case "probeSegmentation":
+							// No view needed either: the layout panel decides whether to offer the
+							// camera-background control before any preview exists.
+							return createSuccessResponse(requestId, {
+								support: compositorViewService.probeSegmentation(),
+							});
 						case "setRect":
 							compositorViewService.setRect(request.payload.id, request.payload.rect);
 							return createSuccessResponse(requestId, { ok: true });
@@ -422,17 +433,34 @@ export function registerNativeBridgeHandlers(context: NativeBridgeContext) {
 						}
 						case "exportGif": {
 							const sender = event.sender;
-							const stats = await compositorViewService.exportGif(
-								request.payload.clips,
-								request.payload.outPath,
-								request.payload.sceneJson,
-								request.payload.params,
-								(frames) => {
-									if (!sender.isDestroyed()) {
-										sender.send("export:native-progress", frames);
-									}
-								},
-							);
+							const exportId = request.payload?.exportId;
+							if (exportId !== undefined && !isGifExportId(exportId)) {
+								return createErrorResponse(requestId, "INVALID_REQUEST", "Invalid GIF export ID.");
+							}
+							const onProgress = (frames: number) => {
+								if (!sender.isDestroyed()) sender.send("export:native-progress", frames, exportId);
+							};
+							const stats = exportId
+								? await gifExportJobs.run(
+										sender,
+										exportId,
+										(progress) =>
+											compositorViewService.startGifExport(
+												request.payload.clips,
+												request.payload.outPath,
+												request.payload.sceneJson,
+												request.payload.params,
+												progress,
+											),
+										onProgress,
+									)
+								: await compositorViewService.exportGif(
+										request.payload.clips,
+										request.payload.outPath,
+										request.payload.sceneJson,
+										request.payload.params,
+										onProgress,
+									);
 							if (!stats) {
 								return createErrorResponse(
 									requestId,
@@ -441,6 +469,15 @@ export function registerNativeBridgeHandlers(context: NativeBridgeContext) {
 								);
 							}
 							return createSuccessResponse(requestId, stats);
+						}
+						case "cancelGifExport": {
+							const exportId = request.payload?.exportId;
+							if (!isGifExportId(exportId)) {
+								return createErrorResponse(requestId, "INVALID_REQUEST", "Invalid GIF export ID.");
+							}
+							return createSuccessResponse(requestId, {
+								accepted: gifExportJobs.cancel(event.sender, exportId),
+							});
 						}
 						default:
 							return createErrorResponse(
@@ -483,6 +520,7 @@ export function registerNativeBridgeHandlers(context: NativeBridgeContext) {
 									request.payload.projectId,
 									request.payload.path,
 									request.payload.label,
+									request.payload.kind,
 								),
 							);
 						case "document.removeAsset":
@@ -639,6 +677,50 @@ export function registerNativeBridgeHandlers(context: NativeBridgeContext) {
 					}
 				}
 
+				case "presets": {
+					const action = request.action as string;
+					const presets = context.getStylePresets();
+					switch (request.action) {
+						case "list":
+							return createSuccessResponse(requestId, await presets.list());
+						case "create":
+							return createSuccessResponse(
+								requestId,
+								await presets.create(request.payload.name, request.payload.appearance),
+							);
+						case "rename":
+							return createSuccessResponse(
+								requestId,
+								await presets.rename(request.payload.id, request.payload.name),
+							);
+						case "update":
+							return createSuccessResponse(
+								requestId,
+								await presets.update(request.payload.id, request.payload.appearance),
+							);
+						case "delete":
+							await presets.delete(request.payload.id);
+							return createSuccessResponse(requestId, { success: true });
+						case "reveal": {
+							// The path is built here from the id, never taken from the renderer.
+							const target = await presets.revealTarget(request.payload.id);
+							if (target.kind === "file") {
+								shell.showItemInFolder(target.path);
+							} else {
+								const openError = await shell.openPath(target.path);
+								if (openError) throw new Error(openError);
+							}
+							return createSuccessResponse(requestId, { success: true });
+						}
+						default:
+							return createErrorResponse(
+								requestId,
+								"UNSUPPORTED_ACTION",
+								`Unsupported presets action: ${action}`,
+							);
+					}
+				}
+
 				default:
 					return createErrorResponse(
 						requestId,
@@ -647,11 +729,32 @@ export function registerNativeBridgeHandlers(context: NativeBridgeContext) {
 					);
 			}
 		} catch (error) {
+			if (
+				request.domain === "compositor" &&
+				request.action === "exportGif" &&
+				error instanceof Error &&
+				error.message === "GIF_EXPORT_CANCELLED"
+			) {
+				return createErrorResponse(requestId, "CANCELLED", "GIF export cancelled.");
+			}
 			// Not retryable by default: most failures here are permanent (a missing
 			// file, a bad payload, an unavailable addon), and a blanket `true` tells
 			// the client to spin on them. The message keeps the reason but drops any
 			// absolute path — it crosses to the renderer and ends up in UI strings.
 			console.error(`native bridge ${domain}.${request.action} failed:`, error);
+			// Style preset failures the UI acts on keep their own code: a taken name is a
+			// prompt to pick another, not a crash. A TypeError there is a preset or name that
+			// failed validation, i.e. a bad request.
+			if (error instanceof StylePresetError) {
+				return createErrorResponse(
+					requestId,
+					error.code === "INVALID_ID" ? "INVALID_REQUEST" : error.code,
+					redactPaths(error.message),
+				);
+			}
+			if (domain === "presets" && error instanceof TypeError) {
+				return createErrorResponse(requestId, "INVALID_REQUEST", redactPaths(error.message));
+			}
 			return createErrorResponse(
 				requestId,
 				"INTERNAL_ERROR",

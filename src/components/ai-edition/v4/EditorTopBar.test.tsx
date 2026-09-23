@@ -283,3 +283,51 @@ describe("AppMenu", () => {
 		}
 	});
 });
+
+describe("EditorTopBar responsive affordances and tooltips", () => {
+	it("provides accessible name and title on the export button", () => {
+		renderTopBar("Demo Project");
+		const exportBtn = screen.getByRole("button", { name: "topbar.export" });
+		expect(exportBtn).toBeInTheDocument();
+		expect(exportBtn).toHaveAttribute("title", "topbar.export");
+	});
+
+	it("provides title tooltips for mode switch tabs", () => {
+		renderTopBar("Demo Project");
+		const tabs = screen.getAllByRole("tab");
+		expect(tabs).toHaveLength(3);
+		expect(tabs[0]).toHaveAttribute("title", "topbar.modes.media");
+		expect(tabs[1]).toHaveAttribute("title", "topbar.modes.edit");
+		expect(tabs[2]).toHaveAttribute("title", "topbar.modes.rec");
+	});
+
+	it("provides title tooltips on the saved status indicator", () => {
+		renderTopBar("Demo Project");
+		const savedIndicator = screen.getByTitle("topbar.saved");
+		expect(savedIndicator).toBeInTheDocument();
+		expect(savedIndicator).toHaveTextContent("topbar.saved");
+	});
+
+	// Upstream asserts a hardcoded "OpenScreen" on both attributes. A branded fork
+	// cannot: the name is PRODUCT_NAME, and unembedded the wordmark IS the button's
+	// accessible name, so `aria-label` and `title` are deliberately absent (they are
+	// set only when embedded, where the wordmark comes off — see EditorTopBar).
+	it("names the brand trigger with the product name, from the wordmark", () => {
+		renderTopBar("Demo Project");
+		const brandBtn = screen.getByRole("button", { name: PRODUCT_NAME });
+		expect(brandBtn).not.toHaveAttribute("title");
+		expect(brandBtn).not.toHaveAttribute("aria-label");
+	});
+
+	// The language toggle is commented out with the rest of the language UI (see
+	// LaunchWindow.tsx), so upstream's test for it cannot pass here. Restore it
+	// from upstream alongside that UI.
+	// it("provides accessible language toggle with short code and options", () => {
+	// 	renderTopBar("Demo Project");
+	// 	const langBtn = screen.getByRole("button", { name: "topbar.changeLanguage" });
+	// 	expect(langBtn).toBeInTheDocument();
+	// 	expect(langBtn).toHaveTextContent("EN");
+	// 	fireEvent.click(langBtn);
+	// 	expect(screen.getByText("English")).toBeInTheDocument();
+	// });
+});

@@ -6,16 +6,32 @@ import { useEditorDialogActions } from "@/contexts/EditorDialogsContext";
 import { useScopedT } from "@/contexts/I18nContext";
 import { useShortcuts } from "@/contexts/ShortcutsContext";
 import {
+	AUDIO_ROW_EXPANSION_PX,
+	computeAudioRowCount,
+} from "@/lib/ai-edition/document/audioTracks";
+import { createId } from "@/lib/ai-edition/document/ids";
+import {
 	migrateProjectDataToAxcutDocument,
 	migrateRawDocumentToCurrent,
 } from "@/lib/ai-edition/document/migrate";
 import {
-	applyProbedDuration,
-	replaceTimeline as replaceTimelineOp,
+	documentAfterProbedDuration,
+	PLACEHOLDER_DURATION_SEC,
 } from "@/lib/ai-edition/document/timeline";
+import {
+	type InsertSide,
+	insertDocumentWord,
+	removeDocumentWords,
+	setDocumentWordText,
+} from "@/lib/ai-edition/document/transcript";
 import { isModalOpen } from "@/lib/ai-edition/modalGuard";
-import { type AxcutClip, documentSchema } from "@/lib/ai-edition/schema";
-import { useProjectStore } from "@/lib/ai-edition/store/projectStore";
+import {
+	type AxcutAudioTrack,
+	type AxcutClip,
+	type AxcutDocument,
+	documentSchema,
+} from "@/lib/ai-edition/schema";
+import { saveWithDeadline, useProjectStore } from "@/lib/ai-edition/store/projectStore";
 import {
 	useAssetTranscriptions,
 	useAutoTranscription,
@@ -23,16 +39,24 @@ import {
 	useTranscriptionStore,
 } from "@/lib/ai-edition/store/transcriptionStore";
 import { useUndoRedoShortcuts } from "@/lib/ai-edition/store/undo";
+import { useChatPromptBus } from "@/lib/ai-edition/store/useChatPromptBus";
 import { useSequentialTimelineOps } from "@/lib/ai-edition/store/useSequentialTimelineOps";
 import { useTimeline } from "@/lib/ai-edition/store/useTimeline";
+import { isGeneratedAssetId } from "@/lib/ai-edition/timeline/clip-parts";
 import { newRegionDurationSec } from "@/lib/ai-edition/timeline/newRegionDuration";
+import {
+	dropTrimPillsByIds,
+	ventilateTimelineSpanToTrims,
+} from "@/lib/ai-edition/timeline/trim-mapping";
+import { firstTimelineBusyView } from "@/lib/ai-edition/transcription/status";
 import { matchesShortcut } from "@/lib/shortcuts";
 import { nativeBridgeClient } from "@/native";
 import type { AiEditionProjectSummary } from "@/native/contracts";
 import { resolveVisibleClips } from "@/native/sceneDescription";
 import { useNativePlaybackSync } from "@/native/useNativePlaybackSync";
 import { ExportDialog } from "./ExportDialog";
-import { LeftPanel } from "./LeftPanel";
+import { insertionsEnabled } from "./insertionsEnabled";
+import { ChatStripPanel } from "./LeftPanel";
 import {
 	EditClipModal,
 	NewProjectModal,
@@ -42,9 +66,9 @@ import {
 	type UnsavedChoice,
 } from "./Modals";
 import { Preview } from "./Preview";
-import type { TrimTarget } from "./RightPanes";
-import { importPendingRecording } from "./recordingImport";
+import { importPendingRecording, maybeSaveFreshRecordingAutoZooms } from "./recordingImport";
 import { useIncomingProjectPath } from "./useOpenProjectFile";
+import { AddAudioLayerDialog } from "./v4/AddAudioLayerDialog";
 import v4 from "./v4/EditorShellV4.module.css";
 import { type EditorMode, EditorTopBar } from "./v4/EditorTopBar";
 import { type Facet, FloatingInspector } from "./v4/FloatingInspector";
@@ -74,6 +98,10 @@ interface SeekTarget {
  * handlers that need it. The store write cadence is unchanged — `currentTimeSec`
  * is still the source of truth, still updated every frame.
  */
+// Stable empty list: a fresh `[]` each render would churn the preview's audio
+// element set on every playhead tick.
+const NO_AUDIO_TRACKS: AxcutAudioTrack[] = [];
+
 function NativePlaybackSync({
 	visibleClips,
 	clips,
@@ -87,6 +115,76 @@ function NativePlaybackSync({
 	// is measured against. resolveNativePosition needs both (see timelineMap).
 	useNativePlaybackSync(playing, currentTimeSec, visibleClips, clips);
 	return null;
+}
+
+export const DEFAULT_TIMELINE_HEIGHT_PX = 392;
+export const MIN_TIMELINE_HEIGHT_PX = 160;
+export const MAX_TIMELINE_HEIGHT_PX = 560;
+
+/**
+ * What one `loadedmetadata` event does, from the front of the write queue.
+ *
+ * Exported because it is only reachable from outside the component: the event
+ * arrives through Preview, PreviewCanvas, VirtualPreview and a real `<video>`
+ * decoding real media, which no test environment here provides. The decision
+ * itself lives in `documentAfterProbedDuration`, and is tested next to it.
+ *
+ * Every store read is at call time, not from a closure. By the time this runs the
+ * document may have moved on, and `originatingProjectId` is what says whether it
+ * moved to a different project.
+ */
+export async function runLoadedMetadataWrite(
+	durationSec: number,
+	assetId: string,
+	originatingProjectId: string | undefined,
+	deps: {
+		/** Defaults to the real auto-zoom pass; injected in tests. */
+		autoZoom?: (document: AxcutDocument) => Promise<unknown>;
+		saveTimeoutMs?: number;
+	} = {},
+): Promise<void> {
+	// ponytail: WebM recordings from MediaRecorder report NaN/Infinity until the
+	// main-process EBML fix lands. Seed against a placeholder so the timeline never
+	// gets stuck empty; `documentAfterProbedDuration` is what refuses to write it over
+	// a length something already measured. Auto-zoom is not fooled by it either --
+	// `hasProbedDurationForPendingAsset` asks the CLIPS, not the asset, and a clip
+	// still sitting at the placeholder reads as waiting.
+	const finite = Number.isFinite(durationSec) && durationSec > 0;
+	const knownSec = finite ? durationSec : PLACEHOLDER_DURATION_SEC;
+	const state = useProjectStore.getState();
+	// The placeholder exists so the FIRST clip is not empty, nothing more. Once a
+	// timeline is there, a length nothing measured has nothing to fold in -- and
+	// re-applying it to a clip already sitting at it means a `history: false` write on
+	// every metadata event for the same unmeasured take.
+	const next =
+		finite || state.document?.timeline.clips.length === 0
+			? documentAfterProbedDuration(state.document, assetId, knownSec, originatingProjectId)
+			: null;
+	if (next) {
+		// `history: false`: this is the probed duration being folded into the document
+		// on load, not something the user did — an undo landing on it would empty their
+		// timeline. Auto-zoom below is a later, undoable suggestion.
+		//
+		// Awaited so the queue can serialise it, but bounded: `saveDocument` awaits the
+		// bridge with no deadline of its own and never rejects, so a main process that
+		// stops answering would hold this queue slot — and every edit behind it — for
+		// the life of the renderer. The abandoned write is safe to let go of.
+		await saveWithDeadline(state.saveDocument(next, { history: false }), deps.saveTimeoutMs);
+	}
+	// Re-checked rather than assumed: the await above is exactly when a project
+	// switch lands, and the check inside the decision spoke only for the document as
+	// it was before it. Handing the auto-zoom pass another project's document would
+	// not write zooms into it — `canApplyFreshRecordingAutoZooms` refuses a document
+	// that does not hold the pending recording — but the passes before that check DO
+	// clear the pending flag on what they are given, so the take that was actually
+	// imported would silently lose its auto-zoom. A closed project ends the step for
+	// the same reason: there is nothing left this event belongs to.
+	const settled = useProjectStore.getState().document;
+	if (!settled || settled.project.id !== originatingProjectId) return;
+	// A document with no assets has no take to suggest zooms for. The auto-zoom pass
+	// would refuse it anyway; not calling it keeps "nothing to do" meaning nothing.
+	if (settled.assets.length === 0) return;
+	await (deps.autoZoom ?? maybeSaveFreshRecordingAutoZooms)(settled);
 }
 
 export function NewEditorShell() {
@@ -117,12 +215,49 @@ export function NewEditorShell() {
 	// v4 shell: three modes (Media / Edit / Rec), a collapsible agent (chat)
 	// column, and a floating facet inspector over the stage.
 	const [mode, setMode] = useState<EditorMode>("edit");
-	const [chatOpen, setChatOpen] = useState(true);
+	const [chatOpen, setChatOpen] = useState(false);
+	const pendingChatPrompt = useChatPromptBus((s) => s.pending);
+	useEffect(() => {
+		if (pendingChatPrompt && !chatOpen) {
+			setChatOpen(true);
+		}
+	}, [pendingChatPrompt, chatOpen]);
 	const [chatWidthPx, setChatWidthPx] = useState(
 		() => Number(localStorage.getItem("os-editor-chat-width")) || 392,
 	);
-	const [timelineHeightPx, setTimelineHeightPx] = useState(
-		() => Number(localStorage.getItem("os-editor-timeline-height")) || 308,
+	const [timelineBaseHeightPx, setTimelineBaseHeightPx] = useState(() => {
+		const raw = localStorage.getItem("os-editor-timeline-height");
+		// One-time migration: if legacy 308px default exists without the migration marker,
+		// migrate it once to DEFAULT_TIMELINE_HEIGHT_PX so existing users see all lanes,
+		// but allow them to intentionally choose 308px in the future.
+		// Also migrate intermediate 344px default to DEFAULT_TIMELINE_HEIGHT_PX.
+		const migrated = localStorage.getItem("os-editor-timeline-height-migrated");
+		if (!migrated && (!raw || Number(raw) === 308 || Number(raw) === 344)) {
+			localStorage.setItem("os-editor-timeline-height-migrated", "true");
+			localStorage.setItem("os-editor-timeline-height", String(DEFAULT_TIMELINE_HEIGHT_PX));
+			return DEFAULT_TIMELINE_HEIGHT_PX;
+		}
+		if (raw === "344") {
+			localStorage.setItem("os-editor-timeline-height", String(DEFAULT_TIMELINE_HEIGHT_PX));
+			return DEFAULT_TIMELINE_HEIGHT_PX;
+		}
+		const val = raw ? Number(raw) : 0;
+		if (!val) {
+			return DEFAULT_TIMELINE_HEIGHT_PX;
+		}
+		return Math.min(MAX_TIMELINE_HEIGHT_PX, Math.max(MIN_TIMELINE_HEIGHT_PX, val));
+	});
+
+	// The timeline height automatically expands by AUDIO_ROW_EXPANSION_PX (+29px)
+	// whenever the project transitions between 1 and 2 stacked audio rows (e.g. voiceover + music).
+	const audioRowCount = useMemo(
+		() => computeAudioRowCount(document?.audioTracks ?? []),
+		[document?.audioTracks],
+	);
+	const extraAudioHeightPx = Math.max(0, audioRowCount - 1) * AUDIO_ROW_EXPANSION_PX;
+	const timelineHeightPx = Math.min(
+		MAX_TIMELINE_HEIGHT_PX,
+		Math.max(MIN_TIMELINE_HEIGHT_PX, timelineBaseHeightPx + extraAudioHeightPx),
 	);
 	const [inspectorOpen, setInspectorOpen] = useState(true);
 	const [facet, setFacet] = useState<Facet>("effects");
@@ -166,6 +301,12 @@ export function NewEditorShell() {
 				.map((v) => v.assetId),
 		[transcriptions],
 	);
+	// For the pane-level busy label: timeline-scoped like the gate, so an
+	// off-timeline job cannot relabel controls the gate keeps enabled.
+	const timelineBusyView = useMemo(
+		() => firstTimelineBusyView(document, transcriptions),
+		[document, transcriptions],
+	);
 	const tl = useTimeline();
 	// An undo only puts the restored document back in the store and marks it dirty,
 	// so without this the reverted state never reached disk: close the window and the
@@ -192,7 +333,11 @@ export function NewEditorShell() {
 	// don't race each other's save and overwrite one another in the
 	// store. The hook reads the doc inside the chain (after awaiting the
 	// previous save) — see its source for the race this fixes.
-	const { apply: applyTimelineOp, enqueue: enqueueTimelineWrite } = useSequentialTimelineOps({
+	// Only `enqueue` now: the two trim handlers were the last callers of `apply`, and both
+	// read the document inside the chain so a cut cannot be overwritten by a word edit
+	// landing between the read and the save. The `add_trim_range` / `remove_trim_range` ops
+	// stay for the agent, which addresses clips rather than moments.
+	const { enqueue: enqueueTimelineWrite } = useSequentialTimelineOps({
 		fallbackDocument: document,
 		saveDocument,
 	});
@@ -246,7 +391,7 @@ export function NewEditorShell() {
 		void (async () => {
 			if (!window.electronAPI) return;
 			try {
-				if (await importPendingRecording()) {
+				if (await importPendingRecording((warning) => toast.warning(warning))) {
 					toast.success("Recording added to a new project");
 					return;
 				}
@@ -340,6 +485,10 @@ export function NewEditorShell() {
 
 	const videoSources = useMemo(() => {
 		if (!document) return [];
+		// Every asset, insertions included — an insertion is a clip on an asset with a real
+		// path. A file the save has not written yet simply fails to load, and the player
+		// reports it the way it reports any unreadable source: the edit stands, the picture
+		// catches up on the next save.
 		return document.assets.map((asset) => ({
 			id: asset.id,
 			filePath: /^(https?|blob|data):/.test(asset.originalPath) ? undefined : asset.originalPath,
@@ -356,53 +505,26 @@ export function NewEditorShell() {
 
 	const handleLoadedMetadata = useCallback(
 		(durationSec: number, assetId: string) => {
-			// ponytail: WebM recordings from MediaRecorder report NaN/Infinity
-			// until the main-process EBML fix lands. Fall back to a 60s seed if
-			// duration is unknown so the timeline never gets stuck on an empty
-			// placeholder. All store reads go through getState() to avoid
-			// stale-closure bugs.
-			const known = Number.isFinite(durationSec) && durationSec > 0 ? durationSec : 60;
-			const state = useProjectStore.getState();
-			setSourceDuration(known);
-			const doc = state.document;
-			if (!doc || doc.assets.length === 0) return;
-			if (doc.timeline.clips.length === 0) {
-				// ponytail: replaceTimeline derives clip length from
-				// asset.durationSec, which import never populates — without this
-				// patch the first auto-created clip silently comes out empty
-				// (normalizeIntervals clamps against a 0 duration and drops it).
-				const primaryAssetId = doc.project.primaryAssetId ?? doc.assets[0]?.id;
-				const docWithDuration = primaryAssetId
-					? {
-							...doc,
-							assets: doc.assets.map((a) =>
-								a.id === primaryAssetId ? { ...a, durationSec: known } : a,
-							),
-						}
-					: doc;
-				const next = replaceTimelineOp(
-					docWithDuration,
-					[{ startSec: 0, endSec: known }],
-					"Auto-created full-duration clip",
-				);
-				// `history: false` for both writes in this callback: they are the probed
-				// duration being folded into the document on load, not something the user
-				// did — an undo landing on one of them would empty their timeline.
-				void state.saveDocument(next, { history: false });
-				return;
-			}
-			// Hand the probed duration to the pure document layer: it patches only the
-			// clips of THIS asset that are still waiting for a real length (the
-			// pre-probe placeholder, or the extent-less clip a legacy v2 import mints),
-			// shifts what follows, and brings the modifiers along — anchoring the ones
-			// migration had to leave unanchored. Returns the document untouched when
-			// nothing is waiting, so there is nothing to guard here.
-			const next = applyProbedDuration(doc, assetId, known);
-			if (next !== doc) {
-				void state.saveDocument(next, { history: false });
-			}
+			setSourceDuration(
+				Number.isFinite(durationSec) && durationSec > 0 ? durationSec : PLACEHOLDER_DURATION_SEC,
+			);
+			// Read before queueing: this is the project the event belongs to.
+			const originatingProjectId = useProjectStore.getState().document?.project.id;
+			// On the shared write queue, and reading the document inside it. Folding a
+			// probed duration in is a read-modify-write of the whole document, which is
+			// what `useSequentialTimelineOps` exists for -- its header says anything that
+			// reads the doc and saves it back belongs there. Off the queue, `getState()`
+			// returns the PRE-edit document while a user's save is still in flight (the
+			// store is only written once the bridge answers), and the full snapshot built
+			// from it lands after theirs and takes their edit with it.
+			//
+			// The auto-zoom pass goes on the same queued task rather than after it, so a
+			// fresh take's suggestions are serialised against user edits too.
+			void enqueueTimelineWrite(() =>
+				runLoadedMetadataWrite(durationSec, assetId, originatingProjectId),
+			);
 		},
-		[setSourceDuration],
+		[setSourceDuration, enqueueTimelineWrite],
 	);
 
 	const handleSeek = useCallback(
@@ -438,7 +560,16 @@ export function NewEditorShell() {
 	const handleDropAsset = useCallback(
 		(assetId: string) =>
 			enqueueTimelineWrite(() => {
-				const at = useProjectStore.getState().document?.timeline.clips.length ?? 0;
+				const doc = useProjectStore.getState().document;
+				// An audio asset has no video, so it must never become a clip (issue
+				// #350) — it goes on the audio lane as a track. Adding it "to the
+				// timeline" reuses its existing track if it already has one (importing
+				// already placed one) so the same file can't stack up duplicate lanes.
+				if (doc?.assets.find((a) => a.id === assetId)?.kind === "audio") {
+					if (doc.audioTracks.some((t) => t.assetId === assetId)) return Promise.resolve();
+					return tl.addAudioTrack(assetId).then(() => undefined);
+				}
+				const at = doc?.timeline.clips.length ?? 0;
 				return tl.insertClipAt(assetId, at);
 			}).catch((error) => {
 				toast.error(te("mediaStage.couldNotAddAsset"), {
@@ -582,37 +713,142 @@ export function NewEditorShell() {
 	// axcut's `queueAddTrimRange` / `queueRemoveTrimRange` callbacks in
 	// apps/web/src/App.tsx. The serialised save + inside-the-chain doc
 	// read is owned by `useSequentialTimelineOps` above.
-	const handleAddTrimRange = useCallback(
-		(target: TrimTarget, startSec: number, endSec: number, reason: string) => {
-			// `clipId` is what keeps the cut on the block the user typed in: with two clips
-			// over the same media, an asset-only trim showed up on both (see `trimAppliesToClip`).
-			void applyTimelineOp(
-				{
-					type: "add_trim_range",
-					assetId: target.assetId,
-					clipId: target.clipId,
-					startSec,
-					endSec,
+	// transcript-pane → a cut, authored as a stretch of the RAW ruler (issue #560).
+	//
+	// The pane used to hand over the asset and clip the words belonged TO, which is how a
+	// cut made on the voiceover lane came to be anchored on an audio fragment: it removed
+	// nothing from playback or the export while the word turned red. A cut is a moment of
+	// the programme, so the clips that carry it are resolved HERE, from the clips actually
+	// under the span — `ventilateTimelineSpanToTrims`, the same primitive a zoom straddling
+	// a boundary uses, so one gesture can become several rows and stay one pill.
+	//
+	// On `enqueueTimelineWrite`, not `applyTimelineOp`'s convenience or `tl.setTrimEntries`:
+	// the latter reads `useProjectStore.getState().document` unqueued, so correcting a word
+	// and immediately cutting the next one would let the word edit overwrite the cut. That
+	// is exactly the failure this chain exists to prevent.
+	const handleTrimTimelineSpan = useCallback(
+		(startSec: number, endSec: number, reason: string) => {
+			void enqueueTimelineWrite(async () => {
+				const doc = useProjectStore.getState().document;
+				if (!doc) return;
+				const ranges = ventilateTimelineSpanToTrims(startSec, endSec, doc.timeline.clips);
+				if (ranges.length === 0) {
+					// No nearest-clip fallback. A span over a gap, or past the last clip, names
+					// no film — cutting the closest thing instead would remove something the
+					// user never pointed at.
+					toast.error(te("errors.trimNoFilm"));
+					return;
+				}
+				const rows = ranges.map((range) => ({
+					id: createId("trim"),
+					assetId: range.assetId,
+					clipId: range.clipId,
+					startSec: range.sourceStartSec,
+					endSec: range.sourceEndSec,
 					reason,
-				},
-				{ history: true },
-			);
+					origin: "user" as const,
+				}));
+				await saveDocument(
+					{
+						...doc,
+						timeline: { ...doc.timeline, trimRanges: [...doc.timeline.trimRanges, ...rows] },
+					},
+					{ history: true },
+				);
+			});
 		},
-		[applyTimelineOp],
+		[enqueueTimelineWrite, saveDocument, te],
 	);
 
-	const handleRemoveTrimRange = useCallback(
-		(trimId: string) => {
-			void applyTimelineOp(
-				{
-					type: "remove_trim_range",
-					trimId,
-					reason: "Restored from transcript pane.",
-				},
-				{ history: true },
-			);
+	// Every row of the pill at once: a cut ventilated across a clip boundary is several
+	// rows and one pill, and `dropTrimPillsByIds` resolves the rest of the group from any
+	// member. Dropping half would leave the word still cut with nothing on screen to say so.
+	const handleRemoveTrimRanges = useCallback(
+		(trimIds: string[]) => {
+			if (trimIds.length === 0) return;
+			void enqueueTimelineWrite(async () => {
+				const doc = useProjectStore.getState().document;
+				if (!doc) return;
+				const next = dropTrimPillsByIds(doc.timeline.trimRanges, doc.timeline.clips, trimIds);
+				if (next.length === doc.timeline.trimRanges.length) return;
+				await saveDocument(
+					{ ...doc, timeline: { ...doc.timeline, trimRanges: next } },
+					{ history: true },
+				);
+			});
 		},
-		[applyTimelineOp],
+		[enqueueTimelineWrite, saveDocument],
+	);
+
+	// transcript-pane → the word's own text. Unlike Backspace (which writes a trimRange and
+	// cuts the media), this writes only `transcript.words[].text`: the captions follow, the
+	// film is untouched. Queued on the SAME chain as the trims so correcting a word and
+	// cutting the next one cannot overwrite each other's save.
+	const handleSetWordText = useCallback(
+		(assetId: string, wordId: string, text: string) => {
+			void enqueueTimelineWrite(async () => {
+				// Read inside the chain: the previous save has resolved by now, so the store
+				// holds the document this edit has to be applied to.
+				const doc = useProjectStore.getState().document;
+				if (!doc) return;
+				// Correcting a transcribed word is a shipped feature; retyping an INSERTED one
+				// resizes generated media and asks the save for a new file of it, which is the
+				// same thing the gate above refuses. A release build must not do either.
+				if (!insertionsEnabled() && isGeneratedAssetId(assetId)) return;
+				try {
+					await saveDocument(setDocumentWordText(doc, assetId, wordId, text), { history: true });
+				} catch (err) {
+					// The word or its transcript vanished under the edit (a regeneration landed
+					// mid-typing). Nothing to retry — say so rather than dropping it silently.
+					toast.error(te("errors.wordEditFailed"), {
+						description: err instanceof Error ? err.message : String(err),
+					});
+				}
+			});
+		},
+		[enqueueTimelineWrite, saveDocument, te],
+	);
+
+	// transcript-pane → a word nobody said. It takes the silence it is dropped into and no
+	// audio at all, so unlike a cut it changes nothing about the film; today it reaches the
+	// captions and stops there.
+	const handleInsertWord = useCallback(
+		(assetId: string, anchorWordId: string, side: InsertSide, text: string) => {
+			if (!insertionsEnabled()) return;
+			void enqueueTimelineWrite(async () => {
+				const doc = useProjectStore.getState().document;
+				if (!doc) return;
+				try {
+					await saveDocument(insertDocumentWord(doc, assetId, anchorWordId, side, text), {
+						history: true,
+					});
+				} catch (err) {
+					toast.error(te("errors.wordInsertFailed"), {
+						description: err instanceof Error ? err.message : String(err),
+					});
+				}
+			});
+		},
+		[enqueueTimelineWrite, saveDocument, te],
+	);
+
+	// Deleting inserted words. One save for the whole set, so a Backspace over several of
+	// them is one Ctrl+Z, and the document layer refuses anything that was actually spoken.
+	const handleRemoveWords = useCallback(
+		(assetId: string, wordIds: string[]) => {
+			void enqueueTimelineWrite(async () => {
+				const doc = useProjectStore.getState().document;
+				if (!doc || wordIds.length === 0) return;
+				try {
+					await saveDocument(removeDocumentWords(doc, assetId, wordIds), { history: true });
+				} catch (err) {
+					toast.error(te("errors.wordRemoveFailed"), {
+						description: err instanceof Error ? err.message : String(err),
+					});
+				}
+			});
+		},
+		[enqueueTimelineWrite, saveDocument, te],
 	);
 
 	const handleSelectProject = useCallback(
@@ -781,6 +1017,56 @@ export function NewEditorShell() {
 		});
 	}, []);
 
+	// Voiceover recording (the one audio gesture that is not a file import). The
+	// dialog owns the mic; the shell owns the transport and the placement.
+	const [voiceoverFlow, setVoiceoverFlow] = useState<{ maxDurationSec: number } | null>(null);
+	// The playhead as it was when RECORDING STARTED. Recording plays the video so
+	// the user can narrate what they see, which means the live playhead has moved
+	// on by the take's own length by the time the take ends — reading it then
+	// placed every voiceover one full take-length to the right of where it was
+	// spoken. Captured on the way in, used on the way out.
+	const voiceoverStartSecRef = useRef(0);
+
+	const openVoiceoverFlow = useCallback(() => {
+		const doc = useProjectStore.getState().document;
+		if (!doc) return;
+		const total = doc.timeline.clips.reduce((max, c) => Math.max(max, c.timelineEndSec), 0);
+		const playhead = useProjectStore.getState().currentTimeSec;
+		voiceoverStartSecRef.current = playhead;
+		// Recording stops itself at the end of the timeline: a take can never
+		// outlive the video it was recorded over.
+		setVoiceoverFlow({ maxDurationSec: Math.max(0.5, total - playhead) });
+	}, []);
+
+	// Silences the timeline's own audio tracks for the duration of a take — see
+	// where it is passed to the preview.
+	const [voiceoverRecording, setVoiceoverRecording] = useState(false);
+
+	const handleVoiceoverRecordingStart = useCallback(() => {
+		// Re-capture: the user may have scrubbed between opening the dialog and
+		// hitting Record, and playback starts from wherever the playhead is now.
+		voiceoverStartSecRef.current = useProjectStore.getState().currentTimeSec;
+		setVoiceoverRecording(true);
+		if (videoElement?.paused) void videoElement.play().catch(() => undefined);
+	}, [videoElement]);
+
+	const handleVoiceoverRecordingStop = useCallback(() => {
+		setVoiceoverRecording(false);
+		videoElement?.pause();
+	}, [videoElement]);
+
+	const handleVoiceoverReady = useCallback(
+		async (assetId: string, durationSec: number) => {
+			setVoiceoverFlow(null);
+			await tl.addAudioTrack(assetId, voiceoverStartSecRef.current, {
+				kind: "voiceover",
+				durationSec,
+				spanSec: durationSec,
+			});
+		},
+		[tl],
+	);
+
 	const pasteRegion = useCallback(async () => {
 		const doc = useProjectStore.getState().document;
 		if (!doc) return;
@@ -797,6 +1083,21 @@ export function NewEditorShell() {
 			return;
 		}
 
+		// Validate before building anything. The clipboard outlives the project, so
+		// a track copied in one project and pasted in another would reference an
+		// asset that only exists back where it came from — a pill that plays
+		// nothing and exports nothing. Audio is the only kind carrying a reference
+		// out of the document today; the next one belongs here too, rather than in
+		// its own branch below.
+		const referencedAssetId = (snapshot.region as { assetId?: unknown }).assetId;
+		if (
+			typeof referencedAssetId === "string" &&
+			!doc.assets.some((a) => a.id === referencedAssetId)
+		) {
+			toast.error(te("regionClipboard.pasteAssetMissing"));
+			return;
+		}
+
 		const { anchorRegionsWithDerivedMs } = await import("@/lib/ai-edition/timeline/timelineMap");
 		const { createId } = await import("@/lib/ai-edition/document/ids");
 
@@ -804,6 +1105,27 @@ export function NewEditorShell() {
 		const timeMs = Math.round(useProjectStore.getState().currentTimeSec * 1000);
 		const src = snapshot.region as { startMs: number; endMs: number };
 		const prefix = snapshot.kind === "annotation" ? "ann" : snapshot.kind;
+
+		// Audio re-ventilates through its own anchorer, which advances each
+		// fragment's source offset — the generic one would copy the offset into
+		// every fragment and restart the file at each cut.
+		if (snapshot.kind === "audio") {
+			const { placeAudioTrackInDocument } = await import("@/lib/ai-edition/document/audioTracks");
+			const track = {
+				...(snapshot.region as unknown as AxcutAudioTrack),
+				id: createId("audio"),
+				trackId: undefined,
+				startMs: timeMs,
+				endMs: timeMs + (Number(src.endMs) - Number(src.startMs)),
+			};
+			// Pasting onto an occupied lane queues behind what is there rather than doubling
+			// the row — the same rule every other placement obeys (issue #560).
+			const next = placeAudioTrackInDocument(doc, track, () => createId("audio"), "create");
+			if (next === doc) return;
+			await saveDocument(next, { history: true });
+			toast.success("Region pasted");
+			return;
+		}
 		const pasted = {
 			...snapshot.region,
 			id: createId(prefix),
@@ -853,7 +1175,7 @@ export function NewEditorShell() {
 		// `tl` belongs here now that the trim branch calls tl.addTrim: useTimeline
 		// returns a fresh object each render, so memoizing on saveDocument alone
 		// would paste through a callback holding a stale document.
-	}, [saveDocument, tl]);
+	}, [saveDocument, tl, te]);
 
 	// Copy the SELECTED pill. Reads the same arrays the lanes render, so what gets
 	// copied is what the user is looking at — the old version dug into the raw
@@ -876,6 +1198,22 @@ export function NewEditorShell() {
 			);
 			if (!group) return;
 			copyRegion({ kind: "trim", region: { durationSec: group.end - group.start } });
+			setCopiedClipId(null);
+			toast.success("Region copied");
+			return;
+		}
+
+		// An audio track is stored as one fragment per clip it covers; the user
+		// copied the PILL, so collapse it back before it goes on the clipboard.
+		if (sel.kind === "audio") {
+			const { collapseTracksToPills, trackGroupId } = await import(
+				"@/lib/ai-edition/document/audioTracks"
+			);
+			const [pill] = collapseTracksToPills(
+				tl.audioTracks.filter((t) => trackGroupId(t) === sel.id),
+			);
+			if (!pill) return;
+			copyRegion({ kind: "audio", region: pill as unknown as Record<string, unknown> });
 			setCopiedClipId(null);
 			toast.success("Region copied");
 			return;
@@ -959,6 +1297,14 @@ export function NewEditorShell() {
 				}
 				if (tl.selection) {
 					void tl.removeRegion(tl.selection.kind, tl.selection.id);
+					return;
+				}
+				// An audio track is selected through its OWN channel, not `selection`
+				// (the two are mutually exclusive — see addAudioTrack), so it needs its
+				// own branch here or Delete does nothing on the one lane that looks
+				// exactly like every other.
+				if (tl.selectedAudioTrackId) {
+					void tl.removeAudioTrack(tl.selectedAudioTrackId);
 				}
 			};
 
@@ -1041,6 +1387,18 @@ export function NewEditorShell() {
 			if (matchesShortcut(e, shortcuts.addAnnotation, isMac)) {
 				e.preventDefault();
 				void tl.addAnnotation(newRegionDurationSec());
+				return;
+			}
+			// Unlike its neighbours this opens a file picker rather than dropping a region at
+			// the playhead — there is nothing to size, so it takes no duration (issue #350).
+			if (matchesShortcut(e, shortcuts.addAudio, isMac)) {
+				e.preventDefault();
+				void tl.addAudio();
+				return;
+			}
+			if (matchesShortcut(e, shortcuts.addVoiceover, isMac)) {
+				e.preventDefault();
+				openVoiceoverFlow();
 				return;
 			}
 			if (matchesShortcut(e, shortcuts.addSpeed, isMac)) {
@@ -1134,34 +1492,44 @@ export function NewEditorShell() {
 		(e: React.PointerEvent) => {
 			e.preventDefault();
 			const startY = e.clientY;
-			const startHeight = timelineHeightPx;
-			let latest = startHeight;
+			const startBase = timelineBaseHeightPx;
+			let latestBase = startBase;
 			const move = (ev: PointerEvent) => {
 				// Dragging the handle up (negative clientY delta) enlarges the
 				// timeline, since it sits below the handle.
-				latest = Math.min(480, Math.max(160, startHeight - (ev.clientY - startY)));
-				setTimelineHeightPx(latest);
+				const renderedTarget = Math.min(
+					MAX_TIMELINE_HEIGHT_PX,
+					Math.max(MIN_TIMELINE_HEIGHT_PX, startBase + extraAudioHeightPx - (ev.clientY - startY)),
+				);
+				latestBase = Math.max(MIN_TIMELINE_HEIGHT_PX, renderedTarget - extraAudioHeightPx);
+				setTimelineBaseHeightPx(latestBase);
 			};
 			const up = () => {
 				window.removeEventListener("pointermove", move);
 				window.removeEventListener("pointerup", up);
-				localStorage.setItem("os-editor-timeline-height", String(latest));
+				localStorage.setItem("os-editor-timeline-height", String(latestBase));
 			};
 			window.addEventListener("pointermove", move);
 			window.addEventListener("pointerup", up);
 		},
-		[timelineHeightPx],
+		[timelineBaseHeightPx, extraAudioHeightPx],
 	);
 
 	const transcriptProps = {
 		clips,
+		audioTracks: document?.audioTracks ?? [],
 		transcripts: document?.transcripts ?? [],
 		assets: document?.assets ?? [],
 		trimRanges: document?.timeline?.trimRanges ?? [],
 		busyAssetIds,
+		transcriptions,
+		busyView: timelineBusyView,
 		onSeek: handleSeek,
-		onAddTrimRange: handleAddTrimRange,
-		onRemoveTrimRange: handleRemoveTrimRange,
+		onTrimTimelineSpan: handleTrimTimelineSpan,
+		onRemoveTrimRanges: handleRemoveTrimRanges,
+		onSetWordText: handleSetWordText,
+		onInsertWord: handleInsertWord,
+		onRemoveWords: handleRemoveWords,
 		onTranscribe: handleTranscribe,
 		canTranscribe: hasAsset,
 		isTranscribing: transcriptGate.state === "pending",
@@ -1202,7 +1570,7 @@ export function NewEditorShell() {
 				{mode === "edit" && chatOpen ? (
 					<>
 						<aside className={v4.agent} aria-label={te("shell.aiEditor")}>
-							<LeftPanel active="chat" />
+							<ChatStripPanel />
 						</aside>
 						<div
 							className={v4.chatResizeHandle}
@@ -1246,6 +1614,20 @@ export function NewEditorShell() {
 									hasProject={hasProject}
 									hasAsset={hasAsset}
 									videoSources={videoSources}
+									// While the timeline is empty the preview mounts this asset rather
+									// than whichever one sorts first, so the clip `handleLoadedMetadata`
+									// seeds comes from the video it is sized against.
+									primaryAssetId={document?.project.primaryAssetId}
+									// Imported audio tracks (issue #350). `videoSources` already
+									// resolves a URL for every asset (audio included), so it doubles as
+									// the audio source list; VirtualPreview looks each track up by assetId.
+									// Nothing already on the timeline plays while a take is being
+									// recorded. On speakers it bleeds straight into the microphone
+									// and lands in the new take; even on headphones, narrating over
+									// an earlier voiceover is not what the button offers. The video
+									// itself keeps playing — that is what the user is narrating to.
+									audioTracks={voiceoverRecording ? NO_AUDIO_TRACKS : tl.audioTracks}
+									audioSources={videoSources}
 									clips={clips}
 									zoomRegions={tl.zoomRegions}
 									speedRegions={tl.speedRegions}
@@ -1335,6 +1717,7 @@ export function NewEditorShell() {
 						onTogglePlay={togglePlay}
 						onPrevClip={handlePrevClip}
 						onNextClip={handleNextClip}
+						onAddVoiceover={openVoiceoverFlow}
 						onEditClip={setEditClipTarget}
 					/>
 				</div>
@@ -1394,6 +1777,21 @@ export function NewEditorShell() {
 				onChoose={handleConfirmUnsaved}
 			/>
 			<ExportDialog open={exportOpen} onClose={() => setExportOpen(false)} document={document} />
+			<AddAudioLayerDialog
+				open={voiceoverFlow !== null}
+				maxDurationSec={voiceoverFlow?.maxDurationSec ?? 0}
+				onClose={() => {
+					// Belt and braces: the recorder's own stop handler clears this, but a
+					// flow that ends any other way must not leave the timeline muted.
+					setVoiceoverRecording(false);
+					setVoiceoverFlow(null);
+				}}
+				onComplete={(assetId, durationSec) => {
+					void handleVoiceoverReady(assetId, durationSec);
+				}}
+				onRecordingStart={handleVoiceoverRecordingStart}
+				onRecordingStop={handleVoiceoverRecordingStop}
+			/>
 		</div>
 	);
 }

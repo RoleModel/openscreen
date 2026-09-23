@@ -32,7 +32,7 @@ interface Window {
 		/** Native (D3D) export progress — frames encoded so far, pushed at ~10 Hz max while
 		 *  `compositor.export`/`compositor.exportMulti` runs. Distinct from `exportOnFrameAck`,
 		 *  the OLD web/CPU pipeline's per-frame ack, not a progress signal. */
-		onNativeExportProgress?: (callback: (frames: number) => void) => () => void;
+		onNativeExportProgress?: (callback: (frames: number, exportId?: string) => void) => () => void;
 		getSources: (opts: Electron.SourcesOptions) => Promise<ProcessedDesktopSource[]>;
 		switchToEditor: () => Promise<void>;
 		switchToHud: () => Promise<void>;
@@ -51,9 +51,14 @@ interface Window {
 			opened: boolean;
 			reason?: string;
 		}>;
-		selectSource: (source: ProcessedDesktopSource) => Promise<ProcessedDesktopSource | null>;
+		selectSource: (
+			source: ProcessedDesktopSource,
+			options?: { persist?: boolean },
+		) => Promise<ProcessedDesktopSource | null>;
 		getSelectedSource: () => Promise<ProcessedDesktopSource | null>;
-		onSelectedSourceChanged: (callback: (source: ProcessedDesktopSource) => void) => () => void;
+		onSelectedSourceChanged: (
+			callback: (source: ProcessedDesktopSource | null) => void,
+		) => () => void;
 		getRecordingPrefs: () => Promise<import("./ipc/handlers").RecordingPrefs>;
 		setRecordingPrefs: (
 			prefs: Partial<import("./ipc/handlers").RecordingPrefs>,
@@ -81,7 +86,10 @@ interface Window {
 		requestNativeMacCursorAccess: () => Promise<{
 			success: boolean;
 			granted: boolean;
-			status: string;
+			// "not-determined" is the only genuine denial; the rest mean the helper
+			// never got to ask. See macNativeCursorRecordingSession.ts.
+			status: "granted" | "not-determined" | "missing-helper" | "error" | "exited" | "timeout";
+			accessibilityTrusted: boolean;
 			error?: string;
 		}>;
 		assetBaseUrl: string;
@@ -176,6 +184,10 @@ interface Window {
 			session?: import("../src/lib/recordingSession").RecordingSession;
 			message?: string;
 			discarded?: boolean;
+			/** The take ended before it was stopped, but its recording was kept. */
+			warning?: string;
+			/** The stop failed and the recording was recovered from what was on disk. */
+			recovered?: boolean;
 			error?: string;
 		}>;
 		attachNativeMacWebcamRecording: (payload: {
@@ -294,6 +306,23 @@ interface Window {
 			message?: string;
 			error?: string;
 		}>;
+		// Import an external audio file from the timeline toolbar (issue #350).
+		openAudioFilePicker: () => Promise<{
+			success: boolean;
+			path?: string;
+			name?: string;
+			canceled?: boolean;
+			message?: string;
+			error?: string;
+		}>;
+		// Persist an in-editor voiceover take (raw MediaRecorder bytes) under the
+		// recordings dir, so it outlives the session like every other asset.
+		saveRecordedVoiceover: (data: ArrayBuffer) => Promise<{
+			success: boolean;
+			path?: string;
+			message?: string;
+			error?: string;
+		}>;
 		setCurrentVideoPath: (path: string) => Promise<{ success: boolean }>;
 		setCurrentRecordingSession: (
 			session: import("../src/lib/recordingSession").RecordingSession | null,
@@ -306,6 +335,8 @@ interface Window {
 			success: boolean;
 			session?: RecordingSession | null;
 			canceled?: boolean;
+			/** Why this recording ended before it was stopped, when it did. */
+			warning?: string;
 		}>;
 		findRecordingCamera: (videoPath: string) => Promise<{
 			success: boolean;
@@ -432,7 +463,21 @@ interface Window {
 		/** Total pointer travel since `beginHudOverlayDrag`, not a per-frame delta. */
 		dragHudOverlayTo: (deltaX: number, deltaY: number) => void;
 		endHudOverlayDrag: () => void;
-		setHudOverlaySize: (width: number, height: number) => void;
+		/** Resizes the overlay and reports the visible stack's rect inside the requested
+		 *  size (window-relative); positioning decisions are made on that rect. */
+		setHudOverlaySize: (
+			width: number,
+			height: number,
+			content: { x: number; y: number; width: number; height: number },
+		) => void;
+		/** The visible stack's rect changed without a resize (a popover opened, the bar
+		 *  grew into its reserve); the overlay is re-clamped by it. */
+		setHudOverlayContent: (content: {
+			x: number;
+			y: number;
+			width: number;
+			height: number;
+		}) => void;
 		showCountdownOverlay: (value: number, runId: number) => Promise<void>;
 		setCountdownOverlayValue: (value: number, runId: number) => Promise<void>;
 		hideCountdownOverlay: (runId: number) => Promise<void>;

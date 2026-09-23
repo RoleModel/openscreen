@@ -20,7 +20,16 @@ const probeVideoDurationMock = vi.hoisted(() => vi.fn());
 const probeVideoDimensionsMock = vi.hoisted(() =>
 	vi.fn().mockResolvedValue({ width: 1920, height: 1080 }),
 );
+const probeAudioDurationMock = vi.hoisted(() => vi.fn().mockResolvedValue(null));
 const toastErrorMock = vi.hoisted(() => vi.fn());
+// Real implementation unless a test forces an answer (the backfill's timeout branch).
+const waitForDocumentSavesMock = vi.hoisted(() => vi.fn());
+
+vi.mock("./projectStore", async (importOriginal) => {
+	const actual = await importOriginal<typeof import("./projectStore")>();
+	waitForDocumentSavesMock.mockImplementation(actual.waitForDocumentSaves);
+	return { ...actual, waitForDocumentSaves: waitForDocumentSavesMock };
+});
 
 vi.mock("sonner", () => ({ toast: { error: toastErrorMock } }));
 
@@ -30,6 +39,7 @@ vi.mock("../timeline/duration", async (importOriginal) => {
 		...actual,
 		probeVideoDuration: probeVideoDurationMock,
 		probeVideoDimensions: probeVideoDimensionsMock,
+		probeAudioDuration: probeAudioDurationMock,
 	};
 });
 
@@ -110,6 +120,7 @@ const sampleDoc: AxcutDocument = {
 	},
 	annotations: [],
 	zoomRanges: [],
+	audioTracks: [],
 	legacyEditor: null,
 };
 
@@ -188,8 +199,11 @@ describe("useTimeline.moveClip / duplicateClip (delegates to document/timeline.t
 				{
 					id: "clip_b",
 					assetId: "asset_1",
-					sourceStartSec: 10,
-					sourceEndSec: 20,
+					// Does not continue where clip_a stops, on purpose: two clips of one recording
+					// whose media timecodes meet are one clip, so a fixture like that would
+					// collapse under any structural edit.
+					sourceStartSec: 15,
+					sourceEndSec: 25,
 					timelineStartSec: 10,
 					timelineEndSec: 20,
 					wordRefs: [],
@@ -296,6 +310,122 @@ describe("useTimeline backfills missing source dimensions on load", () => {
 		renderTimeline();
 		await waitFor(() => expect(bridgeMocks.save).toHaveBeenCalledTimes(1));
 		expect(probeVideoDimensionsMock).toHaveBeenCalledTimes(1);
+		const saved = useProjectStore.getState().document?.assets.find((a) => a.id === "asset_1");
+		expect(saved?.video).toMatchObject({ width: 1920, height: 1080 });
+	});
+
+	// A fresh recording: the document is rewritten (duration, camera link, auto-zoom) while
+	// the probe is still out. That re-render used to cancel the probe's write for good.
+	it("still persists probed dims when the document changes while the probe is running", async () => {
+		let resolveProbe!: (dims: { width: number; height: number }) => void;
+		probeVideoDimensionsMock.mockReturnValue(
+			new Promise((resolve) => {
+				resolveProbe = resolve;
+			}),
+		);
+		const unprobed = { ...sampleDoc, assets: [{ ...sampleDoc.assets[0], video: undefined }] };
+		useProjectStore.setState({
+			projectId: "proj_test",
+			document: unprobed,
+			revision: 1,
+			status: "ready",
+			error: null,
+		});
+		renderTimeline();
+		await waitFor(() => expect(probeVideoDimensionsMock).toHaveBeenCalledTimes(1));
+		act(() => {
+			useProjectStore.setState({ document: { ...unprobed, zoomRanges: [] }, revision: 2 });
+		});
+		await act(async () => {
+			resolveProbe({ width: 1080, height: 1920 });
+		});
+		await waitFor(() => expect(bridgeMocks.save).toHaveBeenCalledTimes(1));
+		const saved = useProjectStore.getState().document?.assets.find((a) => a.id === "asset_1");
+		expect(saved?.video).toMatchObject({ width: 1080, height: 1920 });
+	});
+
+	// The fresh-recording auto-zooms are saved while the probe is out. The store only takes
+	// them once that save returns, so a backfill built on the store before then erased them.
+	it("keeps a save that is still in flight when the probe resolves", async () => {
+		let resolveProbe!: (dims: { width: number; height: number }) => void;
+		probeVideoDimensionsMock.mockReturnValue(
+			new Promise((resolve) => {
+				resolveProbe = resolve;
+			}),
+		);
+		const unprobed = { ...sampleDoc, assets: [{ ...sampleDoc.assets[0], video: undefined }] };
+		useProjectStore.setState({
+			projectId: "proj_test",
+			document: unprobed,
+			revision: 1,
+			status: "ready",
+			error: null,
+		});
+		renderTimeline();
+		await waitFor(() => expect(probeVideoDimensionsMock).toHaveBeenCalledTimes(1));
+
+		let releaseZoomSave!: () => void;
+		const zoomSaveGate = new Promise<void>((resolve) => {
+			releaseZoomSave = resolve;
+		});
+		bridgeMocks.save.mockImplementationOnce(async (doc: typeof sampleDoc) => {
+			await zoomSaveGate;
+			return { success: true, document: doc };
+		});
+		const zoomed = {
+			...unprobed,
+			zoomRanges: [
+				{ id: "zoom_1", startMs: 0, endMs: 1000, depth: 3, focus: { cx: 0.5, cy: 0.5 } },
+			],
+		} as AxcutDocument;
+		let zoomSave!: Promise<boolean>;
+		act(() => {
+			zoomSave = useProjectStore.getState().saveDocument(zoomed, { history: true });
+		});
+		await act(async () => {
+			resolveProbe({ width: 1080, height: 1920 });
+			await new Promise((r) => setTimeout(r, 0));
+		});
+		await act(async () => {
+			releaseZoomSave();
+			await zoomSave;
+		});
+
+		await waitFor(() => expect(bridgeMocks.save).toHaveBeenCalledTimes(2));
+		await waitFor(() => {
+			const doc = useProjectStore.getState().document;
+			expect(doc?.zoomRanges).toHaveLength(1);
+			expect(doc?.assets.find((a) => a.id === "asset_1")?.video).toMatchObject({
+				width: 1080,
+				height: 1920,
+			});
+		});
+	});
+
+	// A wait that times out says nothing about what landed, so the backfill writes nothing.
+	// It must not leave the asset marked attempted either, or no later run ever probes it.
+	it("probes again on the next document change after the save wait timed out", async () => {
+		waitForDocumentSavesMock.mockResolvedValueOnce("timeout");
+		const unprobed = { ...sampleDoc, assets: [{ ...sampleDoc.assets[0], video: undefined }] };
+		useProjectStore.setState({
+			projectId: "proj_test",
+			document: unprobed,
+			revision: 1,
+			status: "ready",
+			error: null,
+		});
+		renderTimeline();
+		await waitFor(() => expect(waitForDocumentSavesMock).toHaveBeenCalledTimes(1));
+		await act(async () => {
+			await new Promise((r) => setTimeout(r, 0));
+		});
+		expect(bridgeMocks.save).not.toHaveBeenCalled();
+
+		act(() => {
+			useProjectStore.setState({ document: { ...unprobed, zoomRanges: [] }, revision: 2 });
+		});
+		await waitFor(() => expect(bridgeMocks.save).toHaveBeenCalledTimes(1));
+		expect(probeVideoDimensionsMock).toHaveBeenCalledTimes(2);
 		const saved = useProjectStore.getState().document?.assets.find((a) => a.id === "asset_1");
 		expect(saved?.video).toMatchObject({ width: 1920, height: 1080 });
 	});
@@ -667,6 +797,46 @@ describe("useTimeline zoom modifiers (rotation + focus mode)", () => {
 			rotationPreset: "left",
 			focusMode: "auto",
 		});
+	});
+
+	it("stores a moving camera in the same field as the fixed angles", async () => {
+		// One control, one field: a moving camera replaces a fixed angle instead of stacking on it.
+		const { result } = renderTimeline();
+		await act(async () => {
+			await result.current.updateZoomRotation("zoom_a", "iso");
+		});
+		await act(async () => {
+			await result.current.updateZoomRotation("zoom_a", "follow-cursor");
+		});
+		const zoom = useProjectStore.getState().document?.zoomRanges[0];
+		expect(zoom?.rotationPreset).toBe("follow-cursor");
+		expect(zoom).not.toHaveProperty("cameraMotion");
+	});
+
+	it("updates hideCursor on a zoom region", async () => {
+		const { result } = renderTimeline();
+		await act(async () => {
+			await result.current.updateZoomHideCursor("zoom_a", true);
+		});
+		expect(useProjectStore.getState().document?.zoomRanges[0].hideCursor).toBe(true);
+
+		await act(async () => {
+			await result.current.updateZoomHideCursor("zoom_a", false);
+		});
+		expect(useProjectStore.getState().document?.zoomRanges[0].hideCursor).toBeUndefined();
+	});
+
+	it("updates clickImpact on a zoom region and drops the key when off", async () => {
+		const { result } = renderTimeline();
+		await act(async () => {
+			await result.current.updateZoomClickImpact("zoom_a", true);
+		});
+		expect(useProjectStore.getState().document?.zoomRanges[0].clickImpact).toBe(true);
+
+		await act(async () => {
+			await result.current.updateZoomClickImpact("zoom_a", false);
+		});
+		expect(useProjectStore.getState().document?.zoomRanges[0].clickImpact).toBeUndefined();
 	});
 
 	it("rolls a live focus edit back when its commit cannot be saved", async () => {
@@ -1283,5 +1453,398 @@ describe("useTimeline drag snapshots", () => {
 			expect(undo()).toBe(true);
 		});
 		expect(useProjectStore.getState().document?.annotations[0].content).toBe("before");
+	});
+});
+
+// Issue #350 — imported audio tracks. The hook wraps the pure ops in
+// document/audioTracks.ts (unit-tested separately); these cover the wiring:
+// asset lookup, playhead placement, the save, and undo.
+describe("useTimeline audio tracks", () => {
+	const audioDoc: AxcutDocument = {
+		...sampleDoc,
+		assets: [
+			...sampleDoc.assets,
+			{
+				id: "audio_1",
+				kind: "audio",
+				label: "voiceover.mp3",
+				originalPath: "/tmp/vo.mp3",
+				durationSec: 30,
+				cameraTrack: null,
+			},
+		],
+	};
+
+	beforeEach(() => {
+		useProjectStore.getState().clear();
+		clearHistory();
+		for (const mock of Object.values(bridgeMocks)) mock.mockReset();
+		probeAudioDurationMock.mockReset();
+		probeAudioDurationMock.mockResolvedValue(null);
+		bridgeMocks.save.mockImplementation(async (doc: typeof sampleDoc) => ({
+			success: true,
+			document: doc,
+		}));
+		useProjectStore.setState({
+			projectId: "proj_test",
+			document: audioDoc,
+			revision: 1,
+			status: "ready",
+			error: null,
+			currentTimeSec: 4,
+		});
+	});
+
+	afterEach(() => {
+		vi.clearAllMocks();
+	});
+
+	it("addAudioTrack places a track for the asset at the playhead and returns its id", async () => {
+		const { result } = renderTimeline();
+		let id: string | null = null;
+		await act(async () => {
+			id = await result.current.addAudioTrack("audio_1");
+		});
+		const tracks = useProjectStore.getState().document?.audioTracks ?? [];
+		expect(tracks).toHaveLength(1);
+		expect(id).toBe(tracks[0]?.id);
+		expect(tracks[0]).toMatchObject({
+			assetId: "audio_1",
+			durationSec: 30,
+			// Head at the playhead (4s), span the source's own length.
+			startMs: 4000,
+			label: "voiceover.mp3",
+		});
+	});
+
+	it("addAudioTrack refuses a non-audio (or unknown) asset", async () => {
+		const { result } = renderTimeline();
+		let videoId: string | null = "x";
+		let missingId: string | null = "x";
+		await act(async () => {
+			videoId = await result.current.addAudioTrack("asset_1"); // a video asset
+			missingId = await result.current.addAudioTrack("nope");
+		});
+		expect(videoId).toBeNull();
+		expect(missingId).toBeNull();
+		expect(useProjectStore.getState().document?.audioTracks).toEqual([]);
+	});
+
+	it("place / gain update the track and each is one undo step", async () => {
+		const { result } = renderTimeline();
+		let id = "";
+		await act(async () => {
+			id = (await result.current.addAudioTrack("audio_1", 2)) ?? "";
+		});
+		// A lane drag commits the whole span in one write and re-ventilates it.
+		await act(async () => {
+			await result.current.placeAudioTrack(id, { startMs: 3000, endMs: 8000 });
+		});
+		await act(async () => {
+			await result.current.setAudioTrackGain(id, -6);
+		});
+
+		const track = useProjectStore.getState().document?.audioTracks[0];
+		expect(track).toMatchObject({
+			startMs: 3000,
+			endMs: 8000,
+			gainDb: -6,
+		});
+
+		// Three writes (add + place + gain) → the gain edit undoes first.
+		act(() => {
+			expect(undo()).toBe(true);
+		});
+		expect(useProjectStore.getState().document?.audioTracks[0]?.gainDb).toBe(0);
+	});
+
+	it("clamps a track to the content under it, like every other anchored region", async () => {
+		// The sample timeline is one 0..10s clip. A track dragged past the end has
+		// nothing to anchor to out there — and the exported programme stops at the
+		// last clip regardless — so the span is cut at the content, not stored
+		// hanging off the end where it could never play.
+		const { result } = renderTimeline();
+		let id = "";
+		await act(async () => {
+			id = (await result.current.addAudioTrack("audio_1", 2)) ?? "";
+		});
+		await act(async () => {
+			await result.current.placeAudioTrack(id, { startMs: 9000, endMs: 16_000 });
+		});
+		const track = useProjectStore.getState().document?.audioTracks[0];
+		expect(track).toMatchObject({ startMs: 9000, endMs: 10_000 });
+	});
+
+	it("turning loop on fills the rest of the programme, in one undo step", async () => {
+		// Looping only means anything when the span exceeds the source, so a toggle
+		// that changed nothing else did nothing at all. The sample timeline is one
+		// 0..10s clip and the asset is 30s, so the track is created 2..10 (clamped
+		// to the content) and filling is a no-op — place it short first.
+		const { result } = renderTimeline();
+		let id = "";
+		await act(async () => {
+			id = (await result.current.addAudioTrack("audio_1", 2)) ?? "";
+		});
+		await act(async () => {
+			await result.current.placeAudioTrack(id, { startMs: 2000, endMs: 4000 });
+		});
+		await act(async () => {
+			await result.current.setAudioTrackLoop(id, true);
+		});
+		const tracks = useProjectStore.getState().document?.audioTracks ?? [];
+		expect(tracks[0]).toMatchObject({ startMs: 2000, endMs: 10_000, loop: true });
+
+		// One step: the flag and the fill undo together.
+		act(() => {
+			expect(undo()).toBe(true);
+		});
+		const back = useProjectStore.getState().document?.audioTracks[0];
+		expect(back).toMatchObject({ endMs: 4000, loop: false });
+	});
+
+	it("turning loop off leaves the span alone", async () => {
+		// Shrinking back would throw away a length the user may have set by hand.
+		const { result } = renderTimeline();
+		let id = "";
+		await act(async () => {
+			id = (await result.current.addAudioTrack("audio_1", 2)) ?? "";
+		});
+		await act(async () => {
+			await result.current.setAudioTrackLoop(id, true);
+		});
+		const filled = useProjectStore.getState().document?.audioTracks[0]?.endMs;
+		await act(async () => {
+			await result.current.setAudioTrackLoop(id, false);
+		});
+		const track = useProjectStore.getState().document?.audioTracks[0];
+		expect(track?.loop).toBe(false);
+		expect(track?.endMs).toBe(filled);
+	});
+
+	it("removeAudioTrack deletes the track", async () => {
+		const { result } = renderTimeline();
+		let id = "";
+		await act(async () => {
+			id = (await result.current.addAudioTrack("audio_1")) ?? "";
+		});
+		await act(async () => {
+			await result.current.removeAudioTrack(id);
+		});
+		expect(useProjectStore.getState().document?.audioTracks).toEqual([]);
+	});
+
+	// #350: the toolbar button and the `M` shortcut both call `tl.addAudio`, which opens
+	// the OS file picker and hands the result to `importAudioAsset`. Spy on the store's
+	// import so these assert the wiring (picker → import), not the import itself.
+	it("addAudio imports the picked file, and is a no-op when the picker is cancelled", async () => {
+		const importSpy = vi.fn().mockResolvedValue(null);
+		useProjectStore.setState({ importAudioAsset: importSpy });
+		const pickerMock = vi.fn();
+		Object.defineProperty(window, "electronAPI", {
+			configurable: true,
+			value: { openAudioFilePicker: pickerMock },
+		});
+		const { result } = renderTimeline();
+
+		// Cancelled picker → nothing imported.
+		pickerMock.mockResolvedValueOnce({ success: false });
+		await act(async () => {
+			await result.current.addAudio();
+		});
+		expect(importSpy).not.toHaveBeenCalled();
+
+		// Picked a file → imported with its path and display name.
+		pickerMock.mockResolvedValueOnce({ success: true, path: "/tmp/bgm.mp3", name: "bgm.mp3" });
+		await act(async () => {
+			await result.current.addAudio();
+		});
+		expect(importSpy).toHaveBeenCalledWith("/tmp/bgm.mp3", "bgm.mp3");
+	});
+
+	it("addAudio clears region/clip selections after a successful import", async () => {
+		// importAudioAsset must resolve an asset for the success path to run.
+		useProjectStore.setState({ importAudioAsset: vi.fn().mockResolvedValue({ id: "audio_1" }) });
+		Object.defineProperty(window, "electronAPI", {
+			configurable: true,
+			value: {
+				openAudioFilePicker: vi
+					.fn()
+					.mockResolvedValue({ success: true, path: "/tmp/bgm.mp3", name: "bgm.mp3" }),
+			},
+		});
+		const { result } = renderTimeline();
+
+		// A clip selected before the import (selectClip and selectRegion are mutually
+		// exclusive, so a clip is enough to prove the import wipes the local selection)…
+		act(() => result.current.selectClip("clip_1"));
+		expect(result.current.clipSelection).toBe("clip_1");
+
+		await act(async () => {
+			await result.current.addAudio();
+		});
+		// …is gone after it (the imported track becomes the sole selection).
+		expect(result.current.selection).toBeNull();
+		expect(result.current.multiSelection).toEqual([]);
+		expect(result.current.clipSelection).toBeNull();
+	});
+
+	it("addAudio toasts when the file picker itself rejects", async () => {
+		toastErrorMock.mockClear();
+		const importSpy = vi.fn();
+		useProjectStore.setState({ importAudioAsset: importSpy });
+		Object.defineProperty(window, "electronAPI", {
+			configurable: true,
+			value: { openAudioFilePicker: vi.fn().mockRejectedValueOnce(new Error("ipc down")) },
+		});
+		const { result } = renderTimeline();
+
+		await act(async () => {
+			await result.current.addAudio();
+		});
+		// A picker rejection reaches the localized toast, not an unhandled rejection, and never
+		// attempts an import.
+		expect(importSpy).not.toHaveBeenCalled();
+		expect(toastErrorMock).toHaveBeenCalledTimes(1);
+	});
+
+	// #350 regression: a failed import-time probe leaves durationSec at 0, which
+	// makes the playback window zero-length. The on-load backfill re-probes and
+	// stamps the real duration onto the asset AND the track, so it can play again.
+	it("backfills a missing audio duration on load", async () => {
+		probeAudioDurationMock.mockResolvedValue(12.5);
+		// Asset imported with an unknown duration (probe failed), and a track that
+		// cached the resulting 0.
+		useProjectStore.setState({
+			projectId: "proj_test",
+			document: {
+				...sampleDoc,
+				assets: [
+					...sampleDoc.assets,
+					{
+						id: "audio_2",
+						kind: "audio",
+						label: "bgm.mp3",
+						originalPath: "/tmp/bgm.mp3",
+						cameraTrack: null,
+					},
+				],
+				audioTracks: [
+					{
+						id: "trk_2",
+						assetId: "audio_2",
+						kind: "music" as const,
+						startMs: 0,
+						endMs: 1,
+						durationSec: 0,
+						offsetMs: 0,
+						gainDb: 0,
+						loop: false,
+						fadeInMs: 0,
+						fadeOutMs: 0,
+						muted: false,
+						label: "bgm.mp3",
+						origin: "user" as const,
+					},
+				],
+			},
+			revision: 1,
+			status: "ready",
+			error: null,
+		});
+		renderTimeline();
+		await waitFor(() => {
+			const doc = useProjectStore.getState().document;
+			expect(doc?.assets.find((a) => a.id === "audio_2")?.durationSec).toBe(12.5);
+			expect(doc?.audioTracks[0]?.durationSec).toBe(12.5);
+		});
+		expect(probeAudioDurationMock).toHaveBeenCalledTimes(1);
+	});
+});
+
+// The wand (`V4Timeline.runAutoZooms`) captures this callback, awaits a
+// multi-second cursor-telemetry IPC, and only then calls it. Anything the user
+// commits during that wait is in the store but not in the callback's render
+// closure, so reading the closure writes back a snapshot that drops their edit.
+// Its `add*` siblings compute and save in the same tick, which is why this one
+// is the reachable case.
+describe("useTimeline.addZoomsBulk reads the document at write time", () => {
+	afterEach(() => {
+		vi.clearAllMocks();
+	});
+
+	beforeEach(() => {
+		useProjectStore.getState().clear();
+		for (const mock of Object.values(bridgeMocks)) mock.mockReset();
+		toastErrorMock.mockReset();
+		bridgeMocks.save.mockImplementation(async (document: AxcutDocument) => ({
+			success: true,
+			document,
+		}));
+		useProjectStore.setState({
+			projectId: "proj_test",
+			document: sampleDoc,
+			revision: 1,
+			status: "ready",
+			error: null,
+		});
+	});
+
+	it("does not write back the document from before the telemetry wait", async () => {
+		const { result } = renderTimeline();
+		// Captured the way the wand captures it: before the wait, not after.
+		const addZoomsBulk = result.current.addZoomsBulk;
+
+		// The user's edit lands while the wand is off fetching telemetry.
+		const edited: AxcutDocument = {
+			...sampleDoc,
+			project: { ...sampleDoc.project, title: "Edited while the wand was busy" },
+		};
+		act(() => {
+			useProjectStore.setState({ document: edited, revision: 2 });
+		});
+
+		let added: number | undefined;
+		await act(async () => {
+			added = await addZoomsBulk([
+				{ span: { start: 1000, end: 2000 }, focus: { cx: 0.5, cy: 0.5 } },
+			]);
+		});
+
+		expect(added).toBe(1);
+		const saved = bridgeMocks.save.mock.calls.at(-1)?.[0] as AxcutDocument;
+		// The zoom was added, and the edit is still there.
+		expect(saved.zoomRanges).toHaveLength(1);
+		expect(saved.project.title).toBe("Edited while the wand was busy");
+		expect(useProjectStore.getState().document?.project.title).toBe(
+			"Edited while the wand was busy",
+		);
+	});
+
+	// Reading the document fresh is what makes this reachable: the spans were built
+	// from the OLD project's telemetry and its ruler, so writing them into whatever is
+	// loaded now puts one project's zooms in another. `saveDocument`'s epoch check does
+	// not cover it -- the write is issued after the switch, not across it.
+	it("writes nothing when the project changed during the telemetry wait", async () => {
+		const { result } = renderTimeline();
+		const addZoomsBulk = result.current.addZoomsBulk;
+
+		// The user switches projects while the wand is off fetching telemetry.
+		act(() => {
+			useProjectStore.setState({
+				projectId: "proj_switched_to",
+				document: sampleDoc,
+				revision: 2,
+			});
+		});
+
+		let added: number | undefined;
+		await act(async () => {
+			added = await addZoomsBulk([
+				{ span: { start: 1000, end: 2000 }, focus: { cx: 0.5, cy: 0.5 } },
+			]);
+		});
+
+		expect(added).toBe(0);
+		expect(bridgeMocks.save).not.toHaveBeenCalled();
 	});
 });

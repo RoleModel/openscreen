@@ -42,7 +42,7 @@ Electron-builder copies only the matching `electron/native/bin/<platform>-<arch>
 
 This is a hard requirement on Windows, not a tidiness preference.
 
-The addon dlopens `avcodec`/`avformat`/`avutil` at `require()` time. Until 1.9.0 the Windows build shipped it inside `app.asar.unpacked/electron/native/compositor-view/build/`, one directory away from `electron/native/bin/win32-x64/*.dll`, and the gap was bridged at runtime by `ensureFfmpegSharedDllsOnPath` prepending the DLL directory to `PATH` before the require.
+The addon pulls in six ffmpeg libraries at `require()` time — `avcodec`, `avformat`, `avutil`, `swresample`, `swscale` and `avfilter`, the exact set `crates/compositor/build.rs` emits `cargo:rustc-link-lib` lines for. (`avfilter` is the newest of them: the speed-region time stretch runs through its `atempo` filter.) Until 1.9.0 the Windows build shipped it inside `app.asar.unpacked/electron/native/compositor-view/build/`, one directory away from `electron/native/bin/win32-x64/*.dll`, and the gap was bridged at runtime by `ensureFfmpegSharedDllsOnPath` prepending the DLL directory to `PATH` before the require.
 
 That works for the NSIS installer. **It does not work under MSIX**, which resolves an addon's dependent DLLs through the package graph and ignores `PATH`. Measured inside a registered package, with the directory verifiably present and correctly prepended to `PATH`:
 
@@ -60,7 +60,7 @@ require BEFORE PATH : LOADED OK
 
 Node loads `.node` files with `LOAD_WITH_ALTERED_SEARCH_PATH`, so the addon's own directory is searched for its dependencies. Colocating removes the `PATH` mechanism rather than repairing it, and works on every Windows packaging format.
 
-This shipped: the 1.9.0 Store build loaded no compositor at all, so the editor opened with a permanently blank preview while audio kept playing — audio comes from the renderer, every frame comes from the addon. It read as an application bug rather than a packaging one, because every file was present in the package and the NSIS build of the same commit was fine. `scripts/before-pack.cjs` now refuses to package unless the addon and at least `avcodec`/`avformat`/`avutil` are in the same directory, on Windows as it already did on macOS.
+This shipped: the 1.9.0 Store build loaded no compositor at all, so the editor opened with a permanently blank preview while audio kept playing — audio comes from the renderer, every frame comes from the addon. It read as an application bug rather than a packaging one, because every file was present in the package and the NSIS build of the same commit was fine. `scripts/before-pack.cjs` now refuses to package unless the addon and all six of those libraries are in the same directory, on Windows as it already did on macOS. It checks one requirement **per library** rather than a count over a combined pattern, on all three platforms: several versioned copies of one library (an `avcodec-60`/`61`/`62.dll` left by an earlier fetch) would satisfy a combined count while another was missing entirely, and the addon would still fail to load.
 
 `electron/native/bin/`, local native build directories, the compositor build output, models, and caches are gitignored. Rebuilding from a source checkout therefore requires the complete platform toolchain and third-party SDKs; running the generic `npm run build` alone does not manufacture missing native artifacts. The Windows compositor's D3D11/FFmpeg prerequisites are described by the source POC in `crates/README.md`, while capture helper lookup and output conventions are documented in `electron/native/README.md`.
 
@@ -103,6 +103,12 @@ Two lessons, and the second is the useful one:
 - A guard is only as good as the property it actually tests. This one tested "imports a redistributable DLL" when the property that matters is "imports a redistributable DLL that will not be there". Those differ precisely when the DLL is shipped alongside — which is the remedy, so the old wording forbade its own fix.
 
 The remedy here is to ship it: `scripts/stage-vcomp-runtime.mjs` copies `vcomp140.dll` out of the Visual Studio redistributable directory into the payload, and `win.extraResources` carries it like everything else in that folder. Shipping rather than rebuilding whisper with `-DGGML_OPENMP=OFF` is deliberate — the DLL leaves the computation identical, where dropping OpenMP swaps its scheduler for ggml's own and changes transcription throughput by an amount nobody has measured. 200 KB against that unknown is a cheap trade; measure before revisiting it.
+
+#### The CRT proper, via ONNX Runtime
+
+The camera-background feature vendors `onnxruntime.dll` (`scripts/fetch-onnxruntime.mjs`), an upstream release binary that imports `msvcp140`, `msvcp140_1`, `vcruntime140` and `vcruntime140_1`. It is not ours to rebuild, so `-C target-feature=+crt-static` — the answer for our own Rust addon — does not apply, and the guard's other exit does not either: `WIN_REQUIRED` in the same hook refuses to package *without* `onnxruntime.dll`, because a build missing it degrades cleanly and silently into a camera-background control that does nothing. Requiring the DLL and refusing its imports left the Windows installer unbuildable from the moment the feature landed, and nothing noticed, because `build.yml` only runs on dispatch or a tag and no Windows build had been dispatched since.
+
+So the same remedy covers both: `stage-vcomp-runtime.mjs` stages the CRT set alongside `vcomp140.dll`, all five from the redistributable directory of the building toolchain, and the guard stops objecting because the imports now ship. **The check that this is complete is the build itself** — `before-pack` reads the real import table of the real payload and refuses on anything still unshipped, which is a stronger statement than any unit test of the staging script could make.
 
 **Local testing cannot confirm this class of fix.** This machine has the redistributable and always will, so a successful run here proves the build is not broken — it says nothing about the clean-machine behaviour. The import table is the only evidence for that half, which is why the guard reads it rather than running anything.
 
@@ -204,7 +210,7 @@ The hook now reads `electron/native/bin/darwin-<arch>/` — the directory `mac.e
 | Required | Without it |
 |---|---|
 | `compositor_view.node` | preview and every export render nothing |
-| `libavcodec/libavformat/libavutil.*.dylib` | the addon cannot load at all (dyld error at `require()`) |
+| `libavcodec/libavformat/libavutil/libavfilter/libswresample/libswscale.*.dylib` | the addon cannot load at all (dyld error at `require()`) |
 | `whisper-stt-server` | transcription and captions fail with a developer error shown to end users |
 | `libggml*.dylib` | the helper dies in dyld before `main()`; STT times out with no diagnostic |
 | `openscreen-screencapturekit-helper` | native screen capture unavailable |
@@ -216,6 +222,54 @@ CI: the Windows job runs `build:win`, which rebuilds before packaging. The macOS
 The check compares modification times, so `git checkout` (which restamps source files) can occasionally flag an addon that is genuinely fine. That trade is deliberate — a false alarm costs one rebuild, whereas a missed stale addon ships a broken installer. Run `node scripts/before-pack.cjs` on its own to see the verdict without packaging.
 
 Diagnosing a suspected stale addon: serde embeds its field-name literals in the compiled binary, so `grep -c <newCamelCaseField> compositor_view.node` returning 0 means the binary predates that contract.
+
+## ASAR layout and packaging optimization
+
+`electron-builder.json5` configures package contents, file exclusions, and resource distribution. Several deliberate optimizations reduce installer payload size and eliminate redundant file copies across platforms.
+
+### Node modules excluded from ASAR
+
+All renderer application code and Electron main/preload entry points are pre-bundled by Vite into `dist/` and `dist-electron/`. The bundled main process relies solely on Node built-ins and `electron`. As a result, `node_modules/**` is excluded from `files` in `electron-builder.json5`, eliminating ~238 MB of redundant dependencies from `app.asar`.
+
+### Asset deduplication and extraResources
+
+Assets requiring direct filesystem access are distributed via `extraResources` rather than bundled inside `app.asar`:
+
+- Dynamic scene assets (`wallpapers/`, `cursors/`) resolve via `ASSET_BASE_DIR` (`process.resourcesPath`) in the renderer and `sceneAssetBaseDirs()` in the main process.
+- Background segmentation models (`dist/mediapipe/`) are placed in `resources/mediapipe/` for access by the segmentation worker.
+
+These directories are excluded from `files` (`!dist/wallpapers/**`, `!dist/cursors/**`, `!dist/mediapipe/**`), avoiding ~17 MB of duplicate files inside the ASAR archive.
+
+### Native addons ship outside ASAR
+
+Native `.node` addons cannot be loaded directly from an ASAR archive. The native compositor addon (`compositor_view.node`) and ONNX Runtime libraries are colocated with their linked FFmpeg/shared libraries under `electron/native/bin/<platform>-<arch>/` and distributed via `extraResources`. Because no `.node` binary travels through `files`, `asarUnpack: ["**/*.node"]` is unnecessary.
+
+### Windows FFmpeg runtime binaries
+
+On Windows, `scripts/fetch-ffmpeg.mjs` stages two artifacts: the shared `av*.dll` set required by the D3D11 compositor addon, and `ffmpeg-shared.exe` (~1 MB), which links against those same DLLs.
+
+`electron-builder.json5` explicitly excludes the standalone static `ffmpeg.exe` (`!win32-*/ffmpeg.exe`, ~109 MB), while retaining `ffmpeg-shared.exe` via `win32-*/*`. This shared executable is spawned at runtime by:
+- `electron/media/audioPeaks.ts` (`getAudioPeaks`): waveform peak extraction for timeline audio.
+- `electron/stt/extractAudio.ts`: 16 kHz mono WAV audio extraction for Whisper speech-to-text.
+- `electron/media/extensionClip.ts`: silence padding generation for AI word extension clips.
+
+`electron/media/audioPeaks.test.ts` validates that the `win.extraResources` filter in `electron-builder.json5` continues to package `ffmpeg-shared.exe`.
+
+### Locale pruning
+
+Chromium packages ~55 locale `.pak` files and macOS `.lproj` directories, totaling over 20 MB of unneeded translations. `electronLanguages` restricts the packaged locales to OpenScreen's supported languages.
+
+Because macOS `ElectronFramework` directory matching uses underscores (`pt_BR.lproj`, `zh_CN.lproj`, `zh_TW.lproj`) while Windows and Linux `.pak` files use hyphens (`pt-BR.pak`, `zh-CN.pak`, `zh-TW.pak`), both forms are declared in `electronLanguages` to prevent `removeUnusedLanguagesIfNeeded` from deleting supported locales on macOS.
+
+`scripts/i18n-check.mjs` (`npm run i18n:check`) verifies that `SUPPORTED_LOCALES` in `src/i18n/config.ts`, `appx.languages`, and `electronLanguages` in `electron-builder.json5` remain synchronized.
+
+### Documentation assets outside `public/`
+
+Marketing and documentation assets (`demo.gif`, `preview*.png`) reside in `docs/assets/` rather than Vite's `public/` directory. This prevents Vite's dev server and build step from copying ~8 MB of documentation media into `dist/`.
+
+### Compression configuration
+
+`electron-builder.json5` declares `compression: "normal"`. For Windows NSIS installers, electron-builder's differential packaging options enforce normal, non-solid compression with a 1 MB dictionary (`dictSize = 1`, `solid = false`). Setting `"maximum"` has no effect on Windows installers and only increases build times for Linux AppImage targets without meaningful size reductions.
 
 ## Platform packaging
 

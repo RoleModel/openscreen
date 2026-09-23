@@ -94,6 +94,37 @@ struct osc_pw_frame {
      * both draw the line in exactly this place.
      */
     int has_crop;
+
+    /*
+     * Zero-copy dmabuf hand-off (issue #507). When `is_dmabuf` is 1, `data` is
+     * NULL and the frame is not CPU-readable — a tiled compositor buffer that
+     * lives on the GPU. The consumer imports it as a VAAPI surface from the
+     * descriptor below instead of reading `data`. When 0, the CPU path above
+     * applies unchanged (shm, or a linear/implicit dmabuf we could mmap).
+     *
+     * When the on_frame callback TAKES a dmabuf frame (returns non-zero), the
+     * PipeWire buffer is NOT re-queued here — `buffer_handle` is retained by the
+     * consumer, which keeps the fds and their CONTENT valid until it has imported
+     * and copied the surface, then calls osc_pw_requeue_buffer. Duplicating the
+     * fds alone would preserve the dmabuf object but not a snapshot of its pixels,
+     * so a re-queued buffer the compositor overwrote could be encoded torn.
+     * `modifier`/`drm_fourcc` describe the tiling and pixel layout.
+     */
+    int is_dmabuf;
+    uint64_t modifier;   /* DRM format modifier of the buffer */
+    uint32_t drm_fourcc; /* DRM fourcc matching `video_format` */
+    int32_t n_planes;    /* number of populated plane_* entries (1..4) */
+    int plane_fd[4];
+    int32_t plane_offset[4];
+    int32_t plane_stride[4];
+    /* The `struct pw_buffer *` this frame came from, opaque to the consumer.
+     * Passed back to osc_pw_requeue_buffer once the import is done. Only set (and
+     * only meaningful) for a dmabuf frame the consumer intends to take. */
+    void *buffer_handle;
+    /* The registration generation of `buffer_handle`. Passed back alongside it so
+     * a re-queue can tell this buffer from a later one PipeWire put in the same
+     * slot after a renegotiation. */
+    uint64_t buffer_generation;
 };
 
 /* The negotiated video format. Reported once, from param_changed. */
@@ -113,8 +144,12 @@ struct osc_pw_callbacks {
     void *user;
     void (*on_format)(void *user, const struct osc_pw_format *format);
     void (*on_cursor)(void *user, const struct osc_pw_cursor *cursor);
-    /* Only ever called when osc_pw_start was given want_video != 0. */
-    void (*on_frame)(void *user, const struct osc_pw_frame *frame);
+    /* Only ever called when osc_pw_start was given want_video != 0. Returns
+     * non-zero to TAKE OWNERSHIP of the PipeWire buffer (`frame->buffer_handle`):
+     * the shim then does NOT re-queue it, and the consumer must later call
+     * osc_pw_requeue_buffer. Zero (the shm/CPU path, and any dmabuf frame the
+     * consumer declines) re-queues immediately as before. */
+    int (*on_frame)(void *user, const struct osc_pw_frame *frame);
     /* Emitted once per negotiated buffer set. `data_type` is the SPA_DATA_* of
      * datas[0]; `metas` is a borrowed "Header:12,Cursor:589872" listing of every
      * metadata block that survived negotiation, which is what distinguishes a
@@ -122,6 +157,18 @@ struct osc_pw_callbacks {
     void (*on_buffer_info)(void *user, uint32_t data_type, uint32_t n_datas,
                            int32_t has_cursor_meta, uint32_t cursor_meta_size,
                            const char *metas);
+    /* A condition that costs the user frames, reported on the event stream
+     * rather than to a debug log.
+     *
+     * This channel exists because the failures it carries are TERMINAL and
+     * SILENT: stride, geometry and the mapped length are constant for a whole
+     * negotiation, so a buffer that fails validation once fails every time, and
+     * the user gets a recording with no frames in it. Nothing downstream can
+     * infer the cause — a rejected frame never reaches the mailbox, so the
+     * frames-dropped counter stays at zero and the session still stops
+     * "successfully". `code` is a stable kebab-case identifier; `detail` is a
+     * borrowed sentence for a human. */
+    void (*on_capture_issue)(void *user, const char *code, const char *detail);
     void (*on_state)(void *user, const char *state, const char *error);
 };
 
@@ -171,6 +218,30 @@ int osc_pw_cursor_meta_accepts_producer_size(uint32_t width, uint32_t height);
  */
 int osc_pw_enum_format_accepts_dmabuf_producer(int with_modifier, int64_t producer_modifier);
 
+/*
+ * Which bound, if any, rejects this frame? Returns the same stable reason string
+ * the frame-drop diagnostics carry ("stride-shorter-than-row",
+ * "chunk-offset-out-of-bounds", ...), or "none" when the frame is accepted.
+ *
+ * It returns the REASON rather than a yes/no because six distinct conditions
+ * reject a frame here, and a test asserting only "rejected" passes when the
+ * wrong one fires — a reordering of the checks, or a broken row computation,
+ * would keep such a suite green. Exposed so the bound can be asserted without a
+ * portal, a compositor, or a screen.
+ *
+ * The caller's pre-checks in osc_read_frame (n_datas, a NULL chunk, a missing
+ * dmabuf mapping) are deliberately NOT modelled here: this answers only the
+ * bounds question.
+ */
+const char *osc_pw_frame_bounds_reason(uint32_t data_type, uint32_t maxsize, size_t mapped_len,
+                                       uint32_t chunk_offset, uint32_t chunk_size,
+                                       int32_t chunk_flags, int32_t stride, int32_t width,
+                                       int32_t height);
+
+/* DMA-BUF mapoffset and shared-mapping lifecycle test helpers. */
+int osc_pw_dmabuf_mapped_len(size_t allocation_len, uint32_t mapoffset, size_t *mapped_len);
+int osc_pw_dmabuf_map_lifecycle_valid(void);
+
 struct osc_pw_session;
 
 /*
@@ -197,11 +268,29 @@ const char *osc_pw_library_version(void);
  * buffer types; without it neither happens, and a cursor-only session never pays
  * to map a full-screen framebuffer per frame.
  *
+ * `prefer_dmabuf` offers dmabuf before shm so a tiled monitor buffer is imported
+ * on the GPU rather than copied through throttled shm (issue #507); set it only
+ * when the VAAPI import pipeline is available. shm remains the fallback.
+ *
  * Returns NULL on failure, with a message in `err`.
  */
 struct osc_pw_session *osc_pw_start(int fd, uint32_t node_id, int want_video,
+                                    int prefer_dmabuf,
                                     const struct osc_pw_callbacks *callbacks, char *err,
                                     size_t err_len);
+
+/*
+ * Re-queues a PipeWire buffer the on_frame callback took ownership of (returned
+ * non-zero for), identified by the `buffer_handle` it was given. Call it once the
+ * frame's pixels have been imported and copied.
+ *
+ * SAFE TO CALL FROM ANY THREAD: it takes the PipeWire thread-loop lock around the
+ * queue, so unlike the shim's own callbacks it must NOT be called from the
+ * PipeWire thread itself (that would deadlock). The consumer requeues from its
+ * own loop, which is a different thread. NULL session or handle is a no-op.
+ */
+void osc_pw_requeue_buffer(struct osc_pw_session *session, void *buffer_handle,
+                           uint64_t buffer_generation);
 
 /* Stops the thread loop, joins it, and frees everything. Safe with NULL. */
 void osc_pw_stop(struct osc_pw_session *session);

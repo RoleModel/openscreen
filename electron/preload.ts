@@ -63,8 +63,8 @@ contextBridge.exposeInMainWorld("electronAPI", {
 	/** Native (D3D) export progress — frames encoded so far, pushed at ~10 Hz max while
 	 *  `compositor.export`/`compositor.exportMulti` runs. Distinct from `exportOnFrameAck`
 	 *  above, which is the OLD web/CPU pipeline's per-frame ack, not a progress signal. */
-	onNativeExportProgress: (cb: (frames: number) => void) => {
-		const handler = (_e: unknown, frames: number) => cb(frames);
+	onNativeExportProgress: (cb: (frames: number, exportId?: string) => void) => {
+		const handler = (_e: unknown, frames: number, exportId?: string) => cb(frames, exportId);
 		ipcRenderer.on("export:native-progress", handler);
 		return () => ipcRenderer.off("export:native-progress", handler);
 	},
@@ -94,8 +94,15 @@ contextBridge.exposeInMainWorld("electronAPI", {
 	endHudOverlayDrag: () => {
 		ipcRenderer.send("hud-overlay-drag-end");
 	},
-	setHudOverlaySize: (width: number, height: number) => {
-		ipcRenderer.send("hud-overlay-set-size", width, height);
+	setHudOverlaySize: (
+		width: number,
+		height: number,
+		content: { x: number; y: number; width: number; height: number },
+	) => {
+		ipcRenderer.send("hud-overlay-set-size", width, height, content);
+	},
+	setHudOverlayContent: (content: { x: number; y: number; width: number; height: number }) => {
+		ipcRenderer.send("hud-overlay-content", content);
 	},
 	getSources: async (opts: Electron.SourcesOptions) => {
 		return await ipcRenderer.invoke("get-sources", opts);
@@ -115,8 +122,8 @@ contextBridge.exposeInMainWorld("electronAPI", {
 	openNotes: () => {
 		return ipcRenderer.invoke("open-notes");
 	},
-	selectSource: (source: ProcessedDesktopSource) => {
-		return ipcRenderer.invoke("select-source", source);
+	selectSource: (source: ProcessedDesktopSource, options?: { persist?: boolean }) => {
+		return ipcRenderer.invoke("select-source", source, options);
 	},
 	getSelectedSource: () => {
 		return ipcRenderer.invoke("get-selected-source");
@@ -132,8 +139,8 @@ contextBridge.exposeInMainWorld("electronAPI", {
 		ipcRenderer.on("recording-prefs-changed", listener);
 		return () => ipcRenderer.removeListener("recording-prefs-changed", listener);
 	},
-	onSelectedSourceChanged: (callback: (source: ProcessedDesktopSource) => void) => {
-		const listener = (_event: unknown, source: ProcessedDesktopSource) => callback(source);
+	onSelectedSourceChanged: (callback: (source: ProcessedDesktopSource | null) => void) => {
+		const listener = (_event: unknown, source: ProcessedDesktopSource | null) => callback(source);
 		ipcRenderer.on("selected-source-changed", listener);
 		return () => ipcRenderer.removeListener("selected-source-changed", listener);
 	},
@@ -278,6 +285,12 @@ contextBridge.exposeInMainWorld("electronAPI", {
 	},
 	openMediaFilePicker: () => {
 		return ipcRenderer.invoke("open-media-file-picker");
+	},
+	openAudioFilePicker: () => {
+		return ipcRenderer.invoke("open-audio-file-picker");
+	},
+	saveRecordedVoiceover: (data: ArrayBuffer) => {
+		return ipcRenderer.invoke("save-recorded-voiceover", data);
 	},
 	setCurrentVideoPath: (path: string) => {
 		return ipcRenderer.invoke("set-current-video-path", path);

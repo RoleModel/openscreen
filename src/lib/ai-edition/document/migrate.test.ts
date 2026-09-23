@@ -14,9 +14,11 @@ function makeV2Project(overrides: Partial<EditorProjectData> = {}): EditorProjec
 		media: { screenVideoPath: "/recordings/screen.webm" },
 		editor: {
 			wallpaper: "/wallpapers/wallpaper1.jpg",
+			wallpaperMotion: "none",
 			shadowIntensity: 0,
 			showBlur: false,
 			motionBlurAmount: 0,
+			depthOfField: true,
 			borderRadius: 0,
 			padding: 50,
 			cropRegion: { x: 0, y: 0, width: 1, height: 1 },
@@ -111,6 +113,8 @@ describe("migrateProjectDataToAxcutDocument", () => {
 							rotationPreset: "iso",
 							customScale: 2.5,
 							source: "manual",
+							hideCursor: true,
+							clickImpact: true,
 						},
 					],
 				},
@@ -125,6 +129,8 @@ describe("migrateProjectDataToAxcutDocument", () => {
 		expect(z.endMs).toBe(2000);
 		expect(z.customScale).toBe(2.5);
 		expect(z.rotationPreset).toBe("iso");
+		expect(z.hideCursor).toBe(true);
+		expect(z.clickImpact).toBe(true);
 	});
 
 	it("converts annotationRegions to seconds with type and content preserved", () => {
@@ -265,6 +271,32 @@ describe("migrateAxcutDocumentToProjectData", () => {
 		expect(back.editor.webcamMaskShape).toBe("circle");
 	});
 
+	it("defaults wallpaperMotion to none when legacyEditor lacks it", () => {
+		const doc = migrateProjectDataToAxcutDocument(makeV2Project());
+		const { wallpaperMotion: _omitted, ...legacy } = doc.legacyEditor as Record<string, unknown>;
+		const back = migrateAxcutDocumentToProjectData({ ...doc, legacyEditor: legacy });
+		expect(back.editor.wallpaperMotion).toBe("none");
+	});
+
+	it("keeps a legacy wallpaperMotion over the default", () => {
+		const v2 = makeV2Project({
+			editor: { ...makeV2Project().editor, wallpaperMotion: "aurora" },
+		});
+		const back = migrateAxcutDocumentToProjectData(migrateProjectDataToAxcutDocument(v2));
+		expect(back.editor.wallpaperMotion).toBe("aurora");
+	});
+
+	it("round-trips depthOfField: on by default, an explicit off stays off", () => {
+		const roundTrip = (depthOfField: boolean) =>
+			migrateAxcutDocumentToProjectData(
+				migrateProjectDataToAxcutDocument(
+					makeV2Project({ editor: { ...makeV2Project().editor, depthOfField } }),
+				),
+			).editor.depthOfField;
+		expect(roundTrip(true)).toBe(true);
+		expect(roundTrip(false)).toBe(false);
+	});
+
 	it("round-trips zoomRegions and annotationRegions back to ms", () => {
 		const v2 = makeV2Project({
 			editor: {
@@ -276,7 +308,10 @@ describe("migrateAxcutDocumentToProjectData", () => {
 						endMs: 2000,
 						depth: 4,
 						focus: { cx: 0.5, cy: 0.5 },
+						hideCursor: true,
+						clickImpact: true,
 					},
+					{ id: "z_2", startMs: 3000, endMs: 4000, depth: 2, focus: { cx: 0.5, cy: 0.5 } },
 				],
 				annotationRegions: [
 					{
@@ -306,6 +341,10 @@ describe("migrateAxcutDocumentToProjectData", () => {
 		const back = migrateAxcutDocumentToProjectData(doc);
 		expect(back.editor.zoomRegions[0].startMs).toBe(0);
 		expect(back.editor.zoomRegions[0].endMs).toBe(2000);
+		expect(back.editor.zoomRegions[0].hideCursor).toBe(true);
+		expect(back.editor.zoomRegions[0].clickImpact).toBe(true);
+		expect("clickImpact" in back.editor.zoomRegions[1]).toBe(false);
+		expect("clickImpact" in doc.zoomRanges[1]).toBe(false);
 		expect(back.editor.annotationRegions[0].startMs).toBe(1000);
 		expect(back.editor.annotationRegions[0].endMs).toBe(3000);
 	});
@@ -480,5 +519,119 @@ describe("migrateRawDocumentToCurrent", () => {
 			}),
 		);
 		expect(() => documentSchema.parse(upgraded)).not.toThrow();
+	});
+});
+
+// ─── The ghost trims of b9e0f1ff ─────────────────────────────────────────────
+// That build let a cut authored from the voiceover lane be anchored on the AUDIO asset
+// the words belonged to. It removed nothing from the film, the preview or the export —
+// it only struck the word through. Now that both lanes read one removed set, leaving
+// those rows behind would keep striking words through for a cut that never happened.
+
+describe("dropping trims anchored to audio", () => {
+	const createdAt = "2024-01-01T00:00:00.000Z";
+
+	function docWith(trimRanges: unknown[], assets?: unknown[]) {
+		return {
+			schemaVersion: 7,
+			project: { id: "p", title: "t", createdAt, updatedAt: createdAt },
+			assets: assets ?? [
+				{ id: "vid", kind: "video", label: "v", originalPath: "/v.mp4", cameraTrack: null },
+				{ id: "aud", kind: "audio", label: "a", originalPath: "/a.mp3", cameraTrack: null },
+			],
+			transcript: null,
+			transcripts: [],
+			timeline: {
+				clips: [
+					{
+						id: "c1",
+						assetId: "vid",
+						sourceStartSec: 0,
+						sourceEndSec: 10,
+						timelineStartSec: 0,
+						timelineEndSec: 10,
+						wordRefs: [],
+						origin: "user",
+						reason: "",
+					},
+				],
+				gaps: [],
+				trimRanges,
+				muteRanges: [],
+				speedRanges: [],
+				captionRanges: [],
+			},
+			annotations: [],
+			zoomRanges: [],
+			audioTracks: [],
+			legacyEditor: null,
+		};
+	}
+
+	const trims = (raw: unknown) =>
+		(
+			(raw as Record<string, Record<string, unknown[]>>).timeline.trimRanges as Array<{
+				id: string;
+			}>
+		).map((t) => t.id);
+
+	const ghost = {
+		id: "ghost",
+		assetId: "aud",
+		clipId: "vo_frag",
+		startSec: 1,
+		endSec: 2,
+		origin: "user",
+		reason: "",
+	};
+	const legacy = {
+		id: "legacy",
+		assetId: "vid",
+		startSec: 1,
+		endSec: 2,
+		origin: "user",
+		reason: "",
+	};
+	const orphan = {
+		id: "orphan",
+		assetId: "vid",
+		clipId: "deleted",
+		startSec: 3,
+		endSec: 4,
+		origin: "user",
+		reason: "",
+	};
+
+	it("drops a trim anchored to an audio asset", () => {
+		expect(trims(migrateRawDocumentToCurrent(docWith([ghost, legacy])))).toEqual(["legacy"]);
+	});
+
+	it("keeps a pre-v7 trim that names no clip, and one whose clip is gone", () => {
+		// The first is asset-wide back-compat; the second can still come back through undo.
+		expect(trims(migrateRawDocumentToCurrent(docWith([legacy, orphan])))).toEqual([
+			"legacy",
+			"orphan",
+		]);
+	});
+
+	it("is idempotent, and returns the document untouched when there is nothing to sweep", () => {
+		const clean = docWith([legacy]);
+		expect(migrateRawDocumentToCurrent(clean)).toBe(clean);
+		const swept = migrateRawDocumentToCurrent(docWith([ghost, legacy]));
+		expect(migrateRawDocumentToCurrent(swept)).toBe(swept);
+	});
+
+	it("leaves a project with no audio asset entirely alone", () => {
+		const noAudio = docWith(
+			[legacy],
+			[{ id: "vid", kind: "video", label: "v", originalPath: "/v.mp4", cameraTrack: null }],
+		);
+		expect(migrateRawDocumentToCurrent(noAudio)).toBe(noAudio);
+	});
+
+	it("still parses after the sweep", () => {
+		expect(() =>
+			documentSchema.parse(migrateRawDocumentToCurrent(docWith([ghost, legacy]))),
+		).not.toThrow();
 	});
 });

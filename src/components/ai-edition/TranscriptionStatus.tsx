@@ -12,6 +12,8 @@ import { useScopedT } from "@/contexts/I18nContext";
 import {
 	type AssetTranscriptionView,
 	isCpuBackend,
+	isModelDownloadInFlight,
+	isSilentFailure,
 	progressFraction,
 	realtimeSpeed,
 } from "@/lib/ai-edition/transcription/status";
@@ -30,7 +32,11 @@ export function useTranscriptionLabel(): (view: AssetTranscriptionView) => strin
 				// screen to explain it, so it gets its own words rather than being
 				// labelled "Transcribing" — this is the phase most often mistaken for
 				// a hang, and the one `phase` was carried through the store for.
-				if (view.phase === "loading-model") return t("mediaStage.downloadingModel");
+				if (view.phase === "loading-model") {
+					return isModelDownloadInFlight(view)
+						? t("mediaStage.downloadingModel")
+						: t("mediaStage.initializingModel");
+				}
 				// Transcribing a long recording runs for minutes. A bare
 				// "Transcribing…" for that whole time is indistinguishable from a
 				// hang, so append the percentage as soon as the main process reports
@@ -100,7 +106,11 @@ export function TranscriptionStatusDot({
 			</Loader2>
 		);
 	}
-	const { fill, halo } = DOT_COLOR[view.status];
+	// A recording made with no system audio and no mic is not a broken job, so it
+	// gets the same amber as "no speech detected" rather than the danger red, and
+	// its label alone rather than a tooltip full of ffmpeg stderr (issue #628).
+	const silent = isSilentFailure(view);
+	const { fill, halo } = silent ? DOT_COLOR.empty : DOT_COLOR[view.status];
 	return (
 		<span
 			style={{
@@ -112,7 +122,7 @@ export function TranscriptionStatusDot({
 				flexShrink: 0,
 			}}
 			aria-label={label}
-			title={view.failure?.message ? `${label} — ${view.failure.message}` : label}
+			title={!silent && view.failure?.message ? `${label} — ${view.failure.message}` : label}
 		/>
 	);
 }

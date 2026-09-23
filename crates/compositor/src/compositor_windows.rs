@@ -9,9 +9,9 @@ use crate::config::Cfg;
 pub use crate::frame_geometry::{live_params_from_scene, webcam_shape_code, LayerCB,
     LiveParams, FIXTURE_FRAMES, HALF_H, HALF_W, OUT_H, OUT_W};
 use crate::frame_geometry::{
-    cover_crop_uv, cover_uv_rect, cursor_sprite_dst, decode_data_uri, ease_in_out_cubic, lerp,
+    cover_crop_uv, cover_uv_rect, decode_data_uri, ease_in_out_cubic, lerp,
     lerp4, parse_hex, preset_placements, remap_box, screen_source_rect, timeline, CursorPlacement,
-    FrameParams, Placement, CURSOR_BASE_SIZE_FRAC, FPS, SCREEN_SHADOW_OFFSET_FRAC,
+    FrameParams, Placement, ShadowCaster, SpriteShape, CURSOR_BASE_SIZE_FRAC, FPS,
     SCREEN_SHADOW_SPREAD_FRAC, SHADOW_TUNING_REF_PX, WEBCAM_SHADOW_OFFSET_FRAC,
     WEBCAM_SHADOW_OPACITY, WEBCAM_SHADOW_SPREAD_FRAC,
 };
@@ -31,6 +31,13 @@ use windows::Win32::Graphics::Direct3D::{
 use windows::Win32::Graphics::Direct3D11::*;
 use windows::Win32::Graphics::Dxgi::Common::*;
 
+/// Budget du cache de textures image (`img_cache`), en octets.
+///
+/// Doit tenir le JEU ACTIF d'une frame — au pire un wallpaper d'écran ET un fond de caméra, que
+/// rien n'empêche d'être deux 7680x7680 à 225 Mo pièce. Sous ce seuil l'éviction ne peut plus
+/// rendre de mémoire sans toucher au jeu actif, ce qu'elle refuse de faire. 512 Mo borne la fuite
+/// (1 774 Mo mesurés en parcourant les 18 wallpapers livrés) en laissant le jeu actif résident.
+const IMG_CACHE_BUDGET_BYTES: u64 = 512 * 1024 * 1024;
 
 
 
@@ -45,6 +52,38 @@ use windows::Win32::Graphics::Dxgi::Common::*;
 
 
 
+
+
+/// Cadence de l'inférence. Pas 60 : une silhouette ne bouge pas de façon perceptible en
+/// 16 ms, et c'est le seul levier mesuré qui divise le coût par deux sans toucher au modèle.
+const SEGMENTATION_HZ: u32 = 30;
+
+/// Cible RGBA + staging CPU pour l'extraction de la frame webcam qui alimente le modèle.
+struct SegCapture {
+    rtv: ID3D11RenderTargetView,
+    rt: ID3D11Texture2D,
+    staging: ID3D11Texture2D,
+    width: u32,
+    height: u32,
+}
+
+/// Texture du masque de segmentation, recréée seulement quand la résolution du modèle change.
+struct WebcamMask {
+    tex: ID3D11Texture2D,
+    srv: ID3D11ShaderResourceView,
+    width: u32,
+    height: u32,
+}
+
+/// Pyramide de la profondeur de champ (mode 8) : la vidéo en RGBA8 à demi-résolution de la
+/// texture DÉCODEUR, avec sa chaîne de mips. Dimensionnée sur la texture décodeur et remplie en
+/// UV plein (0..1) : ses UV sont ceux de t0/t1, et le calcul d'UV du mode 8 ne change pas.
+struct DofPyramid {
+    rtv: ID3D11RenderTargetView,
+    srv: ID3D11ShaderResourceView,
+    width: u32,
+    height: u32,
+}
 
 pub struct Compositor {
     dev: ID3D11Device,
@@ -103,6 +142,8 @@ pub struct Compositor {
     /// entre clips : les régions projetées par l'app portent elles aussi des temps source.
     /// Séparé de l'override curseur pour préserver les chemins fixture sans télémétrie.
     timeline_t_override: RefCell<Option<f32>>,
+    /// Temps programme (secondes de sortie) — cf. `FrameGeometryInput::programme_time`.
+    programme_time: RefCell<Option<f32>>,
     // cache des SRV décodeur par (texture array, slice) : le pool réutilise ~32 textures,
     // donc après warmup plus aucune création de SRV par frame (overhead CPU supprimé).
     srv_cache: RefCell<HashMap<(usize, u32), (ID3D11ShaderResourceView, ID3D11ShaderResourceView)>>,
@@ -122,9 +163,26 @@ pub struct Compositor {
     /// de la source). Séparé de `img_cache` : les wallpapers sont des chemins disque, ces images
     /// des data URL de plusieurs Mo qu'on ne veut pas utiliser comme clés de hachage.
     ann_img_cache: RefCell<HashMap<String, (ID3D11ShaderResourceView, u32, u32, usize)>>,
-    /// Cache des textures wallpaper image (clé = chemin absolu) : décodage/upload une seule
-    /// fois, puis réutilisées par frame. (SRV, largeur, hauteur).
-    img_cache: RefCell<HashMap<String, (ID3D11ShaderResourceView, u32, u32)>>,
+    /// Cache des textures wallpaper image (clé = chemin absolu) : décodé et uploadé une fois,
+    /// puis réutilisé par frame. (SRV, largeur, hauteur, tick d'usage).
+    ///
+    /// « Une fois » et non « une fois pour la session » : l'entrée est évinçable dès qu'elle
+    /// sort du jeu actif d'une frame, et un retour dessus la rechargera — cf. `cached_image`.
+    img_cache: RefCell<HashMap<String, (ID3D11ShaderResourceView, u32, u32, u64)>>,
+    /// Compteur d'accès de `img_cache`, pour l'ordre LRU. Un compteur plutôt que l'index de
+    /// frame : une frame touche plusieurs entrées, et il faut pouvoir les ordonner entre elles.
+    img_tick: std::cell::Cell<u64>,
+    /// Valeur de `img_tick` au début de la frame en cours. Tout ce qui a été touché depuis
+    /// appartient au jeu actif et ne peut pas être évincé — voir `cached_image`.
+    img_frame_start: std::cell::Cell<u64>,
+    /// Champs de distance des sprites de curseur (mode 15), R16F, par chemin, avec leur forme.
+    /// Pas d'éviction : seuls les seize sprites du thème par défaut y passent (~2,6 Mo en tout).
+    sdf_cache: RefCell<HashMap<String, (ID3D11ShaderResourceView, SpriteShape)>>,
+    /// Masque de segmentation du sujet webcam, R8 à la résolution du modèle. Écrit par
+    /// `set_webcam_mask` depuis le thread d'inférence, lu au moment de dessiner la webcam.
+    /// `None` tant qu'aucune frame n'a été segmentée — l'effet reste alors éteint plutôt que
+    /// de rendre une webcam invisible en mode détourage.
+    webcam_mask: RefCell<Option<WebcamMask>>,
     /// Dimensions du RENDER TARGET en pixels — la taille à laquelle `compose_frame`
     /// rastérise réellement, et donc le dénominateur de TOUTE conversion
     /// normalisé↔px de ce fichier.
@@ -150,10 +208,35 @@ pub struct Compositor {
     /// de prévisualisation demandée (variable, contrairement au `staging` fixe à
     /// OUT_W×OUT_H). Recréée quand la taille change — voir `readback_resized`.
     live_readback_staging: RefCell<Option<(u32, u32, ID3D11Texture2D)>>,
+    /// Cible + staging pour extraire la frame webcam à la résolution du modèle de
+    /// segmentation. Créée à la première capture, jamais redimensionnée : le modèle a une
+    /// entrée fixe.
+    seg_capture: RefCell<Option<SegCapture>>,
+    /// Worker d'inférence, absent tant que `enable_segmentation` n'a pas été appelé.
+    seg_worker: RefCell<Option<crate::segmentation::SegmentationWorker>>,
+    /// Segmenteur tenu SUR LE THREAD DE RENDU, utilisé à la place du worker en mode
+    /// déterministe. Voir `set_segmentation_deterministic`.
+    seg_sync: RefCell<Option<crate::segmentation::Segmenter>>,
+    /// Export : cadence par frame et inférence synchrone, au lieu de l'horloge et du worker.
+    seg_deterministic: std::cell::Cell<bool>,
+    /// Boîte aux lettres du worker. Le masque est déposé depuis le thread d'inférence et
+    /// téléversé depuis le thread de rendu : aucun appel D3D ne traverse de thread, malgré
+    /// le device multithread-protected qui l'autoriserait.
+    seg_inbox: std::sync::Arc<std::sync::Mutex<Option<Vec<u8>>>>,
+    seg_rate: RefCell<crate::segmentation::RateLimiter>,
+    /// Frame RGB réutilisée d'une capture à l'autre.
+    seg_scratch: RefCell<Vec<u8>>,
+    /// Le chargement du modèle a échoué : ne pas réessayer à chaque frame.
+    seg_failed: RefCell<bool>,
     /// Staging NV12 du readback d'ENCODAGE (backend CPU) — même motif de cache par taille
     /// que `live_readback_staging`, mais en NV12 et non en RGBA : l'encodeur logiciel veut
     /// les plans Y/UV, pas des pixels RGBA. Voir `read_nv12_scaled`.
     nv12_readback_staging: RefCell<Option<(u32, u32, ID3D11Texture2D)>>,
+    /// Pyramide de profondeur de champ, allouée au premier écran incliné et recréée quand la
+    /// texture décodeur change de taille. Rien n'est alloué tant qu'aucun tilt n'est rendu.
+    dof_pyramid: RefCell<Option<DofPyramid>>,
+    /// Device WARP : la profondeur de champ y obéit à `DOF_ON_CPU_BACKEND`.
+    cpu_backend: bool,
 }
 
 /// Ressources d'un resize export à une taille cible : RGBA intermédiaire (résultat du
@@ -543,6 +626,7 @@ impl Compositor {
             cursor: RefCell::new(None),
             cursor_t_override: RefCell::new(None),
             timeline_t_override: RefCell::new(None),
+            programme_time: RefCell::new(None),
             srv_cache: RefCell::new(HashMap::new()),
             live_params: RefCell::new(LiveParams::default()),
             scene: RefCell::new(None),
@@ -556,10 +640,24 @@ impl Compositor {
             text_cache: RefCell::new(HashMap::new()),
             ann_img_cache: RefCell::new(HashMap::new()),
             img_cache: RefCell::new(HashMap::new()),
+            img_tick: std::cell::Cell::new(0),
+            img_frame_start: std::cell::Cell::new(0),
+            sdf_cache: RefCell::new(HashMap::new()),
+            webcam_mask: RefCell::new(None),
             render_size: Cell::new((out_w, out_h)),
             resize_target: RefCell::new(None),
             live_readback_staging: RefCell::new(None),
+            seg_capture: RefCell::new(None),
+            seg_worker: RefCell::new(None),
+            seg_sync: RefCell::new(None),
+            seg_deterministic: std::cell::Cell::new(false),
+            seg_inbox: std::sync::Arc::new(std::sync::Mutex::new(None)),
+            seg_rate: RefCell::new(crate::segmentation::RateLimiter::new(SEGMENTATION_HZ)),
+            seg_scratch: RefCell::new(Vec::new()),
+            seg_failed: RefCell::new(false),
             nv12_readback_staging: RefCell::new(None),
+            dof_pyramid: RefCell::new(None),
+            cpu_backend: gpu.backend == crate::d3d::Backend::Cpu,
         })
     }
 
@@ -734,6 +832,86 @@ impl Compositor {
             [1.0 / hw, 1.0 / hh, off, 0.0]);
     }
 
+    /// Remplit la pyramide de profondeur de champ depuis la frame écran et rend sa SRV.
+    ///
+    /// UN draw du mode 0 existant, en UV plein, vers une cible demi-résolution : un échantillon
+    /// bilinéaire 2:1 est une moyenne 2x2, cette cible EST donc déjà le niveau 1 d'une pyramide
+    /// pleine résolution. `GenerateMips` fait le reste, comme pour `ann_copy`. Cible vidée
+    /// d'abord et `color.a = 1` : un `LayerCB` par défaut a `color.a = 0`, et le mode 0 sortirait
+    /// une pyramide transparente. `mb.x = 1` : un seul tap, pas de flou de mouvement.
+    ///
+    /// Laisse l'état de composition lié sur le RT principal ; l'appelant enchaîne sur `begin`.
+    unsafe fn fill_dof_pyramid(
+        &self,
+        sy: &ID3D11ShaderResourceView,
+        suv: &ID3D11ShaderResourceView,
+        tex_w: u32,
+        tex_h: u32,
+    ) -> Result<ID3D11ShaderResourceView> {
+        let (w, h) = (tex_w.div_ceil(2).max(1), tex_h.div_ceil(2).max(1));
+        let stale = self.dof_pyramid.borrow().as_ref().is_none_or(|p| (p.width, p.height) != (w, h));
+        if stale {
+            let desc = D3D11_TEXTURE2D_DESC {
+                Width: w,
+                Height: h,
+                MipLevels: crate::frame_geometry::dof_pyramid_levels(w, h),
+                ArraySize: 1,
+                Format: DXGI_FORMAT_R8G8B8A8_UNORM,
+                SampleDesc: DXGI_SAMPLE_DESC { Count: 1, Quality: 0 },
+                Usage: D3D11_USAGE_DEFAULT,
+                BindFlags: (D3D11_BIND_RENDER_TARGET.0 | D3D11_BIND_SHADER_RESOURCE.0) as u32,
+                CPUAccessFlags: 0,
+                MiscFlags: D3D11_RESOURCE_MISC_GENERATE_MIPS.0 as u32,
+            };
+            let mut tex: Option<ID3D11Texture2D> = None;
+            self.dev.CreateTexture2D(&desc, None, Some(&mut tex))?;
+            let tex = tex.unwrap();
+            // RTV sur le niveau 0 seul (défaut), SRV sur toute la chaîne (défaut).
+            let mut rtv: Option<ID3D11RenderTargetView> = None;
+            self.dev.CreateRenderTargetView(&tex, None, Some(&mut rtv))?;
+            let mut srv: Option<ID3D11ShaderResourceView> = None;
+            self.dev.CreateShaderResourceView(&tex, None, Some(&mut srv))?;
+            *self.dof_pyramid.borrow_mut() =
+                Some(DofPyramid { rtv: rtv.unwrap(), srv: srv.unwrap(), width: w, height: h });
+        }
+        let pyr = self.dof_pyramid.borrow();
+        let pyr = pyr.as_ref().expect("pyramide allouée ci-dessus");
+        self.bind_compose_state();
+        // Délie t2 : la pyramide y est peut-être encore liée depuis le mode 8 précédent, et une
+        // ressource liée en lecture ET en écriture est retirée d'office par le runtime.
+        self.ctx.PSSetShaderResources(2, Some(&[None]));
+        self.ctx.OMSetRenderTargets(Some(&[Some(pyr.rtv.clone())]), None);
+        self.ctx.ClearRenderTargetView(&pyr.rtv, &[0.0, 0.0, 0.0, 0.0]);
+        self.ctx.RSSetViewports(Some(&[D3D11_VIEWPORT {
+            TopLeftX: 0.0,
+            TopLeftY: 0.0,
+            Width: w as f32,
+            Height: h as f32,
+            MinDepth: 0.0,
+            MaxDepth: 1.0,
+        }]));
+        let full = [0.0, 0.0, 1.0, 1.0];
+        self.draw_video(
+            &LayerCB {
+                dst: full,
+                src: full,
+                quad_px: [w as f32, h as f32],
+                mode: 0.0,
+                color: [1.0, 1.0, 1.0, 1.0],
+                src_prev: full,
+                dst_prev: full,
+                mb: [1.0, 0.0, 1.0, 0.0],
+                ..Default::default()
+            },
+            sy,
+            suv,
+        );
+        // La pyramide quitte la sortie avant de générer ses mips.
+        self.bind_compose_state();
+        self.ctx.GenerateMips(&pyr.srv);
+        Ok(pyr.srv.clone())
+    }
+
     unsafe fn upload_cb(&self, cb: &LayerCB) {
         let mut m = D3D11_MAPPED_SUBRESOURCE::default();
         self.ctx
@@ -767,18 +945,70 @@ impl Compositor {
     /// Fond wallpaper image (cover-fit). `path` = chemin absolu (résolu côté app). Décodé et
     /// uploadé une fois (cache), puis échantillonné en mode 6. Err → l'appelant retombe sur une
     /// couleur plate. Le rect uv `src` recouvre toute la sortie en rognant le débordement.
+    /// Ouvre une frame du point de vue de `img_cache` : tout ce qui sera touché après cet appel
+    /// est le jeu actif, et devient inévinçable jusqu'à la frame suivante.
+    fn begin_image_frame(&self) {
+        // `+ 1` : la première entrée de cette frame recevra `img_tick + 1`, et la protection
+        // porte sur `tick >= img_frame_start`. Sans le décalage on protégerait aussi la
+        // DERNIÈRE entrée de la frame précédente, qui n'appartient plus au jeu actif — le
+        // résident pourrait alors dépasser le budget d'une texture entière.
+        self.img_frame_start.set(self.img_tick.get() + 1);
+    }
+
+    /// Texture d'un fichier image, décodée une seule fois puis réutilisée.
+    ///
+    /// Le cache était NON BORNÉ, et c'est un vrai coût : les wallpapers livrés pèsent 23,7 Mo sur
+    /// disque mais 1 774 Mo une fois décodés en RGBA8 — `wallpaper8.jpg` fait 7680x7680, soit
+    /// 225 Mo à lui seul. Parcourir le sélecteur les chargeait tous et n'en libérait aucun.
+    ///
+    /// L'éviction est LRU sous un budget en octets, et ne touche jamais une texture que la frame
+    /// EN COURS a déjà servie : sans ça, un fond d'écran et un fond de caméra un peu gros se
+    /// chasseraient l'un l'autre à chaque frame, et un décodage coûte 129 ms contre les ~3,5 ms
+    /// d'une frame. Si le jeu actif dépasse à lui seul le budget, on dépasse le budget.
+    unsafe fn cached_image(&self, path: &str) -> Result<(ID3D11ShaderResourceView, u32, u32)> {
+        let tick = self.img_tick.get() + 1;
+        self.img_tick.set(tick);
+        // La recherche est isolée dans un `let` pour que l'emprunt immuable soit relâché AVANT le
+        // `borrow_mut()` (sinon double-emprunt RefCell → panic sur la 1re frame image).
+        let hit = self.img_cache.borrow().get(path).cloned();
+        if let Some((srv, w, h, _)) = hit {
+            self.img_cache.borrow_mut().insert(path.to_string(), (srv.clone(), w, h, tick));
+            return Ok((srv, w, h));
+        }
+        let (srv, w, h) = self.load_image_srv(path)?;
+        let mut cache = self.img_cache.borrow_mut();
+        cache.insert(path.to_string(), (srv.clone(), w, h, tick));
+        // La politique vit dans `frame_geometry` : les trois backends la partagent, comme la
+        // géométrie, plutôt que d'entretenir trois copies qui finiraient par diverger.
+        let entries: Vec<(String, u64, u64)> = cache
+            .iter()
+            .map(|(k, e)| (k.clone(), e.1 as u64 * e.2 as u64 * 4, e.3))
+            .collect();
+        let protect_from = self.img_frame_start.get();
+        for key in
+            crate::frame_geometry::lru_evictions(&entries, IMG_CACHE_BUDGET_BYTES, protect_from)
+        {
+            cache.remove(&key);
+        }
+        Ok((srv, w, h))
+    }
+
     unsafe fn draw_image_bg(&self, path: &str, output_aspect: f32) -> Result<()> {
-        // NB : la recherche est isolée dans un `let` pour que l'emprunt immuable soit relâché
-        // AVANT le `borrow_mut()` (sinon double-emprunt RefCell → panic sur la 1re frame image).
-        let cached = self.img_cache.borrow().get(path).cloned();
-        let (srv, iw, ih) = match cached {
-            Some(v) => v,
-            None => {
-                let loaded = self.load_image_srv(path)?;
-                self.img_cache.borrow_mut().insert(path.to_string(), loaded.clone());
-                loaded
-            }
-        };
+        self.draw_image_in(path, [0.0, 0.0, 1.0, 1.0], [0.0, 0.0], 0.0, output_aspect)
+    }
+
+    /// `draw_image_bg` pour un rect quelconque — la bulle webcam s'en sert avec ses coins
+    /// arrondis. `output_aspect` est le ratio du RECT visé, pas celui de la sortie : le crop
+    /// « cover » se calcule contre la zone qu'on remplit.
+    unsafe fn draw_image_in(
+        &self,
+        path: &str,
+        dst: [f32; 4],
+        quad_px: [f32; 2],
+        radius_px: f32,
+        output_aspect: f32,
+    ) -> Result<()> {
+        let (srv, iw, ih) = self.cached_image(path)?;
         let ai = iw as f32 / ih as f32;
         // Le fond remplit TOUJOURS le cadre (dst=[0,0,1,1], jamais rétréci par `undistort`),
         // mais le canvas interne est un 16:9 fixe étiré ensuite vers le VRAI ratio de sortie
@@ -795,14 +1025,81 @@ impl Compositor {
             (0.0, (1.0 - vis) * 0.5, 1.0, 1.0 - (1.0 - vis) * 0.5)
         };
         self.upload_cb(&LayerCB {
-            dst: [0.0, 0.0, 1.0, 1.0],
+            dst,
             src: [u0, v0, u1, v1],
+            quad_px,
+            radius_px,
             mode: 6.0,
             ..Default::default()
         });
         self.ctx.PSSetShaderResources(2, Some(&[Some(srv)]));
         self.ctx.Draw(4, 0);
         Ok(())
+    }
+
+    /// Peint le fond du mode « personnalisé » DANS la bulle webcam, avant que la caméra n'y soit
+    /// découpée par-dessus.
+    ///
+    /// Le shader ne sait peindre qu'une couleur plate sous le masque, donc un dégradé ou une image
+    /// y tombaient sur du noir — et le défaut EST une image (`DEFAULT_WALLPAPER`), si bien que le
+    /// mode ne rendait jamais ce que le sélecteur montrait. Peindre le fond puis composer la
+    /// caméra en détourage donne exactement le même résultat (`lerp(fond, caméra, personne)`, ici
+    /// par le mélange alpha) pour les trois sortes de fond, en réutilisant les chemins déjà
+    /// éprouvés du fond d'écran, et sans rien ajouter aux trois shaders.
+    ///
+    /// `quad_px` / `radius_px` sont ceux de la bulle : le fond doit épouser ses coins arrondis,
+    /// sinon un rectangle déborde derrière la caméra.
+    unsafe fn draw_webcam_bg(
+        &self,
+        bg: Option<&SceneBackground>,
+        dst: [f32; 4],
+        quad_px: [f32; 2],
+        radius_px: f32,
+    ) {
+        const BLACK: [f32; 4] = [0.0, 0.0, 0.0, 1.0];
+        let solid = |color: [f32; 4]| LayerCB {
+            dst,
+            quad_px,
+            radius_px,
+            mode: 1.0,
+            color,
+            ..Default::default()
+        };
+        match bg {
+            Some(SceneBackground::Color { color }) => {
+                self.draw_solid(&solid(parse_hex(color).unwrap_or(BLACK)));
+            }
+            // Le mouvement ne vaut que pour le fond d'écran : la bulle garde son dégradé immobile.
+            Some(SceneBackground::Gradient { angle_deg, stops, .. }) => {
+                let c0 = stops.first().and_then(|s| parse_hex(s)).unwrap_or(BLACK);
+                let c1 = stops.last().and_then(|s| parse_hex(s)).unwrap_or(c0);
+                // angle CSS → direction unitaire, même convention que le fond d'écran.
+                let a = angle_deg.to_radians();
+                let dir = [a.sin(), -a.cos()];
+                self.draw_solid(&LayerCB {
+                    dst,
+                    quad_px,
+                    radius_px,
+                    src: [c1[0], c1[1], c1[2], c1[3]],
+                    mode: 5.0,
+                    color: c0,
+                    fx: [dir[0], dir[1], 0.0, 0.0],
+                    ..Default::default()
+                });
+            }
+            Some(SceneBackground::Image { path }) => {
+                // Même contrat que le fond d'écran : un chemin cassé est loggé puis remplacé par
+                // du noir. Un fallback silencieux redonnerait le bug qu'on corrige.
+                let aspect = if quad_px[1] > 0.0 { quad_px[0] / quad_px[1] } else { 1.0 };
+                if let Err(e) = self.draw_image_in(path, dst, quad_px, radius_px, aspect) {
+                    eprintln!("[compositor] fond webcam \"{}\" : {:#}", path, e);
+                    self.draw_solid(&solid(BLACK));
+                }
+            }
+            // Personnalisé sans fond : noir, comme avant — mais c'est désormais le seul chemin
+            // qui y mène, au lieu de l'être pour toute image et tout dégradé.
+            None => self.draw_solid(&solid(BLACK)),
+        }
     }
 
     /// Décode un fichier image (jpg/png) → texture RGBA immuable + SRV.
@@ -846,6 +1143,374 @@ impl Compositor {
         Ok((srv.unwrap(), w, h))
     }
 
+    /// Champ de distance du sprite `path` (t4 du mode 15) et sa forme, calculés au premier appel.
+    unsafe fn cursor_sdf(&self, path: &str) -> Result<(ID3D11ShaderResourceView, SpriteShape)> {
+        if let Some(hit) = self.sdf_cache.borrow().get(path) {
+            return Ok(hit.clone());
+        }
+        let sdf = crate::cursor_sdf::CursorSdf::load(path)?;
+        let texels = sdf.f16_bytes();
+        let td = D3D11_TEXTURE2D_DESC {
+            Width: sdf.width,
+            Height: sdf.height,
+            MipLevels: 1,
+            ArraySize: 1,
+            Format: DXGI_FORMAT_R16_FLOAT,
+            SampleDesc: DXGI_SAMPLE_DESC { Count: 1, Quality: 0 },
+            Usage: D3D11_USAGE_IMMUTABLE,
+            BindFlags: D3D11_BIND_SHADER_RESOURCE.0 as u32,
+            CPUAccessFlags: 0,
+            MiscFlags: 0,
+        };
+        let init = D3D11_SUBRESOURCE_DATA {
+            pSysMem: texels.as_ptr() as *const c_void,
+            SysMemPitch: sdf.width * 2,
+            SysMemSlicePitch: 0,
+        };
+        let mut tex: Option<ID3D11Texture2D> = None;
+        self.dev.CreateTexture2D(&td, Some(&init), Some(&mut tex))?;
+        let mut srv: Option<ID3D11ShaderResourceView> = None;
+        self.dev.CreateShaderResourceView(&tex.unwrap(), None, Some(&mut srv))?;
+        let entry = (srv.unwrap(), sdf.shape);
+        self.sdf_cache.borrow_mut().insert(path.to_string(), entry.clone());
+        Ok(entry)
+    }
+
+    /// Extrait la frame webcam en RGB8 à la résolution du modèle, dans `out`.
+    ///
+    /// `src` est le rect source de la webcam en UV (le même que celui passé à `draw_video`),
+    /// donc le crop utilisateur et le miroir sont déjà dedans — le modèle voit exactement ce
+    /// que le spectateur verra, et le masque n'a pas à être recadré après coup.
+    ///
+    /// **À appeler AVANT `begin()`** : la méthode réquisitionne la cible de rendu et le
+    /// viewport, et ne les restaure pas. Les appeler dans l'autre ordre dessinerait la scène
+    /// dans une texture de 256x144.
+    ///
+    /// C'est le seul readback GPU->CPU du chemin. Il porte 256x144x4 = 147 Ko, contre la
+    /// frame entière que la preview lit déjà à chaque image ; sur le chemin export, qui lui
+    /// est GPU-résident de bout en bout, c'est en revanche un point de synchronisation neuf
+    /// et c'est là qu'il faudra le mesurer.
+    pub unsafe fn capture_webcam_rgb(
+        &self,
+        wy: &ID3D11ShaderResourceView,
+        wuv: &ID3D11ShaderResourceView,
+        src: [f32; 4],
+        width: u32,
+        height: u32,
+        out: &mut Vec<u8>,
+    ) -> Result<()> {
+        if width == 0 || height == 0 {
+            bail!("capture webcam de dimensions nulles ({width}x{height})");
+        }
+        {
+            let mut slot = self.seg_capture.borrow_mut();
+            if !matches!(slot.as_ref(), Some(c) if c.width == width && c.height == height) {
+                let td = D3D11_TEXTURE2D_DESC {
+                    Width: width,
+                    Height: height,
+                    MipLevels: 1,
+                    ArraySize: 1,
+                    Format: DXGI_FORMAT_R8G8B8A8_UNORM,
+                    SampleDesc: DXGI_SAMPLE_DESC { Count: 1, Quality: 0 },
+                    Usage: D3D11_USAGE_DEFAULT,
+                    BindFlags: D3D11_BIND_RENDER_TARGET.0 as u32,
+                    CPUAccessFlags: 0,
+                    MiscFlags: 0,
+                };
+                let mut rt: Option<ID3D11Texture2D> = None;
+                self.dev.CreateTexture2D(&td, None, Some(&mut rt))?;
+                let rt = rt.unwrap();
+                let mut rtv: Option<ID3D11RenderTargetView> = None;
+                self.dev.CreateRenderTargetView(&rt, None, Some(&mut rtv))?;
+
+                let sd = D3D11_TEXTURE2D_DESC {
+                    Usage: D3D11_USAGE_STAGING,
+                    BindFlags: 0,
+                    CPUAccessFlags: D3D11_CPU_ACCESS_READ.0 as u32,
+                    ..td
+                };
+                let mut staging: Option<ID3D11Texture2D> = None;
+                self.dev.CreateTexture2D(&sd, None, Some(&mut staging))?;
+
+                *slot = Some(SegCapture {
+                    rtv: rtv.unwrap(),
+                    rt,
+                    staging: staging.unwrap(),
+                    width,
+                    height,
+                });
+            }
+        }
+
+        let cap = self.seg_capture.borrow();
+        let cap = cap.as_ref().expect("créé juste au-dessus");
+
+        self.bind_compose_state();
+        self.ctx.OMSetBlendState(&self.blend_none, None, 0xffffffff);
+        self.ctx.OMSetRenderTargets(Some(&[Some(cap.rtv.clone())]), None);
+        let vp = D3D11_VIEWPORT {
+            TopLeftX: 0.0, TopLeftY: 0.0,
+            Width: width as f32, Height: height as f32, MinDepth: 0.0, MaxDepth: 1.0,
+        };
+        self.ctx.RSSetViewports(Some(&[vp]));
+        // Plein cadre de la cible, sans coins ni motion blur : le modèle veut l'image, pas
+        // la mise en forme.
+        self.draw_video(
+            &LayerCB {
+                dst: [0.0, 0.0, 1.0, 1.0],
+                src,
+                quad_px: [width as f32, height as f32],
+                mode: 0.0,
+                color: [0.0, 0.0, 0.0, 1.0],
+                mb: [1.0, 1.0, 1.0, 0.0],
+                ..Default::default()
+            },
+            wy,
+            wuv,
+        );
+
+        self.ctx.CopyResource(&cap.staging, &cap.rt);
+        let mut mapped = D3D11_MAPPED_SUBRESOURCE::default();
+        self.ctx.Map(&cap.staging, 0, D3D11_MAP_READ, 0, Some(&mut mapped))?;
+        out.clear();
+        out.reserve((width * height * 3) as usize);
+        for row in 0..height as usize {
+            let line = (mapped.pData as *const u8).add(row * mapped.RowPitch as usize);
+            for col in 0..width as usize {
+                let px = line.add(col * 4);
+                // RGBA -> RGB : le modèle n'a pas de canal alpha en entrée.
+                out.push(*px);
+                out.push(*px.add(1));
+                out.push(*px.add(2));
+            }
+        }
+        self.ctx.Unmap(&cap.staging, 0);
+        Ok(())
+    }
+
+    /// Publie le masque de segmentation du sujet webcam (R8, `width`x`height`, 0 = fond).
+    ///
+    /// Appelé depuis le thread d'inférence, pas depuis le thread de rendu — d'où le
+    /// `SetMultithreadProtected(true)` posé à la création du device (`d3d_windows.rs`). La
+    /// texture est `DYNAMIC` et réécrite en place ; elle n'est recréée que si la résolution du
+    /// modèle change, ce qui n'arrive pas en régime établi.
+    pub fn set_webcam_mask(&self, data: &[u8], width: u32, height: u32) -> Result<()> {
+        if width == 0 || height == 0 {
+            bail!("masque webcam de dimensions nulles ({width}x{height})");
+        }
+        let expected = (width as usize) * (height as usize);
+        if data.len() < expected {
+            bail!("masque webcam trop court : {} octets pour {width}x{height}", data.len());
+        }
+
+        let mut slot = self.webcam_mask.borrow_mut();
+        let needs_alloc = !matches!(slot.as_ref(), Some(m) if m.width == width && m.height == height);
+        if needs_alloc {
+            let td = D3D11_TEXTURE2D_DESC {
+                Width: width,
+                Height: height,
+                MipLevels: 1,
+                ArraySize: 1,
+                Format: DXGI_FORMAT_R8_UNORM,
+                SampleDesc: DXGI_SAMPLE_DESC { Count: 1, Quality: 0 },
+                Usage: D3D11_USAGE_DYNAMIC,
+                BindFlags: D3D11_BIND_SHADER_RESOURCE.0 as u32,
+                CPUAccessFlags: D3D11_CPU_ACCESS_WRITE.0 as u32,
+                MiscFlags: 0,
+            };
+            let mut tex: Option<ID3D11Texture2D> = None;
+            unsafe { self.dev.CreateTexture2D(&td, None, Some(&mut tex))? };
+            let tex = tex.unwrap();
+            let mut srv: Option<ID3D11ShaderResourceView> = None;
+            unsafe { self.dev.CreateShaderResourceView(&tex, None, Some(&mut srv))? };
+            *slot = Some(WebcamMask { tex, srv: srv.unwrap(), width, height });
+        }
+
+        let mask = slot.as_ref().expect("alloué juste au-dessus");
+        unsafe {
+            let mut mapped = D3D11_MAPPED_SUBRESOURCE::default();
+            self.ctx.Map(&mask.tex, 0, D3D11_MAP_WRITE_DISCARD, 0, Some(&mut mapped))?;
+            // `RowPitch` n'est pas `width` : le driver aligne les lignes, donc on recopie
+            // ligne à ligne plutôt que d'un bloc.
+            for row in 0..height as usize {
+                let dst = (mapped.pData as *mut u8).add(row * mapped.RowPitch as usize);
+                let src = data.as_ptr().add(row * width as usize);
+                std::ptr::copy_nonoverlapping(src, dst, width as usize);
+            }
+            self.ctx.Unmap(&mask.tex, 0);
+        }
+        Ok(())
+    }
+
+    /// Un tour de segmentation : téléverse le masque prêt, puis soumet une nouvelle frame si
+    /// la cadence l'autorise.
+    ///
+    /// Les deux moitiés sont volontairement désynchronisées. Le masque téléversé ici vient de
+    /// la frame précédente — une frame de retard sur une silhouette est invisible, alors
+    /// qu'attendre l'inférence bloquerait le rendu, ce qui est exactement le coût que toute
+    /// cette conception cherche à ne pas payer.
+    unsafe fn pump_segmentation(
+        &self,
+        wy: &ID3D11ShaderResourceView,
+        wuv: &ID3D11ShaderResourceView,
+        valid: [f32; 2],
+    ) -> Result<()> {
+        if *self.seg_failed.borrow() {
+            return Ok(());
+        }
+        // Rien à faire si aucun effet n'est demandé : ni capture, ni inférence, ni masque.
+        // Le coût de la fonctionnalité est alors exactement nul.
+        let (wants_effect, model_path) = {
+            let scene = self.scene.borrow();
+            match scene.as_ref().and_then(|s| s.webcam_effect.as_ref()) {
+                Some(e) if e.shader_code() > 0.0 => (true, e.model_path.clone()),
+                _ => (false, None),
+            }
+        };
+        if !wants_effect {
+            return Ok(());
+        }
+
+        // Démarrage paresseux, piloté par la scène : personne n'a à appeler
+        // `enable_segmentation` à la main, et un modèle introuvable éteint l'effet au lieu
+        // de faire tomber le rendu.
+        if self.seg_worker.borrow().is_none() && self.seg_sync.borrow().is_none() {
+            let Some(path) = model_path else { return Ok(()) };
+            if let Err(e) = self.enable_segmentation(std::path::Path::new(&path)) {
+                eprintln!("[segmentation] désactivée : {e}");
+                // Une scène qui reste identique retenterait à chaque frame ; on pose un
+                // worker vide plutôt que de journaliser 60 fois par seconde.
+                *self.seg_failed.borrow_mut() = true;
+                return Ok(());
+            }
+            // En preview on rend cette frame sans masque : le worker vient de démarrer et
+            // l'effet apparaîtra dans quelques millisecondes, ce que personne ne voit. À
+            // l'export cette frame part dans le fichier — on enchaîne donc sur la capture et
+            // l'inférence plutôt que de la laisser sortir non détourée.
+            if !self.seg_deterministic.get() {
+                return Ok(());
+            }
+        }
+
+        if let Some(mask) = self.seg_inbox.lock().unwrap().take() {
+            self.set_webcam_mask(
+                &mask,
+                crate::segmentation::MODEL_WIDTH,
+                crate::segmentation::MODEL_HEIGHT,
+            )?;
+        }
+
+        // La cadence horloge est le bon réglage en preview et le mauvais à l'export, où les
+        // frames défilent aussi vite que la machine décode : le nombre de frames couvertes par
+        // un masque dépendrait alors de la charge. En déterministe, une inférence par frame.
+        if !self.seg_deterministic.get()
+            && !self.seg_rate.borrow_mut().should_run(std::time::Instant::now())
+        {
+            return Ok(());
+        }
+        let mut scratch = self.seg_scratch.borrow_mut();
+        // La frame ENTIÈRE, pas le sous-rect dessiné : un crop utilisateur serré amputerait
+        // le sujet en entrée du modèle, et le masque serait faux là où il compte le plus.
+        // Le shader ramène ses coordonnées dans cet espace via `fx.xy`.
+        self.capture_webcam_rgb(
+            wy,
+            wuv,
+            [0.0, 0.0, valid[0], valid[1]],
+            crate::segmentation::MODEL_WIDTH,
+            crate::segmentation::MODEL_HEIGHT,
+            &mut scratch,
+        )?;
+        if self.seg_deterministic.get() {
+            // Synchrone : le masque doit exister avant que cette frame ne soit composée, sinon
+            // on retombe sur le défaut qu'on corrige. Une inférence ratée laisse le masque
+            // précédent, comme le fait le worker.
+            let mut sync = self.seg_sync.borrow_mut();
+            if let Some(seg) = sync.as_mut() {
+                match seg.run(&scratch) {
+                    Ok(mask) => {
+                        let mask = mask.to_vec();
+                        drop(sync);
+                        self.set_webcam_mask(
+                            &mask,
+                            crate::segmentation::MODEL_WIDTH,
+                            crate::segmentation::MODEL_HEIGHT,
+                        )?;
+                    }
+                    Err(e) => eprintln!("[segmentation] frame ignorée : {e}"),
+                }
+            }
+        } else if let Some(w) = self.seg_worker.borrow().as_ref() {
+            w.submit(&scratch);
+        }
+        Ok(())
+    }
+
+    /// Démarre la segmentation du sujet webcam pour ce compositeur.
+    ///
+    /// Idempotent. Tant qu'elle n'est pas appelée, `compose_frame` ne fait rien de plus et
+    /// la webcam se dessine comme avant — c'est ce qui rend l'effet inerte plutôt que cassé
+    /// sur une build sans modèle.
+    pub fn enable_segmentation(&self, model_path: &std::path::Path) -> Result<()> {
+        if self.seg_worker.borrow().is_some() || self.seg_sync.borrow().is_some() {
+            return Ok(());
+        }
+        let segmenter = crate::segmentation::Segmenter::load(model_path)?;
+        // En déterministe, le segmenteur reste ici : l'inférence tourne sur le thread de rendu,
+        // donc le masque de la frame N est prêt AVANT qu'elle ne soit composée. Le worker est un
+        // choix de preview — ne jamais bloquer l'affichage — et c'est exactement ce qui rend
+        // l'export irreproductible, le masque arrivant quelques frames plus tard selon la charge.
+        if self.seg_deterministic.get() {
+            *self.seg_sync.borrow_mut() = Some(segmenter);
+            return Ok(());
+        }
+        let inbox = std::sync::Arc::clone(&self.seg_inbox);
+        let worker = crate::segmentation::SegmentationWorker::spawn(segmenter, move |mask, _, _| {
+            // Écrase le masque précédent s'il n'a pas encore été téléversé : c'est le plus
+            // récent qui vaut, jamais une file.
+            *inbox.lock().unwrap() = Some(mask.to_vec());
+        });
+        *self.seg_worker.borrow_mut() = Some(worker);
+        Ok(())
+    }
+
+    /// Bascule la segmentation en mode reproductible, pour l'export.
+    ///
+    /// En preview, la cadence suit l'horloge (30 Hz réels) et l'inférence tourne sur un worker :
+    /// c'est le bon choix, l'affichage ne doit jamais attendre. À l'export les frames sont rendues
+    /// aussi vite que la machine décode, sans rapport avec le temps réel — et ces deux choix
+    /// deviennent alors des bugs. La cadence horloge fait dépendre le nombre de frames couvertes
+    /// par un masque de la vitesse de la machine, et le worker asynchrone rend les premières
+    /// frames AVANT que le premier masque n'existe : elles partent dans le fichier avec le vrai
+    /// arrière-plan de la webcam. Deux exports du même projet ne donnent donc pas les mêmes
+    /// pixels, ce qui casse l'invariant « l'export est identique à la preview ».
+    ///
+    /// En déterministe : une inférence PAR FRAME, synchrone. Plus coûteux (~3 ms/frame), mais
+    /// l'export est hors ligne et chaque frame porte le masque calculé depuis SA propre image.
+    ///
+    /// À appeler avant la première frame — c'est ce qui décide comment `enable_segmentation`
+    /// s'installe.
+    pub fn set_segmentation_deterministic(&self, on: bool) {
+        if self.seg_deterministic.get() == on {
+            return;
+        }
+        self.seg_deterministic.set(on);
+        // Changer de mode change le MOTEUR, et `enable_segmentation` est idempotent sur la
+        // PRÉSENCE d'un moteur : sans démonter celui qui ne correspond plus, le drapeau mentirait.
+        // Un compositeur qui a déjà servi en preview garderait son worker, `seg_sync` resterait
+        // vide, et l'export entier ne ferait AUCUNE inférence. Le démarrage paresseux de
+        // `pump_segmentation` réinstalle le bon moteur à la frame suivante.
+        *self.seg_worker.borrow_mut() = None;
+        *self.seg_sync.borrow_mut() = None;
+        // Et le masque que le worker démonté avait peut-être déjà déposé : il vient de l'autre
+        // mode, il n'a rien à faire sur la première frame de celui-ci.
+        *self.seg_inbox.lock().unwrap() = None;
+    }
+
+    /// Éteint l'effet : la webcam se redessine telle quelle à la frame suivante.
+    pub fn clear_webcam_mask(&self) {
+        *self.webcam_mask.borrow_mut() = None;
+    }
+
     pub fn set_cursor(&self, track: CursorTrack) {
         *self.cursor.borrow_mut() = Some(track);
     }
@@ -862,6 +1527,18 @@ impl Compositor {
     /// Voir `timeline_t_override`. `None` restaure le comportement fixture (`frame / FPS`).
     pub fn set_timeline_time(&self, t: Option<f32>) {
         *self.timeline_t_override.borrow_mut() = t;
+    }
+
+    /// Voir `programme_time`. `None` restaure le comportement fixture (`frame / FPS`).
+    pub fn set_programme_time(&self, t: Option<f32>) {
+        *self.programme_time.borrow_mut() = t;
+    }
+
+    /// Dernier temps programme reçu : pour que les tests vérifient ce qui atteint vraiment
+    /// `FrameGeometryInput`, pas seulement ce que l'appelant croit envoyer.
+    #[doc(hidden)]
+    pub fn programme_time(&self) -> Option<f32> {
+        *self.programme_time.borrow()
     }
 
     /// Copie de la scène courante (si présente) — utilisé par l'export multiclip pour lire les
@@ -889,7 +1566,11 @@ impl Compositor {
 
     /// Curseur thème (sprite PNG, ex. arrow.png) dont le PIVOT `hotspot` (fraction 0..1 de
     /// l'image) tombe sur `center`, à la taille de référence `size_px`. `Err` → l'appelant
-    /// retombe sur `draw_cursor` (math dot+ring).
+    /// retombe sur `draw_cursor` (math dot+ring). La géométrie vient de
+    /// `frame_geometry::cursor_sprite_cb`, partagée avec macOS et Linux.
+    ///
+    /// Avec `model`, le même sprite extrudé (mode 15, `cursor_model_cb`) : le sprite en t2, son
+    /// champ de distance en t4.
     unsafe fn draw_cursor_sprite(
         &self,
         placement: CursorPlacement,
@@ -897,70 +1578,41 @@ impl Compositor {
         a: f32,
         sprite: &SceneCursorSprite,
         clip: [f32; 4],
+        model: Option<crate::frame_geometry::CursorPose>,
     ) -> Result<()> {
         let path = sprite.path.as_str();
-        let cached = self.img_cache.borrow().get(path).cloned();
-        let (srv, iw, ih) = match cached {
-            Some(v) => v,
-            None => {
-                let loaded = self.load_image_srv(path)?;
-                self.img_cache.borrow_mut().insert(path.to_string(), loaded.clone());
-                loaded
+        let (srv, iw, ih) = self.cached_image(path)?;
+        // Sans champ de distance, repli sur le sprite plat plutôt que sur le curseur math.
+        // Parité Linux.
+        if let Some(pose) = model {
+            match self.cursor_sdf(path) {
+                Ok((sdf, shape)) => {
+                    let shape =
+                        SpriteShape { hotspot: [sprite.hotspot_x, sprite.hotspot_y], ..shape };
+                    if let Some(cb) = crate::frame_geometry::cursor_model_cb(
+                        placement, size_px, pose, shape, a, clip,
+                    ) {
+                        self.upload_cb(&cb);
+                        self.ctx.PSSetShaderResources(2, Some(&[Some(srv)]));
+                        self.ctx.PSSetShaderResources(4, Some(&[Some(sdf)]));
+                        self.ctx.Draw(4, 0);
+                        self.ctx.PSSetShaderResources(4, Some(&[None]));
+                    }
+                    return Ok(());
+                }
+                Err(e) => eprintln!("[curseur] champ de \"{path}\" : {e:#}"),
             }
-        };
+        }
         let ar = iw as f32 / ih as f32;
         let (pw, ph) = if ar >= 1.0 { (size_px, size_px / ar) } else { (size_px * ar, size_px) };
-        let hotspot = [sprite.hotspot_x, sprite.hotspot_y];
-
-        let cb = match placement {
-            CursorPlacement::Upright { center } => LayerCB {
-                dst: cursor_sprite_dst(center, pw / self.rw(), ph / self.rh(), hotspot),
-                src: [0.0, 0.0, 1.0, 1.0],
-                mode: 7.0,
-                color: [1.0, 1.0, 1.0, a],
-                fx: clip,
-                ..Default::default()
-            },
-            CursorPlacement::Tilted { plane_pt, quad, center_px, screen_px, .. } => {
-                // Le sprite est posé DANS le plan : sa taille devient une fraction du plan
-                // (l'unité de `size_px` est le rect d'écran non incliné), et ses 4 coins
-                // traversent la même projection que la vidéo. La réduction due au tilt vient
-                // donc de la projection elle-même — rien à multiplier à la main.
-                let (wf, hf) = (pw / screen_px[0], ph / screen_px[1]);
-                let x0 = plane_pt[0] - hotspot[0] * wf;
-                let y0 = plane_pt[1] - hotspot[1] * hf;
-                let corners = [(x0, y0), (x0 + wf, y0), (x0 + wf, y0 + hf), (x0, y0 + hf)]
-                    .map(|(fx, fy)| {
-                        let (px, py) = quad.point_px(fx, fy);
-                        (center_px[0] + px, center_px[1] + py)
-                    });
-                let (min_x, max_x) = corners
-                    .iter()
-                    .fold((f32::MAX, f32::MIN), |(mn, mx), &(x, _)| (mn.min(x), mx.max(x)));
-                let (min_y, max_y) = corners
-                    .iter()
-                    .fold((f32::MAX, f32::MIN), |(mn, mx), &(_, y)| (mn.min(y), mx.max(y)));
-                // Le quad projeté d'un sprite peut être très fin de biais : une bbox d'un pixel
-                // de large ferait diverger le warp inverse, donc plancher à 1 px.
-                let (bw, bh) = ((max_x - min_x).max(1.0), (max_y - min_y).max(1.0));
-                let local = |(x, y): (f32, f32)| [x - min_x, y - min_y];
-                let [tl0, tl1] = local(corners[0]);
-                let [tr0, tr1] = local(corners[1]);
-                let [br0, br1] = local(corners[2]);
-                let [bl0, bl1] = local(corners[3]);
-                LayerCB {
-                    dst: [min_x / self.rw(), min_y / self.rh(), bw / self.rw(), bh / self.rh()],
-                    quad_px: [bw, bh],
-                    mode: 13.0,
-                    color: [1.0, 1.0, 1.0, a],
-                    fx: [tl0, tl1, tr0, tr1],
-                    src_prev: [br0, br1, bl0, bl1],
-                    dst_prev: clip,
-                    ..Default::default()
-                }
-            }
-        };
-
+        let cb = crate::frame_geometry::cursor_sprite_cb(
+            placement,
+            [pw, ph],
+            [sprite.hotspot_x, sprite.hotspot_y],
+            a,
+            clip,
+            [self.rw(), self.rh()],
+        );
         self.upload_cb(&cb);
         self.ctx.PSSetShaderResources(2, Some(&[Some(srv)]));
         self.ctx.Draw(4, 0);
@@ -968,11 +1620,13 @@ impl Compositor {
     }
 
     /// Sprite de l'état courant (`cursor_type`, ex. `"text"`), à défaut celui de la flèche,
-    /// à défaut le curseur math (dot+ring).
+    /// à défaut le curseur math (dot+ring). Avec `model`, ce sprite extrudé (mode 15) : même
+    /// résolution que `plan_cursor`, qui en a tiré la pose.
     ///
     /// Le repli sur la flèche compte : un thème n'apporte que sa flèche et son pointeur, les
     /// autres états venant de l'art intégrée — mais si un état inconnu apparaît, mieux vaut
     /// une flèche qu'un point dans un cercle.
+    #[allow(clippy::too_many_arguments)]
     unsafe fn draw_cur_themed(
         &self,
         sprites: &HashMap<String, SceneCursorSprite>,
@@ -981,10 +1635,11 @@ impl Compositor {
         size_px: f32,
         a: f32,
         clip: [f32; 4],
+        model: Option<crate::frame_geometry::CursorPose>,
     ) {
         let sprite = cursor_type.and_then(|t| sprites.get(t)).or_else(|| sprites.get("arrow"));
         if let Some(sprite) = sprite {
-            if self.draw_cursor_sprite(placement, size_px, a, sprite, clip).is_ok() {
+            if self.draw_cursor_sprite(placement, size_px, a, sprite, clip, model).is_ok() {
                 return;
             }
         }
@@ -1091,26 +1746,26 @@ impl Compositor {
         frame: f32,
         cfg: &Cfg,
     ) -> Result<()> {
+        self.begin_image_frame();
         let (sy, suv) = self.nv12_srvs(screen)?;
         let (wy, wuv) = self.nv12_srvs(webcam)?;
         let (stw, sth) = self.tex_dims(screen);
         let (wtw, wth) = self.tex_dims(webcam);
         let (scw, sch) = ((*screen).width as f32, (*screen).height as f32);
         let (wcw, wch) = ((*webcam).width as f32, (*webcam).height as f32);
+        // Étendue valide de la texture webcam : les décodeurs allouent des textures alignées,
+        // donc la frame n'occupe pas forcément toute la texture.
+        let w_valid = [wcw / wtw as f32, wch / wth as f32];
+
+        // Segmentation, AVANT `begin()` : la capture réquisitionne la cible de rendu.
+        self.pump_segmentation(&wy, &wuv, w_valid)?;
         let u_max = scw / stw as f32;
         let v_max = sch / sth as f32;
 
         let scene_ref = self.scene.borrow();
         let cursor_ref = self.cursor.borrow();
         let lp = *self.live_params.borrow();
-        // Toute la géométrie vit dans `frame_geometry::plan_frame` — 353 lignes sans un
-        // appel GPU, partagées avec le backend Metal. Ce qui suit ce destructure est
-        // inchangé, à l'octet près.
-        let crate::frame_geometry::FrameGeometry {
-            scene_preset, mb_taps, source_t, zoom_rotation, padding_scale, cut, s_dst,
-            s_dst_prev, s_ann, s_radius, frame_min_px, w_dst, w_dst_prev, w_px, w_radius,
-            shape_fade,
-        } = crate::frame_geometry::plan_frame(&crate::frame_geometry::FrameGeometryInput {
+        let g = crate::frame_geometry::plan_frame(&crate::frame_geometry::FrameGeometryInput {
             render_px: [self.rw(), self.rh()],
             screen_tex_px: [stw as f32, sth as f32],
             screen_visible_px: [scw, sch],
@@ -1123,8 +1778,29 @@ impl Compositor {
             scene: scene_ref.as_ref(),
             cursor: cursor_ref.as_ref(),
             timeline_t_override: *self.timeline_t_override.borrow(),
+            programme_time: *self.programme_time.borrow(),
         });
+        let scene_preset = g.scene_preset.clone();
+        let mb_taps = g.mb_taps;
+        let mb_amount = g.mb_amount;
+        let source_t = g.source_t;
+        let _padding_scale = g.padding_scale;
+        let cut = g.cut;
+        let s_dst = g.s_dst;
+        let s_dst_prev = g.s_dst_prev;
+        let s_ann = g.s_ann;
+        let s_radius = g.s_radius;
+        let frame_min_px = g.frame_min_px;
+        let w_dst = g.w_dst;
+        let w_dst_prev = g.w_dst_prev;
+        let w_px = g.w_px;
+        let w_radius = g.w_radius;
+        let shape_fade = g.shape_fade;
 
+        // Profondeur de champ : la pyramide n'est remplie que sur une frame inclinée qui la lit,
+        // AVANT `begin`, qui rebranche ensuite le RT principal et le vide.
+        let dof = g.depth_of_field_on(self.cpu_backend);
+        let dof_srv = if dof { Some(self.fill_dof_pyramid(&sy, &suv, stw, sth)?) } else { None };
 
         self.begin([0.0, 0.0, 0.0, 1.0]);
 
@@ -1147,19 +1823,25 @@ impl Compositor {
                         ..Default::default()
                     });
                 }
-                SceneBackground::Gradient { angle_deg, stops } => {
+                SceneBackground::Gradient { angle_deg, stops, motion } => {
                     let c0 = stops.first().and_then(|s| parse_hex(s)).unwrap_or(lp.bg_color);
                     let c1 = stops.last().and_then(|s| parse_hex(s)).unwrap_or(c0);
                     // angle CSS → direction unitaire (espace sortie, y vers le bas) :
                     // 0° = vers le haut, 90° = vers la droite.
                     let a = angle_deg.to_radians();
                     let dir = [a.sin(), -a.cos()];
+                    let (anim, mb) = crate::frame_geometry::gradient_motion_slots(
+                        motion,
+                        g.programme_t,
+                        self.rw() / self.rh(),
+                    );
                     self.draw_solid(&LayerCB {
                         dst: [0.0, 0.0, 1.0, 1.0],
                         src: [c1[0], c1[1], c1[2], c1[3]],
                         mode: 5.0,
                         color: c0,
-                        fx: [dir[0], dir[1], 0.0, 0.0],
+                        fx: [dir[0], dir[1], anim[0], anim[1]],
+                        mb,
                         ..Default::default()
                     });
                 }
@@ -1231,8 +1913,7 @@ impl Compositor {
         // Géométrie du tilt, calculée UNE fois : l'ombre et l'écran doivent porter exactement le
         // même quadrilatère. Deux calculs séparés, c'est une ombre qui se décolle dès qu'un des
         // deux change.
-        let tilt = (!crate::regions::is_identity_rotation(zoom_rotation))
-            .then(|| crate::regions::rotated_quad_corners_px(s_px[0], s_px[1], zoom_rotation));
+        let tilt = g.screen_tilt(s_px);
         let quad_center_px =
             [(s_dst[0] + s_dst[2] * 0.5) * self.rw(), (s_dst[1] + s_dst[3] * 0.5) * self.rh()];
         // L'ombre suit la silhouette réellement affichée : le rect arrondi quand l'écran est
@@ -1240,24 +1921,64 @@ impl Compositor {
         // penché ne se lisait pas comme son ombre mais comme une seconde surface. Elle suit
         // aussi la croissance de la boîte pendant un zoom (issue #179) : quand la boîte sort
         // du cadre, l'ombre en sort avec elle, sans jamais se lire comme une bande noire.
+        // Avec un cadre de fenêtre, c'est le CADRE qui porte l'ombre (`shadow_caster`), sinon
+        // elle tomberait sous l'écran seul et la barre de titre flotterait au-dessus.
+        let render_px = [self.rw(), self.rh()];
         if cfg.shadow {
             let spread = SCREEN_SHADOW_SPREAD_FRAC * frame_min_px;
-            let offset = [0.0, SCREEN_SHADOW_OFFSET_FRAC * frame_min_px];
+            let offset = g.screen_shadow_offset();
             let opacity = 0.45 * lp.shadow_scale;
-            match tilt.as_ref() {
-                None => self.draw_shadow(s_dst, s_px, s_radius, spread, offset, opacity),
-                Some(quad) => self.draw_quad_shadow(
-                    &quad.corners,
-                    quad_center_px,
+            // Un appareil porte l'ombre de sa silhouette 3D (mode 17), pas celle d'un quad.
+            if let Some(cb) = g.device_shadow_cb(render_px, spread, offset, opacity) {
+                self.draw_solid(&cb);
+            } else {
+                match g.shadow_caster(render_px) {
+                    ShadowCaster::Upright { dst, size_px, radius } => {
+                        self.draw_shadow(dst, size_px, radius, spread, offset, opacity)
+                    }
                     // Même rayon que le plan incliné lui-même (cf. le dessin du mode 8).
-                    s_radius * quad.scale,
-                    spread,
-                    offset,
-                    opacity,
-                ),
+                    ShadowCaster::Tilted { corners, center_px, radius } => {
+                        self.draw_quad_shadow(&corners, center_px, radius, spread, offset, opacity)
+                    }
+                }
             }
         }
-        if crate::regions::is_identity_rotation(zoom_rotation) {
+        // Le cadre (mode 14) passe SOUS l'écran : l'écran le recouvre, ne laissant voir que la
+        // barre de titre, le filet et les coins bas entre les deux arrondis.
+        if let Some(cb) = g.window_frame_cb(render_px) {
+            self.draw_solid(&cb);
+        }
+        let square_top = g.screen_square_top();
+        // Sous le chrome de fenetre, la remontee de son contour interieur au-dessus de l'ecran :
+        // l'arrondi du haut se fait par le cadre (`screen_top_lift_px`). 0 sans fenetre.
+        let top_lift = g.screen_top_lift_px(render_px);
+        if let Some(quad) = tilt {
+            // Écran incliné (angle fixe) ou vu par la caméra réelle : warp inverse du mode 8 dans
+            // la bbox du quad projeté (`tilted_screen_cb`, partagé). Les coins arrondis y sont
+            // rendus dans le repère DU PLAN : sans eux le plan a des arêtes de couteau qui
+            // tranchent le contenu en pleine phrase, et l'œil lit une découpe là où il devrait
+            // lire une inclinaison.
+            // t2 EXPLICITE : `draw_video` ne lie que t0/t1, et t2 garde sinon ce que le draw
+            // précédent y a laissé (un wallpaper, un sprite). `None` quand l'effet est coupé :
+            // `k = 0`, le shader n'y lit rien.
+            self.ctx.PSSetShaderResources(2, Some(&[dof_srv.clone()]));
+            self.draw_video(
+                &crate::frame_geometry::tilted_screen_cb(
+                    &quad,
+                    s_px,
+                    quad_center_px,
+                    [su0, sv0, su0 + 2.0 * hu, sv0 + 2.0 * hv],
+                    g.focus_plane,
+                    s_radius,
+                    top_lift,
+                    dof,
+                    render_px,
+                ),
+                &sy,
+                &suv,
+            );
+            self.ctx.PSSetShaderResources(2, Some(&[None]));
+        } else {
             self.draw_video(
                 &LayerCB {
                     dst: s_dst,
@@ -1268,237 +1989,97 @@ impl Compositor {
                     color: [0.0, 0.0, 0.0, 1.0],
                     src_prev: [su0_p, sv0_p, su0_p + 2.0 * hu_p, sv0_p + 2.0 * hv_p],
                     dst_prev: s_dst_prev,
-                    mb: [mb_taps, 1.0, 1.0, 0.0],
-                    ..Default::default()
-                },
-                &sy,
-                &suv,
-            );
-        } else {
-            // Tilt 3D (zoom "rotation" iso/left/right) : warp bilinéaire inverse (mode 8, voir
-            // shaders.hlsl). Pas de motion blur dans ce chemin — le tilt est un effet bref, la
-            // simplification ne se voit pas. Les coins arrondis, eux, se voyaient : sans eux le
-            // plan a des arêtes de couteau qui tranchent le contenu en pleine phrase, et l'œil lit
-            // une découpe (« un overflow hidden qui tronque l'enregistrement ») là où il devrait
-            // lire une inclinaison. Ils sont donc rendus, dans le repère DU PLAN.
-            let quad = tilt.unwrap_or_else(|| {
-                crate::regions::rotated_quad_corners_px(s_px[0], s_px[1], zoom_rotation)
-            });
-            let corners = quad.corners;
-            // Taille du plan dans son propre repère, avant projection : c'est là que vit le rayon,
-            // pour qu'il reste un rayon constant le long du bord et non un arrondi qui s'étire avec
-            // la perspective.
-            let plane_px = [s_px[0] * quad.scale, s_px[1] * quad.scale];
-            let (cx_px, cy_px) = (quad_center_px[0], quad_center_px[1]);
-            let (min_x, max_x) = corners.iter().fold((f32::MAX, f32::MIN), |(mn, mx), &(x, _)| {
-                (mn.min(x), mx.max(x))
-            });
-            let (min_y, max_y) = corners.iter().fold((f32::MAX, f32::MIN), |(mn, mx), &(_, y)| {
-                (mn.min(y), mx.max(y))
-            });
-            let bbox_w = (max_x - min_x).max(1.0);
-            let bbox_h = (max_y - min_y).max(1.0);
-            let bbox_dst = [
-                (cx_px + min_x) / self.rw(),
-                (cy_px + min_y) / self.rh(),
-                bbox_w / self.rw(),
-                bbox_h / self.rh(),
-            ];
-            // coins en px LOCAUX à la bbox (0..bbox_w/h), pour matcher `i.local` du shader.
-            let local = |(x, y): (f32, f32)| -> [f32; 2] { [x - min_x, y - min_y] };
-            let [tl0, tl1] = local(corners[0]);
-            let [tr0, tr1] = local(corners[1]);
-            let [br0, br1] = local(corners[2]);
-            let [bl0, bl1] = local(corners[3]);
-            self.draw_video(
-                &LayerCB {
-                    dst: bbox_dst,
-                    src: [su0, sv0, su0 + 2.0 * hu, sv0 + 2.0 * hv],
-                    quad_px: [bbox_w, bbox_h],
-                    // Le rayon suit la réduction du plan : l'écran incliné est plus petit, ses
-                    // coins le sont d'autant, exactement comme s'il s'éloignait.
-                    radius_px: s_radius * quad.scale,
-                    mode: 8.0,
-                    fx: [tl0, tl1, tr0, tr1],
-                    src_prev: [br0, br1, bl0, bl1],
-                    dst_prev: [plane_px[0], plane_px[1], 0.0, 0.0],
+                    mb: [mb_taps, mb_amount, top_lift, square_top],
                     ..Default::default()
                 },
                 &sy,
                 &suv,
             );
         }
+        // L'appareil modelé (mode 17) passe APRÈS l'écran, et non sous lui comme le chrome plat :
+        // son socle vient DEVANT le plan du métrage et sa lunette mord dessus. Le shader s'arrête
+        // au plan du métrage dans l'ouverture, donc il ne recouvre jamais l'image.
+        if let Some(cb) = g.device_frame_cb(render_px) {
+            self.draw_solid(&cb);
+        }
 
         // --- curseur custom : suit le mapping src/dst (zoom+layout), click bounce,
-        // et flou de mouvement par fantômes le long de sa vélocité (frame-1 -> frame) ---
-        // Jeu de sprites résolu par l'app (art du thème + art intégrée pour les états qu'il ne
-        // fournit pas), sinon math dot+ring — fixture/bench sans scène uniquement.
-        let cursor_sprites: HashMap<String, SceneCursorSprite> = self
-            .scene
-            .borrow()
-            .as_ref()
-            .map(|s| s.cursor.cursor_sprites.clone())
-            .unwrap_or_default();
-        // « Clip to canvas » : tronque le curseur aux bords de l'écran (utile quand le padding
-        // crée une marge et que la pointe, près du bord de la vidéo, dépasserait dedans).
-        // Rect englobant tout par défaut = pas d'effet (le mode 4/7 du shader clippe sur `fx`).
-        // Écran incliné : le rect droit d'origine rognerait le curseur sur les parties du plan
-        // qui débordent au-dessus/en dessous, donc on clippe sur la bbox du quad projeté. Un
-        // rect reste une approximation du quadrilatère — `fx` ne sait pas exprimer autre chose —
-        // mais qui ne coupe plus rien de ce qui est réellement affiché.
-        let cursor_bounds: [f32; 4] = match tilt.as_ref() {
-            None => s_dst,
-            Some(quad) => {
-                let (hx, hy) = quad.half_extents_px();
-                [
-                    (quad_center_px[0] - hx) / self.rw(),
-                    (quad_center_px[1] - hy) / self.rh(),
-                    2.0 * hx / self.rw(),
-                    2.0 * hy / self.rh(),
-                ]
-            }
-        };
-        let cursor_clip_rect: [f32; 4] = match self.scene.borrow().as_ref() {
-            Some(s) if s.cursor.clip_to_bounds => cursor_bounds,
-            _ => [-1.0, -1.0, 3.0, 3.0],
-        };
-        // « Show cursor » : piloté par la scène (contrat de l'app) quand elle est posée ; sinon
-        // par `cfg.cursor` (inspector / bench fixture).
-        let cursor_show = scene_ref
-            .as_ref()
-            .map(|s| s.cursor.show)
-            .unwrap_or(cfg.cursor);
-        if cursor_show {
-            let cursor_ref = self.cursor.borrow();
-            if let Some(track) = cursor_ref.as_ref() {
-                let t = self.cursor_t_override.borrow().unwrap_or(frame / FPS);
-                // position sortie à un temps donné via un mapping screen (src rect + dst)
-                let map = |cxy: Option<(f32, f32)>, s0: [f32; 2], h: [f32; 2], dst: [f32; 4]| {
-                    cxy.and_then(|(cx2, cy2)| {
-                        let fx = (cx2 * u_max - s0[0]) / (2.0 * h[0]);
-                        let fy = (cy2 * v_max - s0[1]) / (2.0 * h[1]);
-                        if !(0.0..=1.0).contains(&fx) || !(0.0..=1.0).contains(&fy) {
-                            return None;
-                        }
-                        // Écran incliné : le curseur vit SUR le plan, pas dans un calque
-                        // au-dessus. On garde donc sa position dans le repère DU PLAN et c'est
-                        // le dessin qui projette — position ET sprite. Le poser sur `dst`, le
-                        // rect droit d'origine, le laissait flotter à côté de l'image, l'écart
-                        // se comptant en dizaines de pixels là où le plan s'éloigne le plus.
-                        Some(match tilt.as_ref() {
-                            Some(&quad) => CursorPlacement::Tilted {
-                                plane_pt: [fx, fy],
-                                quad,
-                                center_px: quad_center_px,
-                                screen_px: s_px,
-                                render_px: [self.rw(), self.rh()],
-                            },
-                            None => CursorPlacement::Upright {
-                                center: [dst[0] + fx * dst[2], dst[1] + fy * dst[3]],
-                            },
-                        })
-                    })
-                };
-                let raw_xy = track.at(t);
-                // Hors de [0,1] = pointeur hors du rect source actuel (zoom serré / hors écran) —
-                // état normal en cours de lecture, pas une erreur : rien à dessiner cette frame.
-                let mapped = map(raw_xy, [su0, sv0], [hu, hv], s_dst);
-                if let Some(cur) = mapped {
-                    // taille + amplitude du bounce pilotées par l'inspector (défauts = fixture).
-                    // `padding_scale` : le curseur est un recouvrement synthétique, pas cuit dans
-                    // la vidéo — quand le padding rétrécit l'écran, le curseur doit rétrécir
-                    // pareil pour rester à l'échelle du contenu (sinon sa pointe semble se
-                    // décaler/dériver à mesure que le padding grandit).
-                    let bounce = 1.0 + (track.bounce(t) - 1.0) * lp.cursor_bounce_scale;
-                    // Pas de facteur de tilt ici : sur un plan incliné la taille est convertie
-                    // en fraction du plan puis projetée avec lui (voir `draw_cursor_sprite`),
-                    // donc la réduction vient de la projection. L'ajouter en plus rétrécirait
-                    // le curseur deux fois.
-                    let sz = CURSOR_BASE_SIZE_FRAC
-                        * frame_min_px
-                        * lp.cursor_size_scale
-                        * bounce
-                        * padding_scale;
-                    // flou de mouvement DU CURSEUR, indépendant de cfg.mblur_n (écran/vidéo).
-                    // BUG corrigé : augmenter l'intensité ne faisait auparavant que sur-échantillonner
-                    // (plus de taps) un écart figé d'1 frame (1/60s) -> la traînée ne s'allongeait
-                    // JAMAIS, donc restait quasi invisible quel que soit le réglage. L'intensité doit
-                    // étirer la FENÊTRE temporelle de la traînée, pas seulement sa densité d'échantillons.
-                    // 0 -> 1 frame en arrière (net) ; 1 -> ~8 frames (~130 ms à 60fps, traînée nette).
-                    let blur01 = lp.cursor_motion_blur.clamp(0.0, 1.0);
-                    let has_scene = self.scene.borrow().is_some();
-                    let trail_frames = if has_scene { 1.0 + blur01 * 7.0 } else { 1.0 };
-                    // BUG corrigé : le plancher était 2 (pas 1) -> même à blur=0 le curseur
-                    // passait TOUJOURS par le chemin additif multi-tap (poids 1/taps=0.5 chacun),
-                    // et comme prev≠cur au pixel près, les deux copies à 0.5 d'alpha ne se
-                    // recouvraient jamais parfaitement -> curseur en permanence semi-transparent
-                    // (quasi invisible sur fond clair), même sans aucun flou demandé.
-                    let taps = if has_scene {
-                        (1.0 + blur01 * 10.0).round() as u32 // 0 -> 1 (net) ; 1 -> 11 (traînée)
-                    } else {
-                        cfg.mblur_n // fixture/bench : comportement historique inchangé
-                    };
-                    // L'état est celui de l'instant rendu : la traînée de flou reprend le même
-                    // sprite pour toutes ses copies, un changement d'état en plein mouvement
-                    // n'a pas à laisser une traînée hybride.
-                    let cursor_type = track.type_at(t).map(str::to_string);
-                    let cursor_type = cursor_type.as_deref();
-                    if taps <= 1 {
+        // et flou de mouvement (parité `compositor_macos.rs` et `compositor_linux.rs`) ---
+        if let Some(track) = cursor_ref.as_ref() {
+            let plan = crate::frame_geometry::plan_cursor(
+                &g,
+                &crate::frame_geometry::CursorPlanInput {
+                    render_px: [self.rw(), self.rh()],
+                    u_max,
+                    v_max,
+                    cfg,
+                    live: lp,
+                    scene: scene_ref.as_ref(),
+                    track,
+                    t: self.cursor_t_override.borrow().unwrap_or(frame / FPS),
+                },
+            )
+            .map(|p| p.for_backend(self.cpu_backend));
+            if let Some(plan) = plan {
+                let cursor_sprites: HashMap<String, SceneCursorSprite> = scene_ref
+                    .as_ref()
+                    .map(|s| s.cursor.cursor_sprites.clone())
+                    .unwrap_or_default();
+                let cursor_type = plan.cursor_type.as_deref();
+                // L'impact des clics (mode 16, sans texture), posé sur l'écran SOUS le curseur.
+                for cb in &plan.impacts {
+                    self.draw_solid(cb);
+                }
+                if plan.taps <= 1 {
+                    self.draw_cur_themed(
+                        &cursor_sprites,
+                        cursor_type,
+                        plan.placement,
+                        plan.size_px,
+                        plan.alpha,
+                        plan.clip,
+                        plan.model,
+                    );
+                } else {
+                    // Flou RÉEL, pas des copies discrètes : accumule les N échantillons dans un
+                    // buffer ISOLÉ (transparent), pas directement sur la scène déjà composée.
+                    self.ctx.ClearRenderTargetView(&self.accum_rtv, &[0.0, 0.0, 0.0, 0.0]);
+                    self.ctx.OMSetRenderTargets(Some(&[Some(self.accum_rtv.clone())]), None);
+                    for k in 0..plan.taps {
+                        let f = k as f32 / (plan.taps - 1) as f32;
+                        let w = crate::frame_geometry::cursor_tap_weight(k, plan.taps);
+                        self.ctx.OMSetBlendState(&self.blend_add, Some(&[w, w, w, w]), 0xffffffff);
                         self.draw_cur_themed(
                             &cursor_sprites,
                             cursor_type,
-                            cur,
-                            sz,
-                            1.0,
-                            cursor_clip_rect,
+                            plan.prev_placement.lerp(plan.placement, f),
+                            plan.size_px,
+                            plan.alpha,
+                            plan.clip,
+                            plan.model,
                         );
-                    } else {
-                        let tp = t - trail_frames / FPS;
-                        let prev = map(track.at(tp), [su0_p, sv0_p], [hu_p, hv_p], s_dst_prev)
-                            .unwrap_or(cur);
-                        // Flou RÉEL, pas des copies discrètes : accumule les N échantillons dans un
-                        // buffer ISOLÉ (transparent), pas directement sur la scène déjà composée.
-                        // BUG précédent : additionner directement sur `self.rtv` revient à AJOUTER
-                        // la couleur du curseur (blanc) à ce qu'il y a déjà dessous — sur un fond
-                        // clair, ajouter du blanc*petit-alpha ne change presque rien de visible
-                        // (déjà proche du blanc) -> curseur quasi invisible. En accumulant d'abord
-                        // dans un buffer à part (parti de zéro, même mécanisme que le motion blur
-                        // écran de `compose_frame_mb`), la somme reste correctement normalisée
-                        // (alpha final ~1 si les échantillons se recouvrent), puis on la composite
-                        // sur la scène par un blend "over" classique — correct quel que soit le fond.
-                        self.ctx.ClearRenderTargetView(&self.accum_rtv, &[0.0, 0.0, 0.0, 0.0]);
-                        self.ctx.OMSetRenderTargets(Some(&[Some(self.accum_rtv.clone())]), None);
-                        let w = 1.0 / taps as f32;
-                        self.ctx.OMSetBlendState(&self.blend_add, Some(&[w, w, w, w]), 0xffffffff);
-                        for k in 0..taps {
-                            let f = k as f32 / (taps - 1) as f32;
-                            self.draw_cur_themed(
-                                &cursor_sprites,
-                                cursor_type,
-                                prev.lerp(cur, f),
-                                sz,
-                                1.0,
-                                cursor_clip_rect,
-                            );
-                        }
-                        // composite le buffer accumulé sur la scène (blend "over" normal, prémultiplié).
-                        self.ctx.OMSetRenderTargets(Some(&[Some(self.rtv.clone())]), None);
-                        self.ctx.PSSetShaderResources(0, Some(&[Some(self.accum_srv.clone())]));
-                        self.ctx.VSSetShader(&self.vs_fs, None);
-                        self.ctx.PSSetShader(&self.ps_tex, None);
-                        self.ctx.PSSetSamplers(0, Some(&[Some(self.sampler.clone())]));
-                        let vp = D3D11_VIEWPORT {
-                            TopLeftX: 0.0, TopLeftY: 0.0,
-                            Width: self.rw(), Height: self.rh(), MinDepth: 0.0, MaxDepth: 1.0,
-                        };
-                        self.ctx.RSSetViewports(Some(&[vp]));
-                        self.ctx.OMSetBlendState(&self.blend, None, 0xffffffff);
-                        self.ctx.Draw(3, 0);
-                        self.ctx.PSSetShaderResources(0, Some(&[None]));
-                        // restaure l'état de composition standard (VS/PS/topologie quad-strip) pour
-                        // le dessin de la webcam qui suit juste après.
-                        self.bind_compose_state();
                     }
+                    // composite le buffer accumulé sur la scène (blend "over" normal, prémultiplié).
+                    self.ctx.OMSetRenderTargets(Some(&[Some(self.rtv.clone())]), None);
+                    self.ctx.PSSetShaderResources(0, Some(&[Some(self.accum_srv.clone())]));
+                    self.ctx.VSSetShader(&self.vs_fs, None);
+                    self.ctx.PSSetShader(&self.ps_tex, None);
+                    self.ctx.PSSetSamplers(0, Some(&[Some(self.sampler.clone())]));
+                    let vp = D3D11_VIEWPORT {
+                        TopLeftX: 0.0,
+                        TopLeftY: 0.0,
+                        Width: self.rw(),
+                        Height: self.rh(),
+                        MinDepth: 0.0,
+                        MaxDepth: 1.0,
+                    };
+                    self.ctx.RSSetViewports(Some(&[vp]));
+                    self.ctx.OMSetBlendState(&self.blend, None, 0xffffffff);
+                    self.ctx.Draw(3, 0);
+                    self.ctx.PSSetShaderResources(0, Some(&[None]));
+                    // restaure l'état de composition standard (VS/PS/topologie quad-strip) pour
+                    // le dessin de la webcam qui suit juste après.
+                    self.bind_compose_state();
                 }
             }
         }
@@ -1538,7 +2119,13 @@ impl Compositor {
                 scene_preset.as_deref(),
                 Some("dual-frame") | Some("vertical-stack"),
             );
-            if cfg.shadow && !webcam_is_block && shape_fade > 0.0 {
+            // L'ombre appartient à la bulle PiP. En détourage il n'y a plus de bulle — une
+            // ombre portée par un rectangle invisible se lit comme un artefact.
+            let is_cutout = matches!(
+                scene_ref.as_ref().and_then(|s| s.webcam_effect.as_ref()),
+                Some(e) if e.shader_code() == 1.0
+            ) && self.webcam_mask.borrow().is_some();
+            if cfg.shadow && !webcam_is_block && !is_cutout && shape_fade > 0.0 {
                 let strength = WEBCAM_SHADOW_OPACITY * shape_fade;
                 self.draw_shadow(
                     w_dst,
@@ -1549,6 +2136,38 @@ impl Compositor {
                     strength,
                 );
             }
+            // Effet d'arrière-plan : le mode vient de la scène, le masque par pixel de
+            // l'inférence. Les DEUX sont requis — un mode sans masque rendrait la webcam
+            // invisible en détourage, donc tant que rien n'a été segmenté on dessine la piste
+            // telle quelle. C'est aussi ce qui rend le premier lancement gracieux.
+            let mask = self.webcam_mask.borrow();
+            let effect = scene_ref
+                .as_ref()
+                .and_then(|s| s.webcam_effect.as_ref())
+                .filter(|_| mask.is_some())
+                .map(|e| (e.shader_code(), e))
+                .filter(|(code, _)| *code > 0.0);
+
+            // Fond personnalisé : on PEINT le fond dans la bulle, puis on y découpe la caméra
+            // par-dessus — le mélange alpha donne `lerp(fond, caméra, personne)`, soit exactement
+            // ce que la branche « mode 3 » du shader calculait, mais pour les TROIS sortes de
+            // fond. Le shader ne sait peindre qu'une couleur plate sous le masque ; dégradés et
+            // images y tombaient sur du noir, et le défaut EST une image.
+            let (effect_code, blur_intensity) = match effect {
+                Some((code, e)) if code > 2.5 => {
+                    self.draw_webcam_bg(e.background.as_ref(), w_dst, w_px, w_radius);
+                    (1.0, 0.0)
+                }
+                Some((code, e)) => (code, e.blur_intensity.clamp(0.0, 1.0)),
+                None => (0.0, 0.0),
+            };
+
+            if let Some(m) = mask.as_ref() {
+                // `draw_video` ne lie que les slots 0-1, donc le masque posé ici tient pour
+                // l'appel qui suit. Il est délié juste après pour ne pas fuir sur les calques
+                // d'annotation, qui utilisent eux aussi le slot 2 et au-delà.
+                self.ctx.PSSetShaderResources(3, Some(&[Some(m.srv.clone())]));
+            }
             self.draw_video(
                 &LayerCB {
                     dst: w_dst,
@@ -1556,15 +2175,21 @@ impl Compositor {
                     quad_px: w_px,
                     radius_px: w_radius,
                     mode: 0.0,
+                    // `color.a` porte l'alpha du découpage (`color.a * personne`) ; le RGB n'est
+                    // plus lu, le fond ayant déjà été peint sous la caméra.
                     color: [0.0, 0.0, 0.0, 1.0],
+                    fx: [w_valid[0], w_valid[1], effect_code, blur_intensity],
                     src_prev: [u0, sv0, u1, sv1], // src fixe (pas de zoom webcam)
                     dst_prev: w_dst_prev,
-                    mb: [mb_taps, 1.0, 1.0, 0.0],
+                    mb: [mb_taps, mb_amount, 1.0, 0.0],
                     ..Default::default()
                 },
                 &wy,
                 &wuv,
             );
+            if mask.is_some() {
+                self.ctx.PSSetShaderResources(3, Some(&[None]));
+            }
         }
 
         // --- annotations : calque le plus haut, comme dans le DOM de la preview (le calque y est
@@ -1574,25 +2199,30 @@ impl Compositor {
         // la transform, donc les annotations restent en place pendant que le contenu zoome dessous.
         // Ce fut `s_dst` tant que le zoom vivait dans la coupe source ; depuis l'issue #179 il vit
         // dans la BOÎTE, et `s_dst` emmenait annotations et sous-titres avec lui.
+        // Exception : le flou de confidentialité suit le contenu (`FrameGeometry::privacy_mask`),
+        // d'où la géométrie entière passée en plus de `s_ann`.
         // `source_t`, la même base de temps que les zoom/speed regions : le temps SOURCE du clip,
         // pas le compteur de frames. C'est ce qui garde une annotation alignée sur l'image quand
         // une speed region répète ou saute des frames.
-        self.draw_annotations(scene_ref.as_ref(), source_t, s_ann);
+        self.draw_annotations(scene_ref.as_ref(), source_t, s_ann, &g);
         Ok(())
     }
 
     /// Dessine les annotations visibles à `t`. `s_ann` = rect écran SANS ZOOM, en fractions de
     /// sortie.
     ///
-    /// Le paramètre s'appelle `s_ann` et pas `screen_dst` parce que c'est le seul rect correct :
-    /// lui passer `s_dst` fait dériver et grossir les sous-titres sous un zoom (issue #179, puis
-    /// #397 sur Linux). L'arithmétique elle-même vit dans `frame_geometry::annotation_dst_in`,
-    /// partagée par les trois backends.
-    ///
-    /// Seule la « figure » (flèche) est rendue à ce stade ; texte, image et flou suivront. Les
-    /// types non gérés sont ignorés silencieusement plutôt que dessinés de travers : mieux vaut
-    /// l'absence connue qu'un placeholder qui ferait croire à un bug de style.
-    unsafe fn draw_annotations(&self, scene: Option<&Scene>, t: f32, s_ann: [f32; 4]) {
+    /// Le paramètre s'appelle `s_ann` et pas `screen_dst` parce que c'est le seul rect correct
+    /// pour le texte, les flèches et les images : lui passer `s_dst` fait dériver et grossir les
+    /// sous-titres sous un zoom (issue #179, puis #397 sur Linux). L'arithmétique elle-même vit
+    /// dans `frame_geometry::annotation_dst_in`, partagée par les trois backends. Le flou, lui,
+    /// se place par `g.privacy_mask` : un masque doit rester sur ce qu'il cache.
+    unsafe fn draw_annotations(
+        &self,
+        scene: Option<&Scene>,
+        t: f32,
+        s_ann: [f32; 4],
+        g: &crate::frame_geometry::FrameGeometry,
+    ) {
         let Some(scene) = scene else { return };
         if scene.annotations.is_empty() {
             return;
@@ -1656,6 +2286,9 @@ impl Compositor {
                 }
                 "blur" => {
                     let Some(blur) = annotation.blur.as_ref() else { continue };
+                    let Some(mask) = g.privacy_mask(annotation, [self.rw(), self.rh()]) else {
+                        continue;
+                    };
                     // Le masque en tracé libre demande une liste de points côté GPU (buffer
                     // structuré), pas encore faite : on masque alors la BOÎTE ENGLOBANTE.
                     //
@@ -1672,7 +2305,9 @@ impl Compositor {
                     // Le repli du tracé libre passe par le rectangle, pas l'ovale : un ovale
                     // inscrit dans la boîte englobante en retirerait les coins, donc une partie de
                     // ce que l'utilisateur a couvert.
-                    let is_oval = if blur.shape == "oval" && !freehand_fallback { 1.0 } else { 0.0 };
+                    // Masque élargi à la trace du flou de mouvement : l'ovale n'y couvrirait plus tout.
+                    let is_oval =
+                        if blur.shape == "oval" && !freehand_fallback && mask.oval_ok { 1.0 } else { 0.0 };
                     // La teinte n'a de sens qu'en mosaïque : elle sert à marquer visiblement une
                     // zone caviardée. Un flou teinté ne ressemblerait plus à un flou.
                     let tinted = if is_blur > 0.5 { 0.0 } else { 1.0 };
@@ -1681,13 +2316,17 @@ impl Compositor {
                     } else {
                         [1.0, 1.0, 1.0, 1.0]
                     };
+                    let (dst_prev, src_prev, mb) = mask.warp_fields();
                     self.ctx.PSSetShaderResources(2, Some(&[Some(self.ann_copy_srv.clone())]));
                     self.draw_solid(&LayerCB {
-                        dst,
-                        quad_px,
+                        dst: mask.dst,
+                        quad_px: mask.quad_px,
                         mode: 10.0,
                         color: tint,
-                        fx: [is_blur, amount.max(1.0), is_oval, tinted],
+                        fx: [is_blur, amount.max(1.0) * mask.strength, is_oval, tinted],
+                        src_prev,
+                        dst_prev,
+                        mb,
                         ..Default::default()
                     });
                 }
@@ -2397,6 +3036,86 @@ impl Compositor {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Preuve de bout en bout que `img_cache` est borné : charge TOUS les wallpapers livrés,
+    /// une frame par wallpaper — ce que fait le sélecteur quand on le parcourt — et vérifie que
+    /// le total reste sous le budget.
+    ///
+    /// Opt-in : il crée un vrai device D3D11, ce qu'aucun autre test de ce fichier ne fait (celui
+    /// juste en dessous s'en passe volontairement) et qu'un runner sans adaptateur ne peut pas
+    /// fournir. Même convention que le harnais visuel de la segmentation :
+    ///
+    ///     set OPENSCREEN_CACHE_DEMO=1 && cargo test -p openscreen-compositor --release
+    ///         img_cache_stays_under_budget -- --nocapture
+    ///
+    /// Les tests de `lru_evictions` couvrent la POLITIQUE ; celui-ci couvre le CÂBLAGE — que le
+    /// backend l'appelle vraiment, sur les bonnes tailles, et que le budget morde sur nos assets.
+    #[test]
+    fn img_cache_stays_under_budget() {
+        if std::env::var_os("OPENSCREEN_CACHE_DEMO").is_none() {
+            eprintln!("OPENSCREEN_CACHE_DEMO absent — saute (ce test demande un device D3D11)");
+            return;
+        }
+        let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .parent()
+            .and_then(|p| p.parent())
+            .expect("racine du dépôt")
+            .join("public/wallpapers");
+        let mut papers: Vec<_> = std::fs::read_dir(&root)
+            .expect("public/wallpapers")
+            .filter_map(|e| e.ok().map(|e| e.path()))
+            .filter(|p| {
+                matches!(p.extension().and_then(|e| e.to_str()), Some("jpg" | "jpeg" | "png"))
+            })
+            .collect();
+        papers.sort();
+        assert!(papers.len() >= 10, "il faut plusieurs wallpapers pour que le budget morde");
+
+        let gpu = crate::d3d::Gpu::create_backend(crate::d3d::Backend::Hardware, false)
+            .expect("device D3D11");
+        let comp = Compositor::new(&gpu).expect("compositeur");
+
+        let mut cumule = 0u64;
+        let mut pic = 0u64;
+        for path in &papers {
+            // Une frame par wallpaper : c'est le rythme du sélecteur, et c'est ce qui rend
+            // l'entrée précédente évinçable. Dans une même frame elle ne le serait pas.
+            comp.begin_image_frame();
+            let p = path.to_string_lossy().to_string();
+            let (_, w, h) = unsafe { comp.cached_image(&p) }.expect("chargement");
+            cumule += w as u64 * h as u64 * 4;
+            let cache = comp.img_cache.borrow();
+            let total: u64 = cache.values().map(|e| e.1 as u64 * e.2 as u64 * 4).sum();
+            pic = pic.max(total);
+            eprintln!(
+                "  {:<20} {:>5}x{:<5} | cache {:>2} entrées {:>4} Mo | cumulé sans éviction {:>5} Mo",
+                path.file_name().unwrap().to_string_lossy(),
+                w,
+                h,
+                cache.len(),
+                total / 1048576,
+                cumule / 1048576,
+            );
+        }
+        eprintln!(
+            "
+  budget {} Mo | pic observé {} Mo | cumulé si rien n'était évincé {} Mo",
+            IMG_CACHE_BUDGET_BYTES / 1048576,
+            pic / 1048576,
+            cumule / 1048576,
+        );
+        assert!(
+            pic <= IMG_CACHE_BUDGET_BYTES,
+            "le cache a dépassé son budget : {} Mo > {} Mo",
+            pic / 1048576,
+            IMG_CACHE_BUDGET_BYTES / 1048576
+        );
+        assert!(
+            cumule > IMG_CACHE_BUDGET_BYTES,
+            "sans éviction le total ({} Mo) doit dépasser le budget, sinon le test ne prouve rien",
+            cumule / 1048576
+        );
+    }
 
 
     /// Le HLSL est compilé au démarrage du compositeur : jusqu'ici une faute dedans ne se voyait

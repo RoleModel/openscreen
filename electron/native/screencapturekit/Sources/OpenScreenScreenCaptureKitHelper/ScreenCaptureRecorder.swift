@@ -65,6 +65,7 @@ struct RecordingRequest: Decodable {
 
 	let schemaVersion: Int?
 	let recordingId: Int?
+	let excludedWindowIds: [UInt32]?
 	let source: Source
 	let video: Video
 	let audio: Audio
@@ -129,10 +130,16 @@ final class ScreenCaptureRecorder: NSObject, SCStreamOutput, SCStreamDelegate {
 	private var didStartWriting = false
 	private var didEmitRecordingStarted = false
 	private var didReportWriterFailure = false
-	private var isStopping = false
+	/// The one shutdown, however many callers ask for it. A writer failure starts it on
+	/// its own task, and the `stop` Electron sends right after has to wait for that run:
+	/// the command loop exits the process as soon as `stop()` returns, which would cut
+	/// `finishWriter()` off before its terminal event.
+	private var shutdownTask: Task<Void, Never>?
 	private var isPaused = false
 	private var pauseStartedAt: CMTime?
 	private var totalPausedDuration = CMTime.zero
+	/// Sample queue only. See `VideoTimestampGate` for the failure it exists to prevent.
+	private var videoTimestampGate = VideoTimestampGate()
 	private var nativeMicrophoneEnabled = false
 	private var outputWidth = 1920
 	private var outputHeight = 1080
@@ -181,17 +188,20 @@ final class ScreenCaptureRecorder: NSObject, SCStreamOutput, SCStreamDelegate {
 	}
 
 	func stop() async {
-		let shouldStop = stateQueue.sync {
-			if isStopping {
-				return false
+		let task = stateQueue.sync { () -> Task<Void, Never> in
+			if let shutdownTask {
+				return shutdownTask
 			}
-			isStopping = true
-			return true
+			let task = Task {
+				await self.performStop()
+			}
+			shutdownTask = task
+			return task
 		}
-		if !shouldStop {
-			return
-		}
+		await task.value
+	}
 
+	private func performStop() async {
 		do {
 			try await stream?.stopCapture()
 		} catch {
@@ -207,7 +217,7 @@ final class ScreenCaptureRecorder: NSObject, SCStreamOutput, SCStreamDelegate {
 
 	func pause() {
 		let didPause = stateQueue.sync {
-			if isStopping || isPaused {
+			if shutdownTask != nil || isPaused {
 				return false
 			}
 
@@ -226,7 +236,7 @@ final class ScreenCaptureRecorder: NSObject, SCStreamOutput, SCStreamDelegate {
 
 	func resume() {
 		let didResume = stateQueue.sync {
-			if isStopping || !isPaused {
+			if shutdownTask != nil || !isPaused {
 				return false
 			}
 
@@ -289,6 +299,19 @@ final class ScreenCaptureRecorder: NSObject, SCStreamOutput, SCStreamDelegate {
 			return
 		}
 		let presentationTime = CMSampleBufferGetPresentationTimeStamp(sampleBuffer)
+		// A frame that does not move the timeline forward fails the whole writer one append
+		// later (-16364), so it is dropped here instead. After a resume that is one frame the
+		// user never sees; without the check it was the end of the recording.
+		switch videoTimestampGate.check(presentationTime) {
+		case .admit:
+			break
+		case .invalid:
+			reportRefusedVideoFrame(presentationTime, previous: nil, pauseOffset: pauseState.offset)
+			return
+		case .notAfterPrevious(let previous):
+			reportRefusedVideoFrame(presentationTime, previous: previous, pauseOffset: pauseState.offset)
+			return
+		}
 		if !didStartWriting {
 			writer.startWriting()
 			writer.startSession(atSourceTime: presentationTime)
@@ -296,8 +319,16 @@ final class ScreenCaptureRecorder: NSObject, SCStreamOutput, SCStreamDelegate {
 			audioMixer?.beginTimeline(at: presentationTime)
 			startAudioTicker()
 		}
+		// Checked before the readiness gate, not only at a false append: a failed
+		// writer is not guaranteed to call itself ready, and an append that is never
+		// attempted can never report the failure (issue #621).
+		if writer.status == .failed {
+			reportWriterFailure("writer status")
+			return
+		}
 
 		if videoInput.isReadyForMoreMediaData {
+			videoTimestampGate.record(presentationTime)
 			let appended = videoInput.append(sampleBuffer)
 			if appended, !didEmitRecordingStarted {
 				didEmitRecordingStarted = true
@@ -329,6 +360,12 @@ final class ScreenCaptureRecorder: NSObject, SCStreamOutput, SCStreamDelegate {
 	/// settles and every failure becomes the "Saving..." hang instead of an error.
 	/// This event answers "when did the writer die"; that one answers "did stopping
 	/// work". Two questions, two codes.
+	///
+	/// It also ends the capture, the way `didStopWithError` does. A failed writer
+	/// never recovers, so every frame after it is dropped; issue #621 is a take
+	/// whose writer died at 75 s while capture ran on for 22 more minutes. The
+	/// process stays up and still answers `stop`, so the Electron stop path works
+	/// unchanged and reads this event back as the reason.
 	private func reportWriterFailure(_ stage: String) {
 		guard !didReportWriterFailure, let writer else {
 			return
@@ -336,10 +373,32 @@ final class ScreenCaptureRecorder: NSObject, SCStreamOutput, SCStreamDelegate {
 		didReportWriterFailure = true
 		emitError(
 			code: "writer-failed-during-capture",
-			message: "\(stage): "
+			message: "Recording stopped: the video file could not be written (\(stage): "
 				+ (writer.error.map { "\($0)" }
-					?? "AVAssetWriter status \(writer.status.rawValue)"),
+					?? "AVAssetWriter status \(writer.status.rawValue)")
+				+ ").",
 		)
+		Task {
+			await stop()
+		}
+	}
+
+	/// Once per take, with the numbers that tell the cause apart. A refusal with a non-zero pause
+	/// offset, a few milliseconds behind the previous frame, is the pause shift measured in
+	/// `VideoTimestampGate`. One with no pause offset at all is a source handing over time that
+	/// goes backwards, which nothing here has observed yet and is worth a report.
+	private func reportRefusedVideoFrame(_ presentationTime: CMTime, previous: CMTime?, pauseOffset: CMTime) {
+		guard videoTimestampGate.rejectedCount == 1 else {
+			return
+		}
+		emit([
+			"event": "warning",
+			"code": "video-frame-timestamp-refused",
+			"message": "Dropped a video frame whose timestamp did not advance.",
+			"presentationTimeSeconds": presentationTime.isNumeric ? CMTimeGetSeconds(presentationTime) : -1,
+			"previousSeconds": previous.map { CMTimeGetSeconds($0) } ?? -1,
+			"pauseOffsetSeconds": pauseOffset.isNumeric ? CMTimeGetSeconds(pauseOffset) : 0,
+		])
 	}
 
 	private func ensureRequestedPermissions() throws {
@@ -387,7 +446,22 @@ final class ScreenCaptureRecorder: NSObject, SCStreamOutput, SCStreamDelegate {
 			guard let display = content.displays.first(where: { $0.displayID == displayId }) else {
 				throw HelperError.sourceNotFound("No ScreenCaptureKit display found for id \(displayId).")
 			}
-			let filter = SCContentFilter(display: display, excludingWindows: [])
+			let requestedWindowIDs = request.excludedWindowIds ?? []
+			let resolvedWindowIDs = resolveCaptureExcludedWindowIDs(
+				requestedWindowIDs: requestedWindowIDs,
+				availableWindowIDs: content.windows.map(\.windowID)
+			)
+			let resolvedWindowIDSet = Set(resolvedWindowIDs)
+			let excludedWindows = content.windows.filter {
+				resolvedWindowIDSet.contains($0.windowID)
+			}
+			let filter = SCContentFilter(display: display, excludingWindows: excludedWindows)
+			emit([
+				"event": "capture-window-exclusion",
+				"requestedWindowIds": requestedWindowIDs,
+				"resolvedWindowIds": resolvedWindowIDs,
+				"excludedWindowCount": excludedWindows.count,
+			])
 			let size = captureSize(
 				for: filter,
 				fallbackPointSize: display.frame.size,
@@ -465,6 +539,12 @@ final class ScreenCaptureRecorder: NSObject, SCStreamOutput, SCStreamDelegate {
 			configuration.setValue(true, forKey: "captureMicrophone")
 			if let deviceId = resolveMicrophoneCaptureDeviceID() {
 				configuration.setValue(deviceId, forKey: "microphoneCaptureDeviceID")
+			} else if requestedASpecificMicrophone {
+				emit([
+					"event": "warning",
+					"code": "microphone-defaulted",
+					"message": "The requested microphone could not be resolved; capturing the default input.",
+				])
 			}
 		} else {
 			nativeMicrophoneEnabled = false
@@ -582,7 +662,16 @@ final class ScreenCaptureRecorder: NSObject, SCStreamOutput, SCStreamDelegate {
 			leeway: .milliseconds(5)
 		)
 		timer.setEventHandler { [weak self] in
-			self?.audioMixer?.tick()
+			guard let self else {
+				return
+			}
+			// A still screen delivers no complete frames, so the frame path alone
+			// could sit on a dead writer for as long as nothing on screen moves.
+			if self.writer?.status == .failed {
+				self.reportWriterFailure("writer status")
+				return
+			}
+			self.audioMixer?.tick()
 		}
 		audioTicker = timer
 		timer.resume()
@@ -613,6 +702,16 @@ final class ScreenCaptureRecorder: NSObject, SCStreamOutput, SCStreamDelegate {
 			if didStartWriting, writer.status == .writing {
 				writer.endSession(atSourceTime: end)
 			}
+		}
+
+		let refusedVideoFrames = sampleQueue.sync { videoTimestampGate.rejectedCount }
+		if refusedVideoFrames > 1 {
+			emit([
+				"event": "warning",
+				"code": "video-frame-timestamps-refused",
+				"message": "Dropped \(refusedVideoFrames) video frames whose timestamps did not advance.",
+				"count": refusedVideoFrames,
+			])
 		}
 
 		videoInput?.markAsFinished()
@@ -678,13 +777,16 @@ final class ScreenCaptureRecorder: NSObject, SCStreamOutput, SCStreamDelegate {
 			arrayToFill: &timing,
 			entriesNeededOut: nil
 		)
+		// Both failures drop the sample rather than pass it on unshifted. An unshifted frame sits
+		// a whole pause ahead of the timeline, and every correctly shifted frame after it would
+		// then fall behind it — refused by the timestamp gate for as long as the pause lasted.
 		if timingStatus != noErr {
 			emit([
 				"event": "warning",
 				"code": "sample-retime-failed",
 				"message": "Unable to read sample timing info: \(timingStatus).",
 			])
-			return sampleBuffer
+			return nil
 		}
 
 		for index in timing.indices {
@@ -713,7 +815,7 @@ final class ScreenCaptureRecorder: NSObject, SCStreamOutput, SCStreamDelegate {
 				"code": "sample-retime-failed",
 				"message": "Unable to copy sample timing info: \(copyStatus).",
 			])
-			return sampleBuffer
+			return nil
 		}
 
 		return retimedBuffer
@@ -780,24 +882,39 @@ final class ScreenCaptureRecorder: NSObject, SCStreamOutput, SCStreamDelegate {
 			SCStreamOutputType(rawValue: microphoneOutputTypeRawValue) != nil
 	}
 
+	/// Did the user actually ask for a particular microphone?
+	///
+	/// The same test the Windows helper makes before emitting this warning
+	/// (`wantedAParticularMicrophone` in wgc-capture/src/wasapi_loopback_capture.cpp),
+	/// and it has to be made here too because `resolveMicrophoneCaptureDeviceID()`
+	/// returns nil for two very different situations. One is a chosen microphone that
+	/// nothing here could find, which is worth saying out loud. The other is no choice
+	/// at all, which is the common case and has to stay silent: the HUD leaves both
+	/// fields unset until its picker moves off "default", and persists the literal id
+	/// "default" when the user picks Chromium's own Default entry — so both shapes
+	/// arrive here meaning "the system default is fine", not "your microphone is gone".
+	private var requestedASpecificMicrophone: Bool {
+		let deviceId =
+			request.audio.microphone.deviceId?.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
+		let deviceName =
+			request.audio.microphone.deviceName?.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
+		// "default" has to veto the name, not sit beside it. Chromium's picker
+		// persists BOTH fields from whichever entry was clicked, and its Default
+		// entry is labelled "Default - Microphone (…)" — a string no AVCaptureDevice
+		// localizedName ever matches. Reading the name here meant that picking
+		// "Default" warned about a microphone the user never chose.
+		if deviceId == "default" { return false }
+		return !deviceId.isEmpty || !deviceName.isEmpty
+	}
+
 	private func resolveMicrophoneCaptureDeviceID() -> String? {
-		let devices = AVCaptureDevice.devices(for: .audio)
-
-		if let deviceName = request.audio.microphone.deviceName?.trimmingCharacters(in: .whitespacesAndNewlines),
-			!deviceName.isEmpty,
-			let device = devices.first(where: { $0.localizedName == deviceName })
-		{
-			return device.uniqueID
-		}
-
-		if let deviceId = request.audio.microphone.deviceId?.trimmingCharacters(in: .whitespacesAndNewlines),
-			!deviceId.isEmpty,
-			devices.contains(where: { $0.uniqueID == deviceId })
-		{
-			return deviceId
-		}
-
-		return nil
+		resolveMicrophoneDeviceID(
+			deviceID: request.audio.microphone.deviceId,
+			deviceName: request.audio.microphone.deviceName,
+			devices: AVCaptureDevice.devices(for: .audio).map {
+				(id: $0.uniqueID, name: $0.localizedName)
+			}
+		)
 	}
 }
 

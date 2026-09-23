@@ -12,25 +12,25 @@ import {
 	type CropRegion,
 	type CursorVisualSettings,
 	DEFAULT_CROP_REGION,
-	DEFAULT_CURSOR_CLICK_BOUNCE,
-	DEFAULT_CURSOR_CLIP_TO_BOUNDS,
-	DEFAULT_CURSOR_MOTION_BLUR,
-	DEFAULT_CURSOR_SIZE,
-	DEFAULT_CURSOR_SMOOTHING,
-	DEFAULT_WEBCAM_LAYOUT_PRESET,
-	DEFAULT_WEBCAM_MASK_SHAPE,
-	DEFAULT_WEBCAM_MIRRORED,
 	DEFAULT_WEBCAM_POSITION,
-	DEFAULT_WEBCAM_REACTIVE_ZOOM,
-	DEFAULT_WEBCAM_SIZE_PRESET,
+	isWallpaperMotion,
+	isWebcamBackgroundMode,
+	type WallpaperMotion,
+	type WebcamBackgroundMode,
 	type WebcamLayoutPreset,
 	type WebcamMaskShape,
 	type WebcamPosition,
 	type WebcamSizePreset,
 } from "@/components/video-editor/types";
-import { DEFAULT_CURSOR_THEME_ID } from "@/lib/cursor/cursorThemes";
-import { DEFAULT_WALLPAPER } from "@/lib/wallpaper";
+import {
+	DEFAULT_PROJECT_APPEARANCE,
+	type FrameTheme,
+	isFrameTheme,
+	type RecordingFrame,
+	readRecordingFrame,
+} from "@/lib/projectDefaults";
 import type { AspectRatio } from "@/utils/aspectRatioUtils";
+import { clamp01 } from "@/utils/math";
 import type { AxcutDocument } from "../schema";
 
 // ponytail: avoid dragging in lib/exporter full surface here — we only
@@ -80,10 +80,17 @@ const DEFAULT_CROP_PAN: CropPan = { x: 0.5, y: 0.5 };
 
 export interface EditorSettingsSnapshot {
 	wallpaper: string;
+	/** Only a gradient wallpaper moves; kept as chosen when the wallpaper changes kind. */
+	wallpaperMotion: WallpaperMotion;
+	/** The frame drawn around the recording (window chrome or a modelled device), or "none". */
+	frame: RecordingFrame;
+	/** Light or dark, for whichever frame is on. Inert with `frame: "none"`. */
+	frameTheme: FrameTheme;
 	aspectRatio: AspectRatio;
 	shadowIntensity: number;
 	showBlur: boolean;
 	motionBlurAmount: number;
+	depthOfField: boolean;
 	borderRadius: number;
 	padding: number;
 	cropRegion: CropRegion;
@@ -98,53 +105,44 @@ export interface EditorSettingsSnapshot {
 	 *  Authoritative: `webcamCropRegion.x/y` are rebuilt from it on read. */
 	webcamCropPan: CropPan;
 	audioGainDb: number;
+	webcamBackgroundMode: WebcamBackgroundMode;
+	webcamWallpaper: string;
+	webcamBlurIntensity: number;
 	cursor: CursorVisualSettings;
 	cursorShow: boolean;
+	cursorAutoHide: boolean;
 	cursorTheme: string;
 	autoFocusAll: boolean;
 }
 
 export const DEFAULT_EDITOR_SETTINGS: EditorSettingsSnapshot = {
-	wallpaper: DEFAULT_WALLPAPER,
-	aspectRatio: "16:9",
 	// Opinionated by default: the wallpaper and the padding were already on, but
 	// with square corners and no shadow the recording read as a rectangle pasted
 	// onto the background rather than a window floating above it (#271 reported
 	// the symptom and blamed the padding). These three are the rest of that look;
 	// shipping the background without them was shipping half a composition.
-	shadowIntensity: 0.2,
-	showBlur: false,
-	motionBlurAmount: 0.2,
-	borderRadius: 40,
+	...DEFAULT_PROJECT_APPEARANCE,
+	// Padding stays 0 here: this fork's Studio hands over its own framing. The
+	// spread's wallpaper fields are correct now — lib/projectDefaults points them
+	// at DEFAULT_WALLPAPER, a brand board, not the stock gradient it used to name.
 	padding: 0,
 	cropRegion: DEFAULT_CROP_REGION,
-	webcamLayoutPreset: DEFAULT_WEBCAM_LAYOUT_PRESET,
-	webcamMaskShape: DEFAULT_WEBCAM_MASK_SHAPE,
-	webcamMirrored: DEFAULT_WEBCAM_MIRRORED,
-	webcamReactiveZoom: DEFAULT_WEBCAM_REACTIVE_ZOOM,
-	webcamSizePreset: DEFAULT_WEBCAM_SIZE_PRESET,
-	webcamPosition: DEFAULT_WEBCAM_POSITION,
 	webcamCropRegion: DEFAULT_CROP_REGION,
 	webcamCropPan: DEFAULT_CROP_PAN,
 	audioGainDb: 0,
-	cursor: {
-		size: DEFAULT_CURSOR_SIZE,
-		smoothing: DEFAULT_CURSOR_SMOOTHING,
-		motionBlur: DEFAULT_CURSOR_MOTION_BLUR,
-		clickBounce: DEFAULT_CURSOR_CLICK_BOUNCE,
-		clipToBounds: DEFAULT_CURSOR_CLIP_TO_BOUNDS,
-	},
-	cursorShow: true,
-	cursorTheme: DEFAULT_CURSOR_THEME_ID,
-	autoFocusAll: false,
 };
 
 interface LegacyShape {
 	wallpaper?: string;
+	wallpaperMotion?: WallpaperMotion;
+	/** `unknown`: it may still hold `window-light` / `window-dark` (`readRecordingFrame`). */
+	frame?: unknown;
+	frameTheme?: FrameTheme;
 	aspectRatio?: AspectRatio;
 	shadowIntensity?: number;
 	showBlur?: boolean;
 	motionBlurAmount?: number;
+	depthOfField?: boolean;
 	borderRadius?: number;
 	padding?: number;
 	cropRegion?: CropRegion;
@@ -157,12 +155,17 @@ interface LegacyShape {
 	webcamCropRegion?: CropRegion;
 	webcamCropPan?: CropPan;
 	audioGainDb?: number;
+	webcamBackgroundMode?: WebcamBackgroundMode;
+	webcamWallpaper?: string;
+	webcamBlurIntensity?: number;
 	cursorSize?: number;
 	cursorSmoothing?: number;
 	cursorMotionBlur?: number;
 	cursorClickBounce?: number;
+	cursorModel3d?: boolean;
 	cursorClipToBounds?: boolean;
 	cursorShow?: boolean;
+	cursorAutoHide?: boolean;
 	cursorTheme?: string;
 	autoFocusAll?: boolean;
 }
@@ -185,13 +188,18 @@ export function getEditorSettings(doc: AxcutDocument | null | undefined): Editor
 	const num = (v: unknown, fallback: number) => (isNumber(v) ? v : fallback);
 	const bool = (v: unknown, fallback: boolean) => (isBoolean(v) ? v : fallback);
 	const str = (v: unknown, fallback: string) => (isString(v) ? v : fallback);
+	// `window-light` / `window-dark` were the frame AND its theme; they split here.
+	const stored = readRecordingFrame(legacy?.frame);
 
 	const cursor: CursorVisualSettings = {
 		size: num(legacy?.cursorSize, DEFAULT_EDITOR_SETTINGS.cursor.size),
 		smoothing: num(legacy?.cursorSmoothing, DEFAULT_EDITOR_SETTINGS.cursor.smoothing),
 		motionBlur: num(legacy?.cursorMotionBlur, DEFAULT_EDITOR_SETTINGS.cursor.motionBlur),
 		clickBounce: num(legacy?.cursorClickBounce, DEFAULT_EDITOR_SETTINGS.cursor.clickBounce),
+		// Absent in every project saved before the setting existed: those keep the flat cursor.
+		model3d: bool(legacy?.cursorModel3d, DEFAULT_EDITOR_SETTINGS.cursor.model3d),
 		clipToBounds: bool(legacy?.cursorClipToBounds, DEFAULT_EDITOR_SETTINGS.cursor.clipToBounds),
+		autoHide: bool(legacy?.cursorAutoHide, DEFAULT_EDITOR_SETTINGS.cursorAutoHide),
 	};
 
 	// The pan is authoritative and the rect's offset is rebuilt from it, so the two cannot
@@ -208,10 +216,21 @@ export function getEditorSettings(doc: AxcutDocument | null | undefined): Editor
 
 	return {
 		wallpaper: str(legacy?.wallpaper, DEFAULT_EDITOR_SETTINGS.wallpaper),
+		wallpaperMotion: isWallpaperMotion(legacy?.wallpaperMotion)
+			? legacy.wallpaperMotion
+			: DEFAULT_EDITOR_SETTINGS.wallpaperMotion,
+		// An unknown value (a frame a newer build added) reads as no frame, like the compositor.
+		// `window-light` / `window-dark` split into a frame PLUS a theme, so a project written
+		// before the theme existed opens with the look it had (`readRecordingFrame`).
+		frame: stored?.frame ?? DEFAULT_EDITOR_SETTINGS.frame,
+		frameTheme: isFrameTheme(legacy?.frameTheme)
+			? legacy.frameTheme
+			: (stored?.theme ?? DEFAULT_EDITOR_SETTINGS.frameTheme),
 		aspectRatio: legacy?.aspectRatio ?? DEFAULT_EDITOR_SETTINGS.aspectRatio,
 		shadowIntensity: num(legacy?.shadowIntensity, DEFAULT_EDITOR_SETTINGS.shadowIntensity),
 		showBlur: bool(legacy?.showBlur, DEFAULT_EDITOR_SETTINGS.showBlur),
 		motionBlurAmount: num(legacy?.motionBlurAmount, DEFAULT_EDITOR_SETTINGS.motionBlurAmount),
+		depthOfField: bool(legacy?.depthOfField, DEFAULT_EDITOR_SETTINGS.depthOfField),
 		borderRadius: num(legacy?.borderRadius, DEFAULT_EDITOR_SETTINGS.borderRadius),
 		padding: num(legacy?.padding, DEFAULT_EDITOR_SETTINGS.padding),
 		cropRegion: legacy?.cropRegion ?? DEFAULT_EDITOR_SETTINGS.cropRegion,
@@ -233,18 +252,32 @@ export function getEditorSettings(doc: AxcutDocument | null | undefined): Editor
 			AUDIO_GAIN_DB_LIMIT,
 			Math.max(-AUDIO_GAIN_DB_LIMIT, num(legacy?.audioGainDb, 0)),
 		),
+		webcamBackgroundMode: isWebcamBackgroundMode(legacy?.webcamBackgroundMode)
+			? legacy.webcamBackgroundMode
+			: DEFAULT_EDITOR_SETTINGS.webcamBackgroundMode,
+		webcamWallpaper: str(legacy?.webcamWallpaper, DEFAULT_EDITOR_SETTINGS.webcamWallpaper),
+		// Same 0-1 range the slider offers; unclamped, a stored 1000 reaches
+		// `blur(25000px)` on the preview canvas and wedges the compositing thread.
+		webcamBlurIntensity: clamp01(
+			num(legacy?.webcamBlurIntensity, DEFAULT_EDITOR_SETTINGS.webcamBlurIntensity),
+		),
 		cursor,
 		cursorShow: bool(legacy?.cursorShow, DEFAULT_EDITOR_SETTINGS.cursorShow),
+		cursorAutoHide: bool(legacy?.cursorAutoHide, DEFAULT_EDITOR_SETTINGS.cursorAutoHide),
 		cursorTheme: str(legacy?.cursorTheme, DEFAULT_EDITOR_SETTINGS.cursorTheme),
 		autoFocusAll: bool(legacy?.autoFocusAll, DEFAULT_EDITOR_SETTINGS.autoFocusAll),
 	};
 }
 export interface EditorSettingsPatch {
 	wallpaper?: string;
+	wallpaperMotion?: WallpaperMotion;
+	frame?: RecordingFrame;
+	frameTheme?: FrameTheme;
 	aspectRatio?: AspectRatio;
 	shadowIntensity?: number;
 	showBlur?: boolean;
 	motionBlurAmount?: number;
+	depthOfField?: boolean;
 	borderRadius?: number;
 	padding?: number;
 	cropRegion?: CropRegion;
@@ -257,7 +290,11 @@ export interface EditorSettingsPatch {
 	webcamCropRegion?: CropRegion;
 	webcamCropPan?: CropPan;
 	audioGainDb?: number;
-	cursor?: Partial<CursorVisualSettings> & { theme?: string; show?: boolean };
+	webcamBackgroundMode?: WebcamBackgroundMode;
+	webcamWallpaper?: string;
+	webcamBlurIntensity?: number;
+	cursor?: Partial<CursorVisualSettings> & { theme?: string; show?: boolean; autoHide?: boolean };
+	cursorAutoHide?: boolean;
 	autoFocusAll?: boolean;
 }
 
@@ -281,10 +318,13 @@ function nextLegacy(current: LegacyShape | null, patch: EditorSettingsPatch): Le
 		if (c.smoothing !== undefined) next.cursorSmoothing = c.smoothing;
 		if (c.motionBlur !== undefined) next.cursorMotionBlur = c.motionBlur;
 		if (c.clickBounce !== undefined) next.cursorClickBounce = c.clickBounce;
+		if (c.model3d !== undefined) next.cursorModel3d = c.model3d;
 		if (c.clipToBounds !== undefined) next.cursorClipToBounds = c.clipToBounds;
 		if (c.theme !== undefined) next.cursorTheme = c.theme;
 		if (c.show !== undefined) next.cursorShow = c.show;
+		if (c.autoHide !== undefined) next.cursorAutoHide = c.autoHide;
 	}
+	if (patch.cursorAutoHide !== undefined) next.cursorAutoHide = patch.cursorAutoHide;
 	return next;
 }
 

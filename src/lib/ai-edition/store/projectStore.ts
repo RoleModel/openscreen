@@ -3,10 +3,88 @@ import { create } from "zustand";
 import { toFileUrl } from "@/components/video-editor/projectPersistence";
 import { toastText } from "@/i18n/toastText";
 import { nativeBridgeClient } from "@/native/client";
+import { placeAudioTrackInDocument } from "../document/audioTracks";
+import { createId } from "../document/ids";
 import { type Interval, replaceTimeline as replaceTimelineOp } from "../document/timeline";
-import { type AxcutAsset, type AxcutDocument, documentSchema } from "../schema";
-import { probeVideoDimensions } from "../timeline/duration";
+import { type AxcutAsset, type AxcutDocument, createAudioTrack, documentSchema } from "../schema";
+import { probeAudioDuration, probeVideoDimensions } from "../timeline/duration";
 import { clearHistory, currentWriteEpoch, pushHistory } from "./undoStack";
+
+let documentSavesInFlight = 0;
+const documentSavesIdle: Array<() => void> = [];
+
+/** Outcome of `waitForDocumentSaves`: saves drained, or the wait gave up. */
+export type DocumentSavesWait = "idle" | "timeout";
+
+/** How long a waiter sits before it stops believing a save will ever settle. */
+export const DOCUMENT_SAVES_WAIT_TIMEOUT_MS = 10_000;
+
+function beginDocumentSave() {
+	documentSavesInFlight += 1;
+}
+
+function endDocumentSave() {
+	documentSavesInFlight = Math.max(0, documentSavesInFlight - 1);
+	if (documentSavesInFlight > 0) return;
+	while (documentSavesIdle.length > 0) {
+		documentSavesIdle.shift()?.();
+	}
+}
+
+/**
+ * `"idle"` once no `saveDocument` is still waiting on IPC or installing its
+ * result; `"timeout"` if that has not happened within `timeoutMs`.
+ *
+ * The timeout is not decoration. `saveDocument` decrements its counter in a
+ * `finally`, so a rejected save still releases waiters — but a bridge call that
+ * never settles at all runs no `finally`, leaves the counter above zero, and
+ * would park every waiter here forever. Callers must treat `"timeout"` as "I do
+ * not know whether that save landed" and abandon the attempt, keeping whatever
+ * pending state lets a later attempt retry. Reporting it as `"idle"` would be a
+ * lie about disk state, and is how a queued write ends up racing a stuck one.
+ */
+export function waitForDocumentSaves(
+	timeoutMs: number = DOCUMENT_SAVES_WAIT_TIMEOUT_MS,
+): Promise<DocumentSavesWait> {
+	if (documentSavesInFlight === 0) return Promise.resolve("idle");
+	return new Promise((resolve) => {
+		const settle = (outcome: DocumentSavesWait) => {
+			const at = documentSavesIdle.indexOf(waiter);
+			if (at >= 0) documentSavesIdle.splice(at, 1);
+			clearTimeout(timer);
+			resolve(outcome);
+		};
+		const waiter = () => settle("idle");
+		const timer = setTimeout(() => settle("timeout"), timeoutMs);
+		documentSavesIdle.push(waiter);
+	});
+}
+
+/**
+ * `saveDocument`'s own answer, or `"timeout"` if it has not produced one within
+ * `timeoutMs`.
+ *
+ * The companion to {@link waitForDocumentSaves}, for the caller that started the
+ * save rather than one waiting behind it: a bridge call that never settles leaves
+ * this promise pending forever, and anything sequenced after it — a queue, a
+ * chain of later callbacks — stops with it. `"timeout"` carries the same meaning
+ * here as there: the write may still land, so treat the document as unknown and
+ * keep whatever state lets a later attempt retry.
+ */
+export async function saveWithDeadline(
+	save: Promise<boolean>,
+	timeoutMs: number = DOCUMENT_SAVES_WAIT_TIMEOUT_MS,
+): Promise<boolean | "timeout"> {
+	let timer: ReturnType<typeof setTimeout> | undefined;
+	const deadline = new Promise<"timeout">((resolve) => {
+		timer = setTimeout(() => resolve("timeout"), timeoutMs);
+	});
+	try {
+		return await Promise.race([save, deadline]);
+	} finally {
+		clearTimeout(timer);
+	}
+}
 
 // ponytail: thin Zustand wrapper over the native-bridge client. Keeps the
 // current project + revision counter in renderer memory; mutations round-trip
@@ -58,6 +136,11 @@ export interface ProjectState {
 	error: string | null;
 	sourceDurationSec: number;
 	currentTimeSec: number;
+	/** The selected imported audio track (issue #350), or null. In the store — not
+	 *  `useTimeline`'s local selection — because the media panel (which imports the
+	 *  file) and the inspector (which edits it) sit in different component subtrees
+	 *  and both need to read/set it; the region/clip selection stays hook-local. */
+	selectedAudioTrackId: string | null;
 	/** Single source of truth for "is the timeline transport playing?" — previously
 	 *  duplicated as separate local state in NewEditorShell AND VirtualPreview, each
 	 *  independently wired to the same raw <video> DOM events, which let one advance
@@ -72,6 +155,37 @@ export interface ProjectState {
 	createProject: (title: string) => Promise<AxcutDocument>;
 	refresh: () => Promise<void>;
 	addAsset: (path: string, label?: string) => Promise<AxcutAsset | null>;
+	/**
+	 * Import an external audio file (voiceover / BGM / SFX) as a `kind: "audio"`
+	 * asset — issue #350. Unlike {@link addAsset} it never looks for a camera
+	 * sidecar, and it probes the file's duration up front so the timeline can lay
+	 * out its track (added separately, see the timeline store). Returns the added
+	 * asset, or null if the write was superseded.
+	 */
+	addAudioAsset: (path: string, label?: string) => Promise<AxcutAsset | null>;
+	/**
+	 * One-shot "Import audio" for the media panel (issue #350): {@link addAudioAsset}
+	 * then place a track for it at the current playhead and select it, so the file
+	 * lands visibly on the timeline in a single user action. Returns the asset (or
+	 * null if the import was superseded). The timeline's own {@link addAudioTrack}
+	 * covers placing an already-imported asset.
+	 */
+	importAudioAsset: (path: string, label?: string) => Promise<AxcutAsset | null>;
+	/** Place a track for an already-imported audio asset at `timelineStartSec`
+	 *  (default: the playhead) and select it. Returns the new track id, or null. */
+	addAudioTrack: (
+		assetId: string,
+		timelineStartSec?: number,
+		options?: {
+			kind?: "voiceover" | "music";
+			/** Real source duration, when the caller measured it (a fresh recording
+			 *  knows its own length before the asset is probed). */
+			durationSec?: number;
+			/** Timeline span, when it should differ from the source duration. */
+			spanSec?: number;
+		},
+	) => Promise<string | null>;
+	setSelectedAudioTrackId: (id: string | null) => void;
 	removeAsset: (assetId: string) => Promise<void>;
 	/**
 	 * Write the document to disk. Resolves `true` when it took effect, `false` when it
@@ -159,6 +273,7 @@ export const useProjectStore = create<ProjectState>((set, get) => ({
 	error: null,
 	sourceDurationSec: 0,
 	currentTimeSec: 0,
+	selectedAudioTrackId: null,
 	playing: false,
 	dirty: false,
 	lastSavedAt: null,
@@ -179,6 +294,7 @@ export const useProjectStore = create<ProjectState>((set, get) => ({
 				error: null,
 				dirty: false,
 				lastSavedAt: new Date(),
+				selectedAudioTrackId: null,
 			});
 			clearHistory();
 		} catch (error) {
@@ -325,6 +441,96 @@ export const useProjectStore = create<ProjectState>((set, get) => ({
 		return addedAsset;
 	},
 
+	async addAudioAsset(path, label) {
+		const { projectId } = get();
+		if (!projectId) throw new Error("No project loaded");
+		// Same superseded guard as addAsset: the native add, a duration probe and a
+		// save all await, and a project switch / clear can land in between.
+		const epoch = currentWriteEpoch();
+		const superseded = () => get().projectId !== projectId || currentWriteEpoch() !== epoch;
+		const result = await nativeBridgeClient.aiEdition.addAsset(projectId, path, label, "audio");
+		if (superseded()) return null;
+		let document = parseDocument(result.document);
+		const addedAsset =
+			document.assets.find(
+				(a) => a.kind === "audio" && a.originalPath === path && (label ? a.label === label : true),
+			) ??
+			document.assets.at(-1) ??
+			null;
+		if (!addedAsset) return null;
+
+		// Probe the real length so the timeline can size the track pill immediately
+		// on add. Non-fatal: an unreadable file just leaves durationSec unset and the
+		// track store falls back to a placeholder. No camera lookup — audio has none.
+		const durationSec = await probeAudioDuration(toFileUrl(addedAsset.originalPath)).catch(
+			() => null,
+		);
+		if (superseded()) return null;
+		if (durationSec != null) {
+			const next: AxcutDocument = {
+				...document,
+				assets: document.assets.map((a) => (a.id === addedAsset.id ? { ...a, durationSec } : a)),
+			};
+			// history: false — probing a duration is part of the import, not an edit
+			// of its own, so it must not become the thing the next Ctrl+Z reverses.
+			if (await get().saveDocument(next, { history: false })) document = parseDocument(next);
+		}
+
+		if (superseded()) return null;
+		set({
+			document,
+			revision: get().revision + 1,
+			dirty: false,
+			lastSavedAt: new Date(),
+		});
+		return document.assets.find((a) => a.id === addedAsset.id) ?? addedAsset;
+	},
+
+	setSelectedAudioTrackId(id) {
+		set({ selectedAudioTrackId: id });
+	},
+
+	async addAudioTrack(assetId, timelineStartSec, options) {
+		const document = get().document;
+		if (!document) return null;
+		const asset = document.assets.find((a) => a.id === assetId);
+		if (!asset || asset.kind !== "audio") return null;
+		const track = createAudioTrack({
+			assetId,
+			durationSec: options?.durationSec ?? asset.durationSec ?? 0,
+			kind: options?.kind,
+			spanSec: options?.spanSec,
+			// Default to the playhead (RAW/document timeline seconds — the clock the
+			// ruler and playhead use, NOT the trim-compressed output programme),
+			// matching the timeline hook's placement. A voiceover passes the playhead
+			// captured when RECORDING STARTED — by the time the take ends the live
+			// playhead has run on by the take's own length.
+			timelineStartSec: timelineStartSec ?? get().currentTimeSec,
+			label: asset.label,
+		});
+		// Through the placement door: it anchors the track into one fragment per clip it
+		// covers AND queues it behind whatever already occupies its kind's row, so two
+		// takes recorded from the same playhead no longer land on top of each other
+		// (issue #560).
+		const next = placeAudioTrackInDocument(document, track, () => createId("audio"), "create");
+		if (next === document) return null;
+		if (!(await get().saveDocument(next, { history: true }))) return null;
+		set({ selectedAudioTrackId: track.id });
+		return track.id;
+	},
+
+	async importAudioAsset(path, label) {
+		const asset = await get().addAudioAsset(path, label);
+		if (!asset) return null;
+		// addAudioAsset already committed the asset (with its probed duration), so
+		// the current document is the one to place the track on. If the placement
+		// write fails or is superseded, the import did NOT succeed as a one-shot —
+		// report failure rather than claim success with an asset but no track.
+		const trackId = await get().addAudioTrack(asset.id);
+		if (!trackId) return null;
+		return asset;
+	},
+
 	async removeAsset(assetId) {
 		const { projectId } = get();
 		if (!projectId) throw new Error("No project loaded");
@@ -339,61 +545,66 @@ export const useProjectStore = create<ProjectState>((set, get) => ({
 	},
 
 	async saveDocument(document, opts) {
-		// Read BEFORE the await, while `get().document` is still the pre-edit one.
-		// This is where undo history actually comes from: the editor writes through
-		// `saveDocument` for every user edit -- add a region, delete one, rename the
-		// project, every timeline op -- and `setDocument` is reserved for the handful
-		// of live/optimistic paths. Recording only in `setDocument` left `past` empty
-		// for everything the user does, so Ctrl+Z was a no-op (#433).
-		const base = historyBaseFor(opts, get().document);
-		// Read alongside it, and for the same reason: both describe the world this write
-		// is building on, and the await is where that world can change underneath it.
-		const epoch = currentWriteEpoch();
+		beginDocumentSave();
 		try {
-			const result = await nativeBridgeClient.aiEdition.save(document);
-			if (!result.success || !result.document) {
-				throw new Error(result.error ?? "Failed to save project");
+			// Read BEFORE the await, while `get().document` is still the pre-edit one.
+			// This is where undo history actually comes from: the editor writes through
+			// `saveDocument` for every user edit -- add a region, delete one, rename the
+			// project, every timeline op -- and `setDocument` is reserved for the handful
+			// of live/optimistic paths. Recording only in `setDocument` left `past` empty
+			// for everything the user does, so Ctrl+Z was a no-op (#433).
+			const base = historyBaseFor(opts, get().document);
+			// Read alongside it, and for the same reason: both describe the world this write
+			// is building on, and the await is where that world can change underneath it.
+			const epoch = currentWriteEpoch();
+			try {
+				const result = await nativeBridgeClient.aiEdition.save(document);
+				if (!result.success || !result.document) {
+					throw new Error(result.error ?? "Failed to save project");
+				}
+				// The undo wins, and this write is dropped -- store and history both. It was
+				// in flight when the user pressed Ctrl+Z (or switched projects), so its document
+				// is the one they just asked to leave: installing it reverted the undo on screen,
+				// and recording it put a FORWARD state on `past` and cleared `future`, so the
+				// redo they had just earned was gone.
+				//
+				// Dropped rather than reverted, because reverting is not this write's to do: the
+				// bytes are already on disk, and it is the undo's own persist -- issued from
+				// `useUndoRedoShortcuts`'s `onAfter` the moment it ran, so ordered after this one
+				// on the same IPC channel -- that puts the restored document back over them.
+				// `dirty` is deliberately left set for exactly that reason.
+				if (currentWriteEpoch() !== epoch) return false;
+				const parsed = parseDocument(result.document);
+				set({
+					document: parsed,
+					revision: get().revision + 1,
+					dirty: false,
+					lastSavedAt: new Date(),
+				});
+				// Recorded HERE, below the write, and not above it. `saveDocument` resolves
+				// false on a handled failure (a read-only project) and callers read that as
+				// "the edit did not happen". Recording first left `past` holding a snapshot
+				// identical to the live document and `future` wiped, so the next Ctrl+Z
+				// visibly did nothing and redo was gone -- #433's own symptom, re-created by
+				// the fix for it. Nothing between the `set` above and this line awaits, so no
+				// undo can observe the half-applied state.
+				recordHistory(base, document, opts);
+				return true;
+			} catch (error) {
+				// Logged as well as toasted: a toast is gone in five seconds, and "my edit
+				// disappeared" gets reported much later than that.
+				console.error("[project] failed to save document:", error);
+				toast.error(toastText("editor", "project.failedToSave"), {
+					description: error instanceof Error ? error.message : String(error),
+				});
+				// `dirty` is deliberately left alone. It is the only input to the
+				// `beforeunload` guard and to `setHasUnsavedChanges`, so clearing it here
+				// would let the window close without a prompt on the one path where there is
+				// definitely something unsaved.
+				return false;
 			}
-			// The undo wins, and this write is dropped -- store and history both. It was
-			// in flight when the user pressed Ctrl+Z (or switched projects), so its document
-			// is the one they just asked to leave: installing it reverted the undo on screen,
-			// and recording it put a FORWARD state on `past` and cleared `future`, so the
-			// redo they had just earned was gone.
-			//
-			// Dropped rather than reverted, because reverting is not this write's to do: the
-			// bytes are already on disk, and it is the undo's own persist -- issued from
-			// `useUndoRedoShortcuts`'s `onAfter` the moment it ran, so ordered after this one
-			// on the same IPC channel -- that puts the restored document back over them.
-			// `dirty` is deliberately left set for exactly that reason.
-			if (currentWriteEpoch() !== epoch) return false;
-			const parsed = parseDocument(result.document);
-			set({
-				document: parsed,
-				revision: get().revision + 1,
-				dirty: false,
-				lastSavedAt: new Date(),
-			});
-			// Recorded HERE, below the write, and not above it. `saveDocument` resolves
-			// false on a handled failure (a read-only project) and callers read that as
-			// "the edit did not happen". Recording first left `past` holding a snapshot
-			// identical to the live document and `future` wiped, so the next Ctrl+Z
-			// visibly did nothing and redo was gone -- #433's own symptom, re-created by
-			// the fix for it. Nothing between the `set` above and this line awaits, so no
-			// undo can observe the half-applied state.
-			recordHistory(base, document, opts);
-			return true;
-		} catch (error) {
-			// Logged as well as toasted: a toast is gone in five seconds, and "my edit
-			// disappeared" gets reported much later than that.
-			console.error("[project] failed to save document:", error);
-			toast.error(toastText("editor", "project.failedToSave"), {
-				description: error instanceof Error ? error.message : String(error),
-			});
-			// `dirty` is deliberately left alone. It is the only input to the
-			// `beforeunload` guard and to `setHasUnsavedChanges`, so clearing it here
-			// would let the window close without a prompt on the one path where there is
-			// definitely something unsaved.
-			return false;
+		} finally {
+			endDocumentSave();
 		}
 	},
 
@@ -451,6 +662,7 @@ export const useProjectStore = create<ProjectState>((set, get) => ({
 			error: null,
 			sourceDurationSec: 0,
 			currentTimeSec: 0,
+			selectedAudioTrackId: null,
 			playing: false,
 			dirty: false,
 			lastSavedAt: null,

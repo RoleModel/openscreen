@@ -20,6 +20,8 @@ import type {
 	CompositorParamValue,
 	CompositorViewRect,
 	CompositorViewResult,
+	SegmentationSupport,
+	SegmentationSupportResult,
 } from "./contracts";
 
 /** Which backend the native compositor will use here.
@@ -34,6 +36,23 @@ export async function probeCompositorBackend(): Promise<CompositorBackend> {
 			action: "probeBackend",
 		});
 		return result.backend;
+	} catch {
+		return "none";
+	}
+}
+
+/** Whether this machine can segment the camera. `"none"` outside Electron or without the addon.
+ *
+ *  Fails closed: any error means the control should not be offered. Showing a setting that
+ *  cannot do anything is the failure this exists to prevent, so a broken probe must not be
+ *  read as capability. */
+export async function probeSegmentationSupport(): Promise<SegmentationSupport> {
+	try {
+		const result = await requireNativeBridgeData<SegmentationSupportResult>({
+			domain: "compositor",
+			action: "probeSegmentation",
+		});
+		return result.support;
 	} catch {
 		return "none";
 	}
@@ -154,10 +173,19 @@ export function exportGifNative(
 	outPath?: string,
 	sceneJson?: string,
 	params?: CompositorExportGifParams,
+	exportId?: string,
 ): Promise<CompositorExportGifResult> {
 	return requireNativeBridgeData<CompositorExportGifResult>({
 		domain: "compositor",
 		action: "exportGif",
-		payload: { clips, outPath, sceneJson, params },
+		payload: { clips, outPath, sceneJson, params, exportId },
+	});
+}
+
+export function cancelGifExportNative(exportId: string): Promise<{ accepted: boolean }> {
+	return requireNativeBridgeData<{ accepted: boolean }>({
+		domain: "compositor",
+		action: "cancelGifExport",
+		payload: { exportId },
 	});
 }

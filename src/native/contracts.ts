@@ -1,3 +1,5 @@
+import type { StylePreset, StylePresetAppearance } from "../lib/ai-edition/stylePresets";
+
 export const NATIVE_BRIDGE_CHANNEL = "native-bridge:invoke";
 export const NATIVE_BRIDGE_VERSION = 1;
 
@@ -31,7 +33,10 @@ export interface CursorRecordingSample extends CursorTelemetryPoint {
 	assetId?: string | null;
 	visible?: boolean;
 	cursorType?: NativeCursorType | null;
-	interactionType?: "move" | "click" | "mouseup";
+	/** The full interaction contract the sidecar may carry; matches the renderer's
+	 * CursorTelemetryPoint. The old narrow override ("move" | "click" | "mouseup")
+	 * legitimized coercing every other click kind to "move" at parse time. */
+	interactionType?: "move" | "click" | "double-click" | "right-click" | "middle-click" | "mouseup";
 }
 
 export interface NativeCursorAsset {
@@ -126,6 +131,23 @@ export type CompositorBackend = "hardware" | "cpu" | "none";
 
 export interface CompositorBackendResult {
 	backend: CompositorBackend;
+}
+
+/** Whether this machine can segment the camera, and if not, what is missing.
+ *
+ *  `"ready"` — runtime and model both present.
+ *  `"no-runtime"` — no ONNX Runtime library. Upstream publishes none for Intel Macs, and a dev
+ *  checkout or a `--dir` build has none staged either.
+ *  `"no-model"` — the runtime is there but the `.onnx` does not resolve.
+ *  `"none"` — no usable native addon: none loaded at all (the pure-web/dev case), or one
+ *  too old to answer the probe. Not a degraded machine, and not a verdict on the runtime.
+ *
+ *  Asked rather than guessed. Gating on `process.platform` was wrong in both directions: it hid
+ *  the control on a Linux box that could segment, and showed it on an Intel Mac that never can. */
+export type SegmentationSupport = "ready" | "no-runtime" | "no-model" | "none";
+
+export interface SegmentationSupportResult {
+	support: SegmentationSupport;
 }
 
 /** A self-describing preview frame returned by `readFrame` (native → renderer): pixels
@@ -347,10 +369,27 @@ export interface AiEditionCaptionTranslateResult {
 	error?: string;
 }
 
+// ---- Style presets domain -------------------------------------------------
+// One `<name>.openscreenpreset` file per preset in Documents/OpenScreen Presets. The
+// shape and its validation live in src/lib/ai-edition/stylePresets.ts, shared with main.
+
+export type { StylePreset, StylePresetAppearance };
+
+export interface StylePresetDeleteResult {
+	success: true;
+}
+
+export interface StylePresetRevealResult {
+	success: true;
+}
+
 export type NativeBridgeErrorCode =
+	| "CANCELLED"
 	| "INVALID_REQUEST"
 	| "UNSUPPORTED_ACTION"
 	| "NOT_FOUND"
+	/** A style preset create/rename collided with an existing name (case-insensitive). */
+	| "NAME_TAKEN"
 	| "UNAVAILABLE"
 	| "INTERNAL_ERROR";
 
@@ -516,7 +555,7 @@ export type NativeBridgeRequest =
 	| {
 			domain: "aiEdition";
 			action: "document.addAsset";
-			payload: { projectId: string; path: string; label?: string };
+			payload: { projectId: string; path: string; label?: string; kind?: "video" | "audio" };
 			requestId?: string;
 	  }
 	| {
@@ -677,6 +716,11 @@ export type NativeBridgeRequest =
 	  }
 	| {
 			domain: "compositor";
+			action: "probeSegmentation";
+			requestId?: string;
+	  }
+	| {
+			domain: "compositor";
 			action: "setRect";
 			payload: { id: number; rect: CompositorViewRect };
 			requestId?: string;
@@ -757,11 +801,54 @@ export type NativeBridgeRequest =
 			 *  l'encodeur. La scène porte fond / layout / webcam / curseur, donc
 			 *  il n'y a aucune entrée spécifique au GIF. */
 			payload: {
+				exportId?: string;
 				clips: CompositorClipInput[];
 				outPath?: string;
 				sceneJson?: string;
 				params?: CompositorExportGifParams;
 			};
+			requestId?: string;
+	  }
+	| {
+			domain: "compositor";
+			action: "cancelGifExport";
+			payload: { exportId: string };
+			requestId?: string;
+	  }
+	| {
+			domain: "presets";
+			action: "list";
+			payload?: EmptyPayload;
+			requestId?: string;
+	  }
+	| {
+			domain: "presets";
+			action: "create";
+			payload: { name: string; appearance: StylePresetAppearance };
+			requestId?: string;
+	  }
+	| {
+			domain: "presets";
+			action: "rename";
+			payload: { id: string; name: string };
+			requestId?: string;
+	  }
+	| {
+			domain: "presets";
+			action: "update";
+			payload: { id: string; appearance: StylePresetAppearance };
+			requestId?: string;
+	  }
+	| {
+			domain: "presets";
+			action: "delete";
+			payload: { id: string };
+			requestId?: string;
+	  }
+	| {
+			domain: "presets";
+			action: "reveal";
+			payload: { id: string };
 			requestId?: string;
 	  };
 

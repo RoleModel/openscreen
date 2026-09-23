@@ -2,7 +2,7 @@ import { fixWebmDuration } from "@fix-webm-duration/fix";
 import { useCallback, useEffect, useRef, useState } from "react";
 import { toast } from "sonner";
 import { useScopedT } from "@/contexts/I18nContext";
-import { MIC_GAIN_BOOST, mixAudioTracks } from "@/lib/audioMix";
+import { mixAudioTracks, nativeMicrophoneGain } from "@/lib/audioMix";
 import {
 	type NativeLinuxRecordingRequest,
 	portalOwnsSourceSelection,
@@ -48,6 +48,31 @@ const RECORDING_FILE_PREFIX = "recording-";
 const VIDEO_FILE_EXTENSION = ".webm";
 const WEBCAM_FILE_SUFFIX = "-webcam";
 
+/**
+ * The cursor mode a BROWSER-pipeline take can actually honour, which is not always the
+ * one the user picked.
+ *
+ * Only win32 reaches that pipeline through `getDisplayMedia`, the sole browser API here
+ * that can exclude the system cursor (`cursor: "never"`). Everywhere else the
+ * desktop-capture stream bakes the real cursor into the pixels, so keeping
+ * "editable-overlay" would start cursor telemetry and have the editor composite a
+ * SECOND, synthetic cursor on top of it.
+ *
+ * This only bites when a platform falls back to browser capture with the editable cursor
+ * selected — on macOS 12 that is now the normal path (#515), and on Linux it is the
+ * no-PipeWire path, where the same latent defect lives.
+ *
+ * One function rather than the expression inlined twice: the mode reported to the main
+ * process at start and the mode persisted at finalize have to agree, and they are ~1200
+ * lines apart.
+ */
+function effectiveBrowserCursorMode(
+	platform: string,
+	requested: CursorCaptureMode,
+): CursorCaptureMode {
+	return platform === "win32" ? requested : "system";
+}
+
 const AUDIO_BITRATE_VOICE = 128_000;
 const AUDIO_BITRATE_SYSTEM = 192_000;
 
@@ -83,6 +108,7 @@ type UseScreenRecorderReturn = {
 	setCursorCaptureMode: (mode: CursorCaptureMode) => void;
 	softwareEncoderFallbackNoticeVisible: boolean;
 	dismissSoftwareEncoderFallbackNotice: (dontShowAgain?: boolean) => void;
+	recordingPrefsLoaded: boolean;
 };
 
 type NativeWindowsRecordingHandle = {
@@ -133,6 +159,17 @@ type NativeLinuxRecordingHandle = {
  * video in the camera's place. Rounding loses nothing: one frame at 60 fps is
  * 16.7 ms.
  */
+export function isRecoverableWebcamConstraintError(
+	error: unknown,
+	savedDeviceName?: string,
+): boolean {
+	if (!savedDeviceName) return false;
+	return (
+		error instanceof DOMException &&
+		["OverconstrainedError", "NotFoundError", "DevicesNotFoundError"].includes(error.name)
+	);
+}
+
 export function webcamOffsetMsFrom(
 	webcamRecorder: RecorderHandle | null,
 	webcamStartedAtMs: number | null,
@@ -219,38 +256,67 @@ export function useScreenRecorder(): UseScreenRecorderReturn {
 	const [cursorCaptureMode, setCursorCaptureMode] = useState<CursorCaptureMode>("editable-overlay");
 	const [softwareEncoderFallbackNoticeVisible, setSoftwareEncoderFallbackNoticeVisible] =
 		useState(false);
+	const [recordingPrefsLoaded, setRecordingPrefsLoaded] = useState(false);
 
 	// Seed from the main-process recording-prefs SSOT on mount, so choices
 	// made in the editor's Rec-mode stage (a different renderer window) carry
 	// over instead of this hook silently reverting to its own hardcoded
 	// defaults every time startNewRecording() switches to the HUD window.
+	// Later saves from any window arrive on the same channel; applying every field
+	// (including null devices) keeps a live HUD in step with them.
 	useEffect(() => {
 		let cancelled = false;
+		let receivedNewerSnapshot = false;
+		const applyPrefs = (prefs: {
+			micEnabled: boolean;
+			micDeviceId?: string | null;
+			micDeviceName?: string | null;
+			camEnabled: boolean;
+			camDeviceId?: string | null;
+			camDeviceName?: string | null;
+			systemAudioEnabled: boolean;
+			cursorCaptureMode: CursorCaptureMode;
+		}) => {
+			if (cancelled) return;
+			setMicrophoneEnabled(prefs.micEnabled);
+			setMicrophoneDeviceId(prefs.micDeviceId ?? undefined);
+			setMicrophoneDeviceName(prefs.micDeviceName ?? undefined);
+			const isCliRecord =
+				typeof window !== "undefined" &&
+				new URLSearchParams(window.location.search).get("windowType") === "cli-record";
+			if (!isCliRecord) {
+				setWebcamEnabledState(prefs.camEnabled);
+				setWebcamDeviceId(prefs.camDeviceId ?? undefined);
+				setWebcamDeviceName(prefs.camDeviceName ?? undefined);
+			}
+			setSystemAudioEnabled(prefs.systemAudioEnabled);
+			setCursorCaptureMode(prefs.cursorCaptureMode);
+			setRecordingPrefsLoaded(true);
+		};
+		const stop = window.electronAPI?.onRecordingPrefsChanged?.((prefs) => {
+			receivedNewerSnapshot = true;
+			applyPrefs(prefs);
+		});
 		void window.electronAPI
 			?.getRecordingPrefs?.()
 			.then((prefs) => {
-				if (cancelled || !prefs) return;
-				setMicrophoneEnabled(prefs.micEnabled);
-				if (prefs.micDeviceId) setMicrophoneDeviceId(prefs.micDeviceId);
-				// The name matters as much as the id: the native Windows helper picks
-				// the microphone by NAME, and falls back to the Windows default
-				// endpoint when it is empty. Seeding only the id left an auto-started
-				// recording racing this window's own device enumeration for it, and
-				// losing (getopenscreen/openscreen#404).
-				if (prefs.micDeviceName) setMicrophoneDeviceName(prefs.micDeviceName);
-				setWebcamEnabledState(prefs.camEnabled);
-				if (prefs.camDeviceId) setWebcamDeviceId(prefs.camDeviceId);
-				setSystemAudioEnabled(prefs.systemAudioEnabled);
-				setCursorCaptureMode(prefs.cursorCaptureMode);
+				if (cancelled || receivedNewerSnapshot) return;
+				if (!prefs) {
+					setRecordingPrefsLoaded(true);
+					return;
+				}
+				applyPrefs(prefs);
 			})
 			.catch((err) => {
 				// Bare ipcRenderer.invoke — rejects if the main handler throws. Falling
 				// back to this hook's own defaults is acceptable; an unhandled rejection
 				// on every HUD mount is not.
 				console.warn("Failed to seed the recording prefs:", err);
+				if (!cancelled && !receivedNewerSnapshot) setRecordingPrefsLoaded(true);
 			});
 		return () => {
 			cancelled = true;
+			stop?.();
 		};
 	}, []);
 
@@ -435,6 +501,10 @@ export function useScreenRecorder(): UseScreenRecorderReturn {
 				webcamStream.current = stream;
 				webcamReady.current = true;
 			} catch (cameraError) {
+				if (isRecoverableWebcamConstraintError(cameraError, webcamDeviceName)) {
+					console.warn("Waiting to resolve the restored camera identity:", cameraError);
+					return;
+				}
 				if (!cancelled) {
 					console.warn("Failed to get webcam access:", cameraError);
 					setWebcamEnabledState(false);
@@ -465,7 +535,7 @@ export function useScreenRecorder(): UseScreenRecorderReturn {
 				webcamStream.current = null;
 			}
 		};
-	}, [webcamEnabled, webcamDeviceId, t]);
+	}, [webcamEnabled, webcamDeviceId, webcamDeviceName, t]);
 
 	const finalizeRecording = useCallback(
 		(
@@ -550,7 +620,16 @@ export function useScreenRecorder(): UseScreenRecorderReturn {
 								? { videoData: webcamVideoData, fileName: webcamFileName }
 								: undefined,
 						createdAt: activeRecordingId,
-						cursorCaptureMode,
+						// What this take actually did, not what was requested. Only the browser
+						// pipeline reaches this finalizer (stopRecording returns earlier for all
+						// three native paths), and off win32 it cannot exclude the system cursor
+						// — so the mode reported to the main process was forced to "system" and
+						// the stored metadata has to agree. It is user-visible: `openscreen
+						// project show` prints it.
+						cursorCaptureMode: effectiveBrowserCursorMode(
+							window.electronAPI.getPlatform(),
+							cursorCaptureMode,
+						),
 						durationMs: duration,
 					});
 
@@ -1143,7 +1222,8 @@ export function useScreenRecorder(): UseScreenRecorderReturn {
 						enabled: microphoneEnabled,
 						deviceId: microphoneDeviceId,
 						deviceName: microphoneDeviceName,
-						gain: MIC_GAIN_BOOST,
+						// Boosted only when the mic has to sit over system audio.
+						gain: nativeMicrophoneGain(systemAudioEnabled),
 					},
 				},
 				webcam: {
@@ -1304,7 +1384,8 @@ export function useScreenRecorder(): UseScreenRecorderReturn {
 						enabled: microphoneEnabled,
 						deviceId: microphoneDeviceId,
 						deviceName: microphoneDeviceName,
-						gain: MIC_GAIN_BOOST,
+						// Boosted only over system audio, like the Windows request above.
+						gain: nativeMicrophoneGain(systemAudioEnabled),
 					},
 				},
 				webcam: {
@@ -1330,6 +1411,9 @@ export function useScreenRecorder(): UseScreenRecorderReturn {
 			if (!isCountdownRunActive(countdownRunToken)) {
 				await window.electronAPI.stopNativeMacRecording(true);
 				return true;
+			}
+			if (result.microphoneDefaulted) {
+				toast.error(t("recording.microphoneDefaulted"));
 			}
 
 			// The IPC call above only resolves once the helper's stdout confirms its
@@ -1404,7 +1488,8 @@ export function useScreenRecorder(): UseScreenRecorderReturn {
 				// microphone get the empty headphone jack recorded, because the
 				// helper then fell back to the session default source.
 				...(microphoneDeviceName ? { deviceName: microphoneDeviceName } : {}),
-				gain: MIC_GAIN_BOOST,
+				// Boosted only over system audio, like the Windows request above.
+				gain: nativeMicrophoneGain(systemAudioEnabled),
 			},
 		},
 		cursor: { mode: cursorCaptureMode },
@@ -1546,12 +1631,25 @@ export function useScreenRecorder(): UseScreenRecorderReturn {
 		try {
 			const platform = window.electronAPI.getPlatform();
 			if (platform === "darwin" && cursorCaptureMode === "editable-overlay") {
-				// The main process shows a native dialog that deep-links to the
-				// Accessibility settings pane when access is missing, so we just stop
-				// here and let the user grant it and press record again.
+				// Stop before the countdown ONLY when the user genuinely denied
+				// Accessibility — the main process is showing them a dialog that
+				// deep-links to the settings pane, so pressing record again after
+				// granting it will work.
+				//
+				// When the helper simply could not run (missing from the build, killed
+				// by the loader, crashed, hung) there is nothing for the user to grant,
+				// and blocking here is what left macOS 12 unable to record at all
+				// (#515). Recording degrades on its own: the session falls back to
+				// position-only cursor telemetry and the editor draws the cursor from
+				// its bundled sprites, so only the pointer/text shape hints are lost.
 				const access = await window.electronAPI.requestNativeMacCursorAccess();
-				if (!access.granted) {
+				if (!access.granted && access.status === "not-determined") {
 					return;
+				}
+				if (!access.granted) {
+					console.warn(
+						`Editable cursor unavailable (${access.status}); recording with position-only cursor telemetry.`,
+					);
 				}
 			}
 		} catch (error) {
@@ -1654,6 +1752,9 @@ export function useScreenRecorder(): UseScreenRecorderReturn {
 		countdownRunToken?: number,
 		preparedRecordingId?: number | null,
 	) => {
+		const platform = window.electronAPI.getPlatform();
+		const browserCursorCaptureMode = effectiveBrowserCursorMode(platform, cursorCaptureMode);
+
 		try {
 			if (!isCountdownRunActive(countdownRunToken)) {
 				teardownMedia();
@@ -1688,8 +1789,6 @@ export function useScreenRecorder(): UseScreenRecorderReturn {
 			// `getUserMedia` calls is the dominant source of the mic-vs-video lag at the
 			// start of the recording (issue #57).
 			const screenCapture = (async (): Promise<MediaStream> => {
-				const platform = window.electronAPI.getPlatform();
-
 				if (platform === "win32") {
 					// getDisplayMedia + setDisplayMediaRequestHandler (main.ts) supplies the
 					// pre-selected source. Editable cursor mode excludes the system cursor so
@@ -1920,7 +2019,7 @@ export function useScreenRecorder(): UseScreenRecorderReturn {
 			setRecording(true);
 			setPaused(false);
 			setElapsedSeconds(0);
-			window.electronAPI?.setRecordingState(true, recordingId.current, cursorCaptureMode);
+			window.electronAPI?.setRecordingState(true, recordingId.current, browserCursorCaptureMode);
 
 			const activeScreenRecorder = screenRecorder.current;
 			const activeWebcamRecorder = webcamRecorder.current;
@@ -2301,5 +2400,6 @@ export function useScreenRecorder(): UseScreenRecorderReturn {
 		setCursorCaptureMode,
 		softwareEncoderFallbackNoticeVisible,
 		dismissSoftwareEncoderFallbackNotice,
+		recordingPrefsLoaded,
 	};
 }

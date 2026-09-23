@@ -11,7 +11,7 @@ import type { ReactElement } from "react";
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
 import { I18nProvider } from "@/contexts/I18nContext";
 import { LOCALE_STORAGE_KEY } from "@/i18n/config";
-import { CursorPane, LayoutPane, VideoEffectsPane } from "./RightPanes";
+import { CursorPane, LayoutPane, TranscriptPane, VideoEffectsPane } from "./RightPanes";
 
 function renderIn(locale: string, ui: ReactElement) {
 	localStorage.setItem(LOCALE_STORAGE_KEY, locale);
@@ -70,11 +70,75 @@ describe("right-rail panes are localized", () => {
 		expect(screen.getByRole("heading", { name: "Curseur" })).toBeInTheDocument();
 		expect(screen.getByText("Lissage")).toBeInTheDocument();
 		expect(screen.getByText("Rebond au clic")).toBeInTheDocument();
+		expect(screen.getByText("Masquer si inactif")).toBeInTheDocument();
+		expect(screen.getByText("Curseur 3D")).toBeInTheDocument();
+	});
+
+	it("renders the cursor pane in German", () => {
+		renderIn("de", <CursorPane />);
+		expect(screen.getByRole("heading", { name: "Cursor" })).toBeInTheDocument();
+		expect(screen.getByText("Glättung")).toBeInTheDocument();
+		expect(screen.getByText("Klick-Federung")).toBeInTheDocument();
+		expect(screen.getByText("Bei Inaktivität ausblenden")).toBeInTheDocument();
 	});
 
 	it("falls back to English when the locale is English", () => {
 		renderIn("en", <VideoEffectsPane />);
 		expect(screen.getByRole("heading", { name: "Composition" })).toBeInTheDocument();
 		expect(screen.getByText("Blur BG")).toBeInTheDocument();
+	});
+
+	it("renders the transcript pane title as 'Transcription' in French", () => {
+		const noop = () => {
+			/* noop */
+		};
+		renderIn(
+			"fr",
+			<TranscriptPane
+				clips={[]}
+				audioTracks={[]}
+				transcripts={[]}
+				assets={[]}
+				trimRanges={[]}
+				busyAssetIds={[]}
+				onSeek={noop}
+				onTrimTimelineSpan={noop}
+				onRemoveTrimRanges={noop}
+				onSetWordText={noop}
+				onInsertWord={noop}
+				onRemoveWords={noop}
+				onTranscribe={noop}
+				canTranscribe={false}
+				isTranscribing={false}
+			/>,
+		);
+		expect(screen.getByRole("heading", { name: "Transcription" })).toBeInTheDocument();
+	});
+
+	it("renders the transcript pane title as 'Transcript' in English", () => {
+		const noop = () => {
+			/* noop */
+		};
+		renderIn(
+			"en",
+			<TranscriptPane
+				clips={[]}
+				audioTracks={[]}
+				transcripts={[]}
+				assets={[]}
+				trimRanges={[]}
+				busyAssetIds={[]}
+				onSeek={noop}
+				onTrimTimelineSpan={noop}
+				onRemoveTrimRanges={noop}
+				onSetWordText={noop}
+				onInsertWord={noop}
+				onRemoveWords={noop}
+				onTranscribe={noop}
+				canTranscribe={false}
+				isTranscribing={false}
+			/>,
+		);
+		expect(screen.getByRole("heading", { name: "Transcript" })).toBeInTheDocument();
 	});
 });

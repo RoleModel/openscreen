@@ -12,6 +12,7 @@ use napi_derive::napi;
 use openscreen_compositor::compositor::{live_params_from_scene, Compositor};
 use openscreen_compositor::d3d::{Backend, Gpu};
 use openscreen_compositor::gif_export::{GifExportParams, GifStats};
+use openscreen_compositor::gif_export_control::{GifExportCancelled, GifExportControl};
 use openscreen_compositor::live::{LiveView, PausedPreviews};
 use openscreen_compositor::scene::Scene;
 use openscreen_compositor::{config, pipeline};
@@ -68,6 +69,22 @@ pub fn probe_backend() -> String {
         None => "none",
     }
     .to_string()
+}
+
+/// Si cette machine peut produire un masque de segmentation, c'est-à-dire si la bibliothèque
+/// ONNX Runtime est là où l'app l'a posée.
+///
+/// Sert à NE PAS MENTIR : le contrôle « fond de caméra » est le seul de l'éditeur dont l'effet
+/// dépend d'un binaire optionnel. Sans lui, `Segmenter::load` refuse, le compositeur dessine la
+/// webcam telle quelle, et l'utilisateur clique sur un réglage qui ne fait rien — exactement ce
+/// qu'un contrôle ne doit jamais faire.
+///
+/// Une question posée au système plutôt que devinée depuis la plateforme : `darwin` ne suffit
+/// pas à répondre, puisque l'amont ne publie aucun binaire ONNX pour les Macs Intel, et une
+/// build de dev ou un `--dir` n'en ont pas davantage. Seul l'état réel de la machine le sait.
+#[napi]
+pub fn segmentation_runtime_available() -> bool {
+    openscreen_compositor::segmentation::runtime_available()
 }
 
 #[napi]
@@ -350,9 +367,73 @@ pub struct ClipInput {
     pub has_audio: bool,
 }
 
+/// The export's pixel size. The SHAPE belongs to the scene: `scene.output` is what the live
+/// preview is sized from (`live.rs::preview_render_size`), so it is the only geometry an export
+/// may have. Absent width/height take `scene.output`; a size of another shape is refused, because
+/// the compositor would otherwise lay the preview's frame out on a different canvas and the file
+/// would silently disagree with what the user saw (a 9:16 project exported 16:9). Only without a
+/// scene does `default` apply. Both axes are snapped to even pixels (NV12 4:2:0).
+fn resolve_output_size(
+    scene: Option<&Scene>,
+    width: Option<u32>,
+    height: Option<u32>,
+    default: (u32, u32),
+) -> Result<(u32, u32)> {
+    let even = |v: u32| v.max(2) & !1;
+    let Some(scene) = scene else {
+        return Ok((
+            even(width.unwrap_or(default.0)),
+            even(height.unwrap_or(default.1)),
+        ));
+    };
+    let (ow, oh) = (
+        scene.output.width.max(1) as u64,
+        scene.output.height.max(1) as u64,
+    );
+    let (Some(w), Some(h)) = (width, height) else {
+        return Ok((even(ow as u32), even(oh as u32)));
+    };
+    let (w, h) = (even(w), even(h));
+    // 3% absorbs even-pixel snapping on small GIF sizes; a real shape change is far beyond it.
+    if (w as u64 * oh).abs_diff(h as u64 * ow) * 100 > 3 * h as u64 * ow {
+        return Err(Error::from_reason(format!(
+            "export size {w}x{h} does not match the scene's output frame {ow}x{oh}"
+        )));
+    }
+    Ok((w, h))
+}
+
+#[cfg(test)]
+mod output_size_tests {
+    use super::*;
+
+    fn portrait_scene() -> Scene {
+        Scene::from_json(r##"{"clips":[],"layout":{"preset":"no-webcam","webcamSize":1,"webcamShape":"rectangle","webcamMirror":false,"webcamPosition":null,"webcamReactiveZoom":false},"effects":{"padding":0,"blur":false,"shadow":0,"roundnessFrac":0,"motionBlur":0},"background":{"kind":"color","color":"#000000"},"zoomRegions":[],"cursor":{"show":false,"size":1,"smoothing":0,"motionBlur":0,"clickBounce":0,"clipToBounds":false,"theme":"default"},"cropByClip":[],"output":{"width":1080,"height":1920,"fps":null}}"##).expect("parse")
+    }
+
+    #[test]
+    fn export_size_follows_the_scene_shape() {
+        let scene = portrait_scene();
+        // No size sent: the scene's frame, never the 1920x1080 default (the 9:16 → 16:9 bug).
+        assert_eq!(
+            resolve_output_size(Some(&scene), None, None, (1920, 1080)).unwrap(),
+            (1080, 1920)
+        );
+        // Same shape at another resolution (quality tier, GIF cap) is accepted.
+        assert_eq!(
+            resolve_output_size(Some(&scene), Some(720), Some(1280), (1920, 1080)).unwrap(),
+            (720, 1280)
+        );
+        assert!(resolve_output_size(Some(&scene), Some(270), Some(480), (1920, 1080)).is_ok());
+        // Another shape would stretch the preview's layout: refused.
+        assert!(resolve_output_size(Some(&scene), Some(1920), Some(1080), (1920, 1080)).is_err());
+        // Without a scene the default still applies.
+        assert_eq!(resolve_output_size(None, None, None, (854, 480)).unwrap(), (854, 480));
+    }
+}
+
 /// Taille/cadence/codec de sortie voulus par l'app (modale d'export). Tous optionnels :
-/// absent → comportement historique (1920x1080, fps du 1er clip, h264). `width`/`height`
-/// sont arrondis au pair le plus proche (exigence NV12 4:2:0) côté `export_multi`.
+/// taille absente → `scene.output` (cf. `resolve_output_size`), fps du 1er clip, h264.
 #[napi(object)]
 pub struct ExportParamsInput {
     pub width: Option<u32>,
@@ -405,13 +486,15 @@ impl Task for ExportMultiTask {
         }
 
         let mut export_params = pipeline::ExportParams::default();
+        let (width, height) = resolve_output_size(
+            scene.as_ref(),
+            self.params.as_ref().and_then(|p| p.width),
+            self.params.as_ref().and_then(|p| p.height),
+            (export_params.width, export_params.height),
+        )?;
+        export_params.width = width;
+        export_params.height = height;
         if let Some(p) = &self.params {
-            if let Some(w) = p.width {
-                export_params.width = w.max(2) & !1; // pair le plus proche (>=2, NV12)
-            }
-            if let Some(h) = p.height {
-                export_params.height = h.max(2) & !1;
-            }
             export_params.fps = p.fps;
             if let Some(codec) = &p.codec {
                 export_params.codec = match codec.as_str() {
@@ -528,6 +611,24 @@ pub struct GifParamsInput {
 /// `Option<&str>`, et `None` désactive le rendu du curseur côté
 /// `Compositor` (équivalent de `cfg.cursor = false` dans
 /// `run_composited_multi`).
+#[napi]
+pub fn create_gif_export_control() -> External<GifExportControl> {
+    External::new(GifExportControl::default())
+}
+
+#[napi]
+pub fn cancel_gif_export(control: External<GifExportControl>) -> bool {
+    control.cancel()
+}
+
+fn gif_task_error(error: anyhow::Error) -> Error {
+    if error.is::<GifExportCancelled>() {
+        Error::from_reason("GIF_EXPORT_CANCELLED")
+    } else {
+        Error::from_reason(format!("{error:#}"))
+    }
+}
+
 pub struct ExportGifTask {
     /// Same clip list the MP4 export takes — GIF is now a multiclip export
     /// driven by the same walk, not a single-file special case.
@@ -538,6 +639,7 @@ pub struct ExportGifTask {
     scene_json: Option<String>,
     out_path: PathBuf,
     params: GifExportParams,
+    control: GifExportControl,
     on_progress: Option<ThreadsafeFunction<u32, ErrorStrategy::Fatal>>,
 }
 
@@ -546,6 +648,7 @@ impl Task for ExportGifTask {
     type JsValue = GifExportStats;
 
     fn compute(&mut self) -> Result<Self::Output> {
+        self.control.check().map_err(gif_task_error)?;
         // Mêmes garanties que `ExportMultiTask` : previews paused for the
         // whole render et restored exactement comme trouvées, y compris
         // sur les chemins d'erreur. L'export GPU+CPU ne partage pas le
@@ -560,6 +663,7 @@ impl Task for ExportGifTask {
         // host without a usable GPU could export an MP4 but not a GIF — the one path
         // where the CPU backend exists specifically so the export still completes.
         let gpu = Gpu::create_auto(false).map_err(|e| Error::from_reason(format!("{e:#}")))?;
+        self.control.check().map_err(gif_task_error)?;
         let mut cfg = config::all().pop().expect("au moins une config"); // C8
         cfg.zoom = false;
         cfg.layout_anim = false;
@@ -573,14 +677,18 @@ impl Task for ExportGifTask {
             cfg.cursor = false;
         }
 
-        let width = self
-            .params
-            .width
-            .unwrap_or(openscreen_compositor::gif_export::DEFAULT_GIF_WIDTH);
-        let height = self
-            .params
-            .height
-            .unwrap_or(openscreen_compositor::gif_export::DEFAULT_GIF_HEIGHT);
+        let (width, height) = resolve_output_size(
+            scene.as_ref(),
+            self.params.width,
+            self.params.height,
+            (
+                openscreen_compositor::gif_export::DEFAULT_GIF_WIDTH,
+                openscreen_compositor::gif_export::DEFAULT_GIF_HEIGHT,
+            ),
+        )?;
+        // `export_gif` reads its size back from the params; keep them the resolved one.
+        self.params.width = Some(width);
+        self.params.height = Some(height);
         let comp = Compositor::new_sized(&gpu, width, height)
             .map_err(|e| Error::from_reason(format!("{e:#}")))?;
         if let Some(scene) = &scene {
@@ -589,7 +697,7 @@ impl Task for ExportGifTask {
         comp.set_scene(scene);
 
         let mut progress = throttled_progress(self.on_progress.take());
-        openscreen_compositor::gif_export::export_gif(
+        openscreen_compositor::gif_export::export_gif_cancellable(
             &self.clips,
             &self.out_path,
             &gpu,
@@ -597,8 +705,9 @@ impl Task for ExportGifTask {
             &cfg,
             &self.params,
             &mut progress,
+            &self.control,
         )
-        .map_err(|e| Error::from_reason(format!("{e:#}")))
+        .map_err(gif_task_error)
     }
 
     fn resolve(&mut self, _env: Env, out: Self::Output) -> Result<Self::JsValue> {
@@ -628,6 +737,7 @@ pub fn export_gif(
     scene_json: Option<String>,
     params: Option<GifParamsInput>,
     on_progress: Option<JsFunction>,
+    control: Option<External<GifExportControl>>,
 ) -> Result<AsyncTask<ExportGifTask>> {
     // Deliberately the same argument shape as `export_multi`: the caller builds
     // one clip list and one scene, and picks the container. Cursor comes from
@@ -657,6 +767,7 @@ pub fn export_gif(
         scene_json,
         out_path: PathBuf::from(out_path),
         params: gif_params,
+        control: control.map(|c| (*c).clone()).unwrap_or_default(),
         on_progress: make_progress_tsfn(on_progress)?,
     }))
 }

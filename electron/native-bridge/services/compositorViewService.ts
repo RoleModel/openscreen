@@ -4,6 +4,7 @@ import path from "node:path";
 import { fileURLToPath } from "node:url";
 import { app } from "electron";
 import { resolveCursorSprites } from "../../../src/lib/cursor/cursorThemes";
+import type { GifExportJob } from "../../ipc/gifExportJobs";
 import type {
 	ClipInput,
 	CompositorBackend,
@@ -16,6 +17,7 @@ import type {
 	GifParamsInput,
 	NativeFramePacket,
 	RemuxStats,
+	SegmentationSupport,
 } from "../../native/compositor-view/addon";
 
 /**
@@ -114,6 +116,11 @@ function resolveCursorSpritePaths(
 	return resolved;
 }
 
+/** Where the segmentation model sits under `public/`, and therefore under `dist/` once Vite
+ *  has copied it. Resolved here rather than in the renderer: the compositor runs in this
+ *  process, and the renderer has no business knowing the on-disk layout. */
+const SEGMENTATION_MODEL_ASSET = "mediapipe/selfie_segmentation/selfie_segmentation_landscape.onnx";
+
 export function resolveSceneAssetPaths(sceneJson: string): string {
 	try {
 		const scene = JSON.parse(sceneJson) as {
@@ -122,20 +129,49 @@ export function resolveSceneAssetPaths(sceneJson: string): string {
 				theme?: string;
 				cursorSprites?: Record<string, { path: string; hotspotX: number; hotspotY: number }>;
 			};
+			webcamEffect?: {
+				mode?: string;
+				modelPath?: string;
+				background?: { kind?: string; path?: string };
+			};
 		};
 		let changed = false;
-		const bg = scene.background;
-		if (bg?.kind === "image" && typeof bg.path === "string" && bg.path.startsWith("/")) {
-			// strip the leading slash so path.join keeps it under the base dir
-			const resolved = resolveSceneAssetPath(bg.path.replace(/^\/+/, ""));
-			if (resolved) {
-				bg.path = resolved;
-				changed = true;
+		// Both backgrounds go through this: the screen's, and the camera's under the "custom"
+		// mode. The camera one was missed, and the failure is silent — the compositor gets
+		// "/wallpapers/wallpaper1.jpg", `image::open` cannot find it, and the PiP falls back to
+		// a flat colour with only a line on stderr to say so.
+		const resolveBackgroundImage = (target?: { kind?: string; path?: string }): boolean => {
+			if (
+				target?.kind !== "image" ||
+				typeof target.path !== "string" ||
+				!target.path.startsWith("/")
+			) {
+				return false;
 			}
-		}
+			// strip the leading slash so path.join keeps it under the base dir
+			const resolved = resolveSceneAssetPath(target.path.replace(/^\/+/, ""));
+			if (!resolved) {
+				return false;
+			}
+			target.path = resolved;
+			return true;
+		};
+		changed = resolveBackgroundImage(scene.background) || changed;
+		changed = resolveBackgroundImage(scene.webcamEffect?.background) || changed;
 		if (scene.cursor && typeof scene.cursor.theme === "string") {
 			scene.cursor.cursorSprites = resolveCursorSpritePaths(scene.cursor.theme);
 			changed = true;
+		}
+		// The scene asks for an effect; this process says where the model is. A model that
+		// does not resolve leaves `modelPath` unset, which turns the effect off in the
+		// compositor rather than failing the scene — same contract as a missing cursor sprite.
+		const effect = scene.webcamEffect;
+		if (effect && typeof effect.mode === "string" && effect.mode !== "none") {
+			const resolved = resolveSceneAssetPath(SEGMENTATION_MODEL_ASSET);
+			if (resolved) {
+				effect.modelPath = resolved;
+				changed = true;
+			}
 		}
 		return changed ? JSON.stringify(scene) : sceneJson;
 	} catch {
@@ -144,6 +180,8 @@ export function resolveSceneAssetPaths(sceneJson: string): string {
 }
 
 export interface CompositorViewServiceOptions {
+	/** Explicit in-process addon, used by tests of native job lifecycle. */
+	addon?: CompositorViewAddon;
 	/**
 	 * Optional explicit override for the addon path. Has precedence over the
 	 * `OPENSCREEN_COMPOSITOR_VIEW_NODE` env var and the candidate path list.
@@ -335,6 +373,37 @@ function ensureFfmpegSharedDllsOnPath(appRoot: string): void {
 	process.env.PATH = `${dir}${path.delimiter}${current}`;
 }
 
+/** The ONNX Runtime shared library's file name for this platform. */
+function ortLibName(): string {
+	if (process.platform === "win32") return "onnxruntime.dll";
+	if (process.platform === "darwin") return "libonnxruntime.dylib";
+	return "libonnxruntime.so";
+}
+
+/**
+ * Points `ORT_DYLIB_PATH` at the staged ONNX Runtime, which the addon loads dynamically for
+ * the webcam segmentation mask.
+ *
+ * It lives in the same arch-tagged `electron/native/bin/<tag>/` directory the addon itself
+ * ships from, next to the ffmpeg DLLs — the convention `whisper-stt` already established for
+ * native sidecars. The crate links `ort` with `load-dynamic`, so the library is resolved at
+ * runtime rather than at build time: absent, `Segmenter::load` fails, the compositor logs one
+ * line and draws the webcam unsegmented. That is why this is best-effort and never throws.
+ */
+function ensureOnnxRuntimeOnPath(appRoot: string): void {
+	if (process.env.ORT_DYLIB_PATH) {
+		return;
+	}
+	const lib = ortLibName();
+	for (const dir of ffmpegSharedBinCandidates(appRoot)) {
+		const candidate = path.join(dir, lib);
+		if (fs.existsSync(candidate)) {
+			process.env.ORT_DYLIB_PATH = candidate;
+			return;
+		}
+	}
+}
+
 function tryLoadAddon(candidates: string[]): CompositorViewAddon | null {
 	for (const candidate of candidates) {
 		try {
@@ -371,6 +440,7 @@ export class CompositorViewService {
 	}
 
 	private ensureAddon(): CompositorViewAddon | null {
+		if (this.options.addon) return this.options.addon;
 		if (this.loadAttempted) {
 			return this.addon;
 		}
@@ -382,6 +452,7 @@ export class CompositorViewService {
 		const isPackaged = this.options.isPackaged ?? defaultIsPackaged();
 
 		ensureFfmpegSharedDllsOnPath(appRoot);
+		ensureOnnxRuntimeOnPath(appRoot);
 		const candidates = buildCandidatePaths(appRoot, isPackaged, envOverride);
 		const loaded = tryLoadAddon(candidates);
 		if (!loaded) {
@@ -417,6 +488,36 @@ export class CompositorViewService {
 			console.warn("[compositor-view] probeBackend unavailable:", err);
 			return "none";
 		}
+	}
+
+	/** Whether this machine can actually segment the camera, and if not, what is missing.
+	 *
+	 *  Three things have to line up, and each of them has been silently absent at some point:
+	 *  the addon, the ONNX Runtime library, and the model. The renderer used to guess from
+	 *  `process.platform`, which was wrong in both directions — it hid the control on Linux
+	 *  builds that could segment, and shows it on Intel Macs, for which upstream publishes no
+	 *  ONNX binary at all. A dev checkout and a `--dir` build have none staged either.
+	 *
+	 *  Same shape as `probeBackend`: asked without allocating a view, because the panel needs
+	 *  the answer before any preview exists. */
+	probeSegmentation(): SegmentationSupport {
+		const addon = this.ensureAddon();
+		if (!addon) {
+			return "none";
+		}
+		try {
+			if (!addon.segmentationRuntimeAvailable()) {
+				return "no-runtime";
+			}
+		} catch (err) {
+			// An older `.node` predates this probe. Treat as unsupported rather than crashing
+			// the bridge — same contract as `probeBackend`.
+			console.warn("[compositor-view] segmentationRuntimeAvailable unavailable:", err);
+			return "none";
+		}
+		// The model is resolved by this process, not the addon, so it is checked here — and it
+		// is the same lookup `resolveSceneAssetPaths` performs, so the two cannot disagree.
+		return resolveSceneAssetPath(SEGMENTATION_MODEL_ASSET) ? "ready" : "no-model";
 	}
 
 	/** Allocates an offscreen compositor view sized to `rect.width`x`rect.height`.
@@ -562,6 +663,7 @@ export class CompositorViewService {
 		sceneJson?: string,
 		params?: GifParamsInput,
 		onProgress?: (frames: number) => void,
+		control?: object,
 	): Promise<GifExportStats | null> {
 		const addon = this.ensureAddon();
 		if (!addon) {
@@ -574,7 +676,29 @@ export class CompositorViewService {
 			sceneJson ? resolveSceneAssetPaths(sceneJson) : undefined,
 			params,
 			onProgress,
+			control,
 		);
+	}
+
+	startGifExport(
+		clips: ClipInput[],
+		outPath?: string,
+		sceneJson?: string,
+		params?: GifParamsInput,
+		onProgress?: (frames: number) => void,
+	): GifExportJob<GifExportStats | null> {
+		const addon = this.ensureAddon();
+		if (!addon?.createGifExportControl || !addon.cancelGifExport) {
+			throw new Error(
+				"Native GIF cancellation is unavailable. Rebuild or update the compositor addon.",
+			);
+		}
+		const control = addon.createGifExportControl();
+		const cancel = addon.cancelGifExport.bind(addon);
+		return {
+			result: this.exportGif(clips, outPath, sceneJson, params, onProgress, control),
+			cancel: () => cancel(control),
+		};
 	}
 
 	/** Stream-copy `inputPath` to `outputPath` through libavformat's matroska muxer.

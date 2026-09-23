@@ -15,7 +15,13 @@
  * contract — do not change the exported types.
  */
 
-import type { CameraFullscreenRegion, SpeedRegion } from "@/components/video-editor/types";
+import type {
+	CameraFullscreenRegion,
+	Rotation3DPreset,
+	SpeedRegion,
+	WallpaperMotion,
+	WebcamBackgroundMode,
+} from "@/components/video-editor/types";
 import { DEFAULT_CROP_REGION, getZoomScale } from "@/components/video-editor/types";
 import { annotationFontSizeFraction } from "@/lib/ai-edition/annotationScale";
 import {
@@ -24,13 +30,21 @@ import {
 	getCaptionSettings,
 	getCaptionTranslations,
 } from "@/lib/ai-edition/captions";
+import { collapseTracksToPills, trackGroupId } from "@/lib/ai-edition/document/audioTracks";
 import { createId } from "@/lib/ai-edition/document/ids";
 import { pickOutputDims } from "@/lib/ai-edition/document/outputFormat";
-import { resolvePlaybackSegments } from "@/lib/ai-edition/document/timeline";
+import {
+	type PlaybackSegment,
+	type PlaybackSpeedRegion,
+	projectRawTimelineSecToPlayback,
+	resolvePlaybackSegments,
+} from "@/lib/ai-edition/document/timeline";
 import type { AxcutClip, AxcutDocument } from "@/lib/ai-edition/schema";
 import { getEditorSettings } from "@/lib/ai-edition/store/editorSettings";
 import { assetCameraSource } from "@/lib/ai-edition/timeline/camera";
 import { resolveClipSourceEndSec } from "@/lib/ai-edition/timeline/clipDuration";
+import { removedRawSpans } from "@/lib/ai-edition/timeline/programme-time";
+import { takeProgramme } from "@/lib/ai-edition/timeline/take-programme";
 import { projectRegionsToSource } from "@/lib/ai-edition/timeline/timelineMap";
 import {
 	computeCompositeLayout,
@@ -40,12 +54,20 @@ import {
 	webcamSizeToFraction,
 } from "@/lib/compositeLayout";
 import { parseCssGradient, resolveLinearGradientAngle } from "@/lib/exporter/gradientParser";
+import type { FrameTheme, RecordingFrame } from "@/lib/projectDefaults";
 import type { CompositorClipInput } from "./contracts";
 
 /** Background behind the screen. Parsed from `settings.wallpaper`. */
 export type SceneBackground =
 	| { kind: "color"; color: string } // "#rrggbb"
-	| { kind: "gradient"; angleDeg: number; stops: string[] } // linear-gradient(deg, c1, c2, …)
+	// linear-gradient(deg, c1, c2, …). `motion` is omitted when still, so a project without
+	// animation sends the same payload as before the setting existed.
+	| {
+			kind: "gradient";
+			angleDeg: number;
+			stops: string[];
+			motion?: Exclude<WallpaperMotion, "none">;
+	  }
 	| { kind: "image"; path: string }; // "/wallpapers/…" or a data: URL
 
 /** A timeline zoom region (from `document.zoomRanges`). Times in seconds. */
@@ -61,13 +83,29 @@ export interface SceneZoomRegion {
 	focusY: number;
 	/** "auto" follows cursor telemetry instead of the fixed focus point. */
 	focusMode: "manual" | "auto" | null;
-	/** Optional rotation preset for the zoom. */
-	rotation: "iso" | "left" | "right" | null;
+	/** The zoom's 3D camera: a fixed angle or a moving camera (`regions.rs::camera_for`).
+	 *  `null` = flat; the native side also renders an unknown value flat. */
+	rotation: Rotation3DPreset | null;
 	/** Index of the clip (within `SceneDescription.clips`) whose source time this region's
 	 *  `startSec`/`endSec` are expressed in — disambiguates clips whose source windows
 	 *  numerically overlap (same or different asset). Unset only for a region that
 	 *  `projectRegionsToSourceTime` couldn't place on any clip. */
 	clipIndex?: number;
+	/** The whole region lies on a stretch a trim removed. Its `startSec`/`endSec` are outside
+	 *  `clips[clipIndex]`'s source window on purpose, and `clipIndex` is the segment the cut
+	 *  interrupts (`cutAddressingSegmentIndex`) — the ONLY thing addressing it.
+	 *
+	 *  Native shows it when the playhead is parked on the cut and gates it HARD on its own
+	 *  span: no ease-in / ease-out window, and no chaining with a neighbouring zoom. That gate
+	 *  is what keeps the render cut — an export never composes a frame at those source times,
+	 *  and a transition envelope would otherwise reach the kept frames beside the cut. */
+	/** Omitted (not `false`) when there is no trim under the region. See issue #216. */
+	underTrim?: boolean;
+	/** When true, cursor is hidden during this zoom region. */
+	hideCursor?: boolean;
+	/** Each click presses the tilted plane toward the clicked side (`regions::click_impact`).
+	 *  Native ignores it without a `rotation`. Omitted (not `false`) when off. */
+	clickImpact?: true;
 }
 
 /** A "Full Camera" timeline region (from `legacyEditor.cameraFullscreenRegions`). Times in seconds. */
@@ -76,6 +114,9 @@ export interface SceneCameraFullscreenRegion {
 	endSec: number;
 	/** See `SceneZoomRegion.clipIndex`. */
 	clipIndex?: number;
+	/** See `SceneZoomRegion.underTrim`. Full-Camera needs no extra gate — its envelope is
+	 *  already contained in `[startSec, endSec]` — so this only carries the intent. */
+	underTrim?: boolean;
 }
 
 /** A speed region projected onto each clip's source time. The native compositor matches
@@ -106,6 +147,11 @@ export interface SceneSpeedRegion {
  *  crop: the overlay is a sibling of the element carrying the zoom transform, so annotations
  *  hold still while the content zooms underneath them.
  *
+ *  The exception is `kind: "blur"`: a privacy mask that held still would let the content it
+ *  hides slide out from under it. Native renders it on the content instead, through the zoom and
+ *  any 3D tilt (`FrameGeometry::privacy_mask`), so its rect names what it covers at rest. The
+ *  selection outline in the editor overlay still sits on the unzoomed rect.
+ *
  *  `space: "frame"` opts an entry out of that and measures it against the output frame instead.
  *  Only captions set it: an annotation is authored on top of the visible video, so it must track
  *  the screen rect, whereas a subtitle belongs to the frame the viewer sees and has to hold still
@@ -117,6 +163,9 @@ export interface SceneAnnotation {
 	endSec: number;
 	/** See `SceneZoomRegion.clipIndex`. */
 	clipIndex?: number;
+	/** See `SceneZoomRegion.underTrim`. Annotations need no extra gate — they are already
+	 *  drawn only while `startSec <= t < endSec` — so this only carries the intent. */
+	underTrim?: boolean;
 	kind: "text" | "image" | "figure" | "blur";
 	/** Which box `x`/`y`/`w`/`h` — and `text.fontSizeRel` — are fractions of. Absent means
 	 *  `"screen"`, the historical behaviour and the only one annotations ever use. */
@@ -320,21 +369,47 @@ export interface SceneEffects {
 	 * wrong; the native side multiplies by whatever its reference measures right now.
 	 *
 	 * The slider itself stays in pixels for the user — the division happens here, once.
+	 *
+	 * Under a frame, the native side reads the slider's POSITION back from it (× the
+	 * output's short side ÷ `ROUNDNESS_SLIDER_MAX_PX`) and maps it onto the range that
+	 * frame wears well, in the frame's own unit — the same corner on every clip ratio.
 	 */
 	roundnessFrac: number;
 	/** 0..1 motion blur. */
 	motionBlur: number;
+	/**
+	 * The frame drawn around the recording. Omitted for "none", like `webcamEffect`: the
+	 * Rust side defaults the field (`SceneFrame::None`), and a scene without a frame then
+	 * serializes exactly as it did before the field existed.
+	 */
+	frame?: Exclude<RecordingFrame, "none">;
+	/**
+	 * Light or dark, for whichever frame is on — the window chrome and the three modelled
+	 * devices alike. Omitted at "light", the Rust default.
+	 */
+	frameTheme?: Exclude<FrameTheme, "light">;
+	/**
+	 * Defocus a 3D-tilted screen by its depth, sharp at the zoom focus. Inert on flat zooms:
+	 * the native side only reads it where it draws a tilted plane.
+	 */
+	depthOfField: boolean;
 }
 
 /** Cursor rendering, from the editor settings. */
 export interface SceneCursor {
 	show: boolean;
+	autoHide: boolean;
 	/** Direct scale (1 = default). */
 	size: number;
 	smoothing: number;
 	/** 0..1. */
 	motionBlur: number;
 	clickBounce: number;
+	/**
+	 * Modelled 3D arrow (`scene.rs` `SceneCursor::model3d`, compositor mode 15). Only drawn for
+	 * the default theme's arrow; any other cursor keeps its flat sprite.
+	 */
+	model3d: boolean;
 	clipToBounds: boolean;
 	/** Cursor theme id (sprite set). */
 	theme: string;
@@ -392,6 +467,31 @@ export interface SceneDescription {
 		gainDb: number;
 	};
 	/**
+	 * Timeline audio tracks (issue #350), mixed over the assembled programme by
+	 * `audio::mix_external_tracks`. One entry per contiguous stretch: a track split by a
+	 * clip boundary contributes one entry per fragment (each picking the source up where
+	 * the last left off), and a looping track one entry per repeat.
+	 *
+	 * `startSec` is the head on the trim-COMPRESSED output programme: the track's raw
+	 * timeline head projected through the trims via `projectRawTimelineSecToPlayback`, so
+	 * a cut ahead of the track pulls it earlier by the removed duration (exactly as the
+	 * preview already plays it). Exact for trims; speed regions stay an approximation.
+	 * `trimEndSec` is always concrete — the compositor preallocates the decode window
+	 * from it — so it is resolved from the span and the source duration.
+	 */
+	audioTracks: Array<{
+		path: string;
+		startSec: number;
+		gainDb: number;
+		trimStartSec: number;
+		trimEndSec: number;
+		/** Ramp lengths at the entry's own edges, in seconds. A split or looping
+		 *  track carries them only on the pieces that touch the track's real
+		 *  start and end, so it fades once rather than at every cut or repeat. */
+		fadeInSec: number;
+		fadeOutSec: number;
+	}>;
+	/**
 	 * Per-clip screen crop (fractions of the frame), or null for the identity
 	 * (full-frame) crop. One entry per clip in the same order as `clips`, so a
 	 * clip that owns its own cropRegion is rendered with that crop and a clip
@@ -401,6 +501,24 @@ export interface SceneDescription {
 	cropByClip: Array<{ x: number; y: number; width: number; height: number } | null>;
 	/** Output frame. `fps` null = use the first clip's source fps. */
 	output: { width: number; height: number; fps: number | null };
+	/** Webcam background effect. Omitted when the mode is "none". */
+	webcamEffect?: SceneWebcamEffect;
+}
+
+/**
+ * The webcam background effect, as the compositor needs it.
+ *
+ * Carries the MODE and its parameters only — never pixels. The per-pixel subject mask is
+ * produced by the segmentation running in the compositor process and reaches the shader as a
+ * texture. An earlier design baked the composite here and shipped it as a video track; the codec
+ * could not carry alpha, and preview and export drifted apart.
+ */
+export interface SceneWebcamEffect {
+	mode: WebcamBackgroundMode;
+	/** 0..1, only meaningful for "blur". */
+	blurIntensity: number;
+	/** Background behind the subject for "custom", parsed like `settings.wallpaper`. */
+	background?: SceneBackground;
 }
 
 /** Parse the settings wallpaper string into the discriminated SceneBackground union. */
@@ -426,6 +544,23 @@ function parseWallpaper(wallpaper: string) {
 }
 
 /**
+ * True when `settings.wallpaperMotion` has something to move: the compositor animates only
+ * the gradient it draws itself. The motion control asks this, not its own guess at what a
+ * gradient is, so it is enabled exactly when the export would show the motion.
+ */
+export function wallpaperAcceptsMotion(wallpaper: string): boolean {
+	return parseWallpaper(wallpaper).kind === "gradient";
+}
+
+/** The screen background with the chosen motion attached, when there is one to attach. */
+function sceneBackground(wallpaper: string, motion: WallpaperMotion): SceneBackground {
+	const background = parseWallpaper(wallpaper);
+	return background.kind === "gradient" && motion !== "none"
+		? { ...background, motion }
+		: background;
+}
+
+/**
  * The ONE clip list every native-facing consumer must build from — trim-narrowed
  * (`resolvePlaybackSegments`, so word-level cuts from the transcript editor actually reach
  * native instead of only affecting the transcript panel's own strikethrough), sorted, and
@@ -434,11 +569,26 @@ function parseWallpaper(wallpaper: string) {
  * `NativeCompositorOverlay.tsx`'s `nativeClips` (live preview) — previously these three each
  * hand-rolled their own sort+filter, acknowledged as needing to be "kept in lock-step".
  */
-export function resolveVisibleClips(document: AxcutDocument): AxcutClip[] {
+/** Whether a clip's media can actually be read — the one rule that decides
+ *  which clips make it into the programme. Shared with the audio-track
+ *  projection, which must count exactly the clips the programme is built from
+ *  or every track after a relinked-away clip lands late. */
+function clipAssetIsResolvable(
+	clip: { assetId: string },
+	assetById: Map<string, { originalPath?: string }>,
+): boolean {
+	return Boolean(assetById.get(clip.assetId)?.originalPath);
+}
+
+/**
+ * Returns `PlaybackSegment[]`, not `AxcutClip[]`: a held segment carries `heldSec`, and
+ * widening it away here is what kept the pause from ever reaching the compositor. Every
+ */
+export function resolveVisibleClips(document: AxcutDocument): PlaybackSegment[] {
 	const assetById = new Map(document.assets.map((a) => [a.id, a]));
 	return resolvePlaybackSegments(document.timeline.clips, document.timeline.trimRanges)
 		.sort((a, b) => a.timelineStartSec - b.timelineStartSec)
-		.filter((clip) => assetById.get(clip.assetId)?.originalPath);
+		.filter((clip) => clipAssetIsResolvable(clip, assetById));
 }
 
 /** Serialize a document into a {@link SceneDescription}. Pure — no per-frame math. */
@@ -449,6 +599,165 @@ export function buildSceneDescription(
 	const settings = getEditorSettings(document);
 
 	const assetById = new Map(document.assets.map((a) => [a.id, a]));
+	// Timeline audio tracks (issue #350) → the compositor's mix list.
+	//
+	// Each STORED track is one clip-anchored fragment, already carrying its own
+	// advanced `offsetMs`, so a fragment maps to one contiguous decode window and
+	// the pieces of a split take play as one continuous take. Project each head
+	// onto the trim-compressed programme the mixer overlays on: the head is
+	// stored in RAW ruler seconds, and passing it verbatim delayed every track by
+	// the total trim duration ahead of it (issue #350).
+	//
+	// Projected onto the same clips the programme is assembled from —
+	// `resolveVisibleClips` drops clips whose asset has no resolvable
+	// `originalPath`, and a projection that counted a relinked-away clip the
+	// programme does not would land every following track past the real end.
+	// `projectRawTimelineSecToPlayback` subtracts the trims itself, so it needs
+	// the RAW clips behind that filter, not the already-compressed segments.
+	const projectedClips = document.timeline.clips.filter((clip) =>
+		clipAssetIsResolvable(clip, assetById),
+	);
+	// Speed regions on the RAW ruler. The programme these tracks mix onto has
+	// already been time-stretched by them (`stretch_clip_pcm_by_speed` runs before
+	// `mix_external_tracks`), so a projection blind to speed lands every track
+	// after a speed region at the wrong second. The tracks themselves are never
+	// stretched — a voiceover should not chipmunk because the video under it was
+	// sped up.
+	const rawSpeedRegions = (
+		((document.legacyEditor as Record<string, unknown> | null)?.speedRegions as
+			| PlaybackSpeedRegion[]
+			| undefined) ?? []
+	).filter((r) => Number.isFinite(r.speed) && r.speed > 0);
+	// The one removed set, hoisted out of the map: every voiceover asks it the same
+	// question, and it does not depend on the track.
+	// Placed once: the projection below counts them, so a track after a pause lands where
+	const removed = removedRawSpans(projectedClips, document.timeline.trimRanges);
+	// The take's pills, keyed by group. A voiceover is walked ONCE per pill and never per
+	// stored fragment: the document keeps one fragment per clip a take covers, so walking
+	// them separately would emit overlapping entries and `overlay_track_pcm` sums with `+=`
+	// at an absolute offset — the export would contain the take playing on top of itself.
+	const voiceoverPills = new Map(
+		collapseTracksToPills(document.audioTracks)
+			.filter((pill) => pill.kind === "voiceover" && !pill.loop)
+			.map((pill) => [trackGroupId(pill), pill]),
+	);
+	const audioTracks = document.audioTracks.flatMap((track) => {
+		if (track.muted) return [];
+		const asset = assetById.get(track.assetId);
+		if (!asset?.originalPath) return [];
+		const sourceDurationSec = asset.durationSec ?? track.durationSec;
+		const offsetSec = track.offsetMs / 1000;
+		const startSec = projectRawTimelineSecToPlayback(
+			projectedClips,
+			document.timeline.trimRanges,
+			track.startMs / 1000,
+			rawSpeedRegions,
+		);
+		// Length is measured WITHOUT speed, position WITH it — the two do different
+		// things to a track and must not be conflated.
+		//
+		// A trim REMOVES timeline: a track inside removed time has nowhere left to
+		// be (zero length, dropped), and one crossing a cut loses what the cut took.
+		// A speed region only COMPRESSES: the track still holds all its audio and
+		// still plays at 1x, so speeding the video up must not quietly cut the
+		// narration short. It changes where the track STARTS, because the programme
+		// ahead of it got shorter, and nothing else.
+		const trimmedSpanSec =
+			projectRawTimelineSecToPlayback(
+				projectedClips,
+				document.timeline.trimRanges,
+				track.endMs / 1000,
+			) -
+			projectRawTimelineSecToPlayback(
+				projectedClips,
+				document.timeline.trimRanges,
+				track.startMs / 1000,
+			);
+		const spanSec = trimmedSpanSec;
+		if (spanSec <= 0) return [];
+		const base = {
+			path: asset.originalPath,
+			gainDb: track.gainDb,
+			fadeInSec: track.fadeInMs / 1000,
+			fadeOutSec: track.fadeOutMs / 1000,
+		};
+		// The window the file has left after the offset. Without a probed duration
+		// there is nothing to loop over and nothing to cap the tail with, so the
+		// span itself is the window — the mixer stops at the real end of the file.
+		const windowSec = sourceDurationSec > 0 ? Math.max(0, sourceDurationSec - offsetSec) : spanSec;
+		if (windowSec <= 0) return [];
+
+		// A cut under a VOICEOVER removes the words that were said there, not the tail of
+		// the take (issue #560). The transcript pane strikes those words through; if the
+		// mix went on playing them, shifted earlier, the red would be a lie.
+		//
+		// Music deliberately keeps the branch below: a bed plays through a cut and ends
+		// early, because slicing it at every edit is a musical regression, and a bed has no
+		// words whose redness has to be true. A LOOPING voiceover keeps it too — step 6 of
+		// #560 refuses that combination outright, and inventing semantics for something
+		// about to be banned would be the worse answer.
+		if (track.kind === "voiceover" && !track.loop) {
+			const groupId = trackGroupId(track);
+			const pill = voiceoverPills.get(groupId);
+			// Emitted from the group's HEAD fragment only — every other fragment of the same
+			// take is already covered by the pill's own walk.
+			if (!pill || pill.id !== track.id) return [];
+			const rawSpanSec = Math.max(0, pill.endMs / 1000 - pill.startMs / 1000);
+			// Unprobed assets have no real duration to cap with; the RAW span is how much
+			// file the take covers, which is the honest fallback once the cuts are taken out.
+			const voWindowSec =
+				sourceDurationSec > 0 ? Math.max(0, sourceDurationSec - offsetSec) : rawSpanSec;
+			const kept = takeProgramme(pill, removed)
+				.filter((piece) => piece.kind === "play")
+				.map((piece) => ({
+					...base,
+					startSec: projectRawTimelineSecToPlayback(
+						projectedClips,
+						document.timeline.trimRanges,
+						piece.rawStartSec,
+						rawSpeedRegions,
+					),
+					trimStartSec: piece.sourceStartSec,
+					trimEndSec: Math.min(offsetSec + voWindowSec, piece.sourceEndSec),
+				}))
+				.filter((entry) => entry.trimEndSec > entry.trimStartSec);
+			// The fades belong to the TAKE's edges, not to every piece a cut left behind.
+			return kept.map((entry, i) => ({
+				...entry,
+				fadeInSec: i === 0 ? base.fadeInSec : 0,
+				fadeOutSec: i === kept.length - 1 ? base.fadeOutSec : 0,
+			}));
+		}
+		if (!track.loop) {
+			return [
+				{
+					...base,
+					startSec,
+					trimStartSec: offsetSec,
+					// Always concrete: the compositor preallocates its decode window
+					// from it. Whichever runs out first — the span or the file.
+					trimEndSec: offsetSec + Math.min(windowSec, spanSec),
+				},
+			];
+		}
+		// A looping track is one mix entry per repeat: the mixer overlays entries
+		// independently, so the repeats are just more of them. The last one is cut
+		// short wherever the span ends.
+		const entries = [];
+		for (let played = 0; played < spanSec && entries.length < 1000; played += windowSec) {
+			const thisSec = Math.min(windowSec, spanSec - played);
+			entries.push({
+				...base,
+				startSec: startSec + played,
+				trimStartSec: offsetSec,
+				trimEndSec: offsetSec + thisSec,
+				// The fades belong to the track's edges, not to every repeat.
+				fadeInSec: played === 0 ? base.fadeInSec : 0,
+				fadeOutSec: played + thisSec >= spanSec ? base.fadeOutSec : 0,
+			});
+		}
+		return entries;
+	});
 	const visibleClips = resolveVisibleClips(document);
 	const clips: CompositorClipInput[] = visibleClips.flatMap((clip) => {
 		const asset = assetById.get(clip.assetId);
@@ -469,6 +778,8 @@ export function buildSceneDescription(
 				sourceEndSec: resolveClipSourceEndSec(clip, asset),
 				webcamOffsetSec: camera.offsetSec,
 				hasAudio: true,
+				// A held segment has an empty source window and exists only for the frames it
+				// holds; every other clip holds nothing.
 			},
 		];
 	});
@@ -770,20 +1081,30 @@ export function buildSceneDescription(
 			roundnessFrac:
 				settings.borderRadius / Math.max(1, Math.min(outputDims.width, outputDims.height)),
 			motionBlur: settings.motionBlurAmount,
+			// Omitted at their defaults, like `webcamEffect`: the Rust side defaults both fields,
+			// so a project with no frame serializes exactly as it did before they existed.
+			...(settings.frame !== "none" ? { frame: settings.frame } : {}),
+			...(settings.frame !== "none" && settings.frameTheme !== "light"
+				? { frameTheme: settings.frameTheme }
+				: {}),
+			depthOfField: settings.depthOfField,
 		},
 		cursor: {
 			show: settings.cursorShow,
+			autoHide: settings.cursorAutoHide,
 			size: settings.cursor.size,
 			smoothing: settings.cursor.smoothing,
 			motionBlur: settings.cursor.motionBlur,
 			clickBounce: settings.cursor.clickBounce,
+			model3d: settings.cursor.model3d,
 			clipToBounds: settings.cursor.clipToBounds,
 			theme: settings.cursorTheme,
 		},
 		audio: {
 			gainDb: settings.audioGainDb,
 		},
-		background: parseWallpaper(settings.wallpaper),
+		audioTracks,
+		background: sceneBackground(settings.wallpaper, settings.wallpaperMotion),
 		zoomRegions: projectedZoomRegions.map((region) => ({
 			id: region.id,
 			startSec: region.startMs / 1000,
@@ -812,6 +1133,9 @@ export function buildSceneDescription(
 			focusMode: settings.autoFocusAll ? "auto" : (region.focusMode ?? null),
 			rotation: region.rotationPreset ?? null,
 			clipIndex: region.clipIndex,
+			...(region.underTrim ? { underTrim: true } : {}),
+			...(region.hideCursor ? { hideCursor: true } : {}),
+			...(region.clickImpact ? { clickImpact: true as const } : {}),
 		})),
 		annotations: projectedAnnotations
 			.map((region) => {
@@ -826,6 +1150,7 @@ export function buildSceneDescription(
 					startSec: region.startMs / 1000,
 					endSec: region.endMs / 1000,
 					clipIndex: region.clipIndex,
+					...(region.underTrim ? { underTrim: true as const } : {}),
 					kind: region.type,
 					...(space ? { space } : {}),
 					// Authored as percentages of the box named by `space` — the screen rect unless
@@ -904,14 +1229,33 @@ export function buildSceneDescription(
 			startSec: region.startMs / 1000,
 			endSec: region.endMs / 1000,
 			clipIndex: region.clipIndex,
+			...(region.underTrim ? { underTrim: true } : {}),
 		})),
-		speedRegions: projectedSpeedRegions.map((region) => ({
-			startSec: region.startMs / 1000,
-			endSec: region.endMs / 1000,
-			speed: region.speed,
-			clipIndex: region.clipIndex,
-		})),
+		// Speed is the one modifier with nothing to show for itself on a parked playhead: a
+		// still frame has no rate. So the entries under a trim are dropped here rather than
+		// shipped inert — `speed_at` (regions.rs) matches on clipIndex + time with no window
+		// to bound it, and the export's frame count is derived from these spans. Nothing to
+		// gain, an arithmetic to put at risk.
+		speedRegions: projectedSpeedRegions
+			.filter((region) => !region.underTrim)
+			.map((region) => ({
+				startSec: region.startMs / 1000,
+				endSec: region.endMs / 1000,
+				speed: region.speed,
+				clipIndex: region.clipIndex,
+			})),
 		cropByClip,
 		output: { ...pickOutputDims(document, settings.aspectRatio), fps: null },
+		// Omitted rather than sent as `{mode:"none"}`: the Rust side defaults the field, and
+		// every project without a webcam effect would otherwise carry it for nothing.
+		...(settings.webcamBackgroundMode !== "none"
+			? {
+					webcamEffect: {
+						mode: settings.webcamBackgroundMode,
+						blurIntensity: settings.webcamBlurIntensity,
+						background: parseWallpaper(settings.webcamWallpaper),
+					},
+				}
+			: {}),
 	};
 }

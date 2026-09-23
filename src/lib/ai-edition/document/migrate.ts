@@ -63,7 +63,7 @@ function clampSec(sec: number): number {
  * v2 inputs are not handled by it — `migrateProjectDataToAxcutDocument` below
  * still owns the legacy EditorProjectData → AxcutDocument translation.
  */
-export { migrateRawDocumentToCurrent };
+export { migrateRawDocumentToCurrent } from "../schema";
 
 function toLegacyMedia(input: ProjectMedia | undefined): ProjectMedia | null {
 	if (!input) return null;
@@ -227,6 +227,8 @@ export function migrateProjectDataToAxcutDocument(
 			...(region.rotationPreset ? { rotationPreset: region.rotationPreset } : {}),
 			...(typeof region.customScale === "number" ? { customScale: region.customScale } : {}),
 			...(region.source === "auto" || region.source === "manual" ? { source: region.source } : {}),
+			...(region.hideCursor ? { hideCursor: true } : {}),
+			...(region.clickImpact === true ? { clickImpact: true as const } : {}),
 		}));
 
 	const migratedAnnotations: AxcutAnnotationRegion[] = annotationRegions
@@ -327,9 +329,11 @@ export function migrateAxcutDocumentToProjectData(input: AxcutDocument): EditorP
 
 	const editor: ProjectEditorState = {
 		wallpaper: "",
+		wallpaperMotion: "none",
 		shadowIntensity: 0,
 		showBlur: false,
 		motionBlurAmount: 0,
+		depthOfField: true,
 		borderRadius: 0,
 		padding: 0,
 		// Round-trip the crop the other way too. It lives on the clip now, so read
@@ -373,6 +377,8 @@ export function migrateAxcutDocumentToProjectData(input: AxcutDocument): EditorP
 		...(region.rotationPreset ? { rotationPreset: region.rotationPreset } : {}),
 		...(typeof region.customScale === "number" ? { customScale: region.customScale } : {}),
 		...(region.source ? { source: region.source } : {}),
+		...(region.hideCursor ? { hideCursor: true } : {}),
+		...(region.clickImpact ? { clickImpact: true as const } : {}),
 	}));
 	editor.zoomRegions = reverseZoomRegions;
 

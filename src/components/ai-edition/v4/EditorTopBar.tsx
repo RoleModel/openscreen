@@ -26,6 +26,7 @@ import { useTheme } from "@/hooks/useTheme";
 // `import type` — so it costs the renderer bundle a string, and the name in the top bar
 // cannot drift from the name in the title bar and the About panel.
 import { PRODUCT_NAME } from "../../../../electron/about";
+import { StylePresetsMenu } from "../StylePresetsMenu";
 import styles from "./EditorShellV4.module.css";
 
 /**
@@ -165,10 +166,10 @@ export function EditorTopBar({
 			    keeps the width of the longer label and the bar doesn't twitch every
 			    time the document goes dirty. The inactive one is visibility:hidden,
 			    which also takes it out of the accessibility tree. */}
-			<span className={styles.saved}>
+			<span className={styles.saved} title={dirty ? t("topbar.unsaved") : t("topbar.saved")}>
 				<span className={styles.savedState} data-on={!dirty}>
 					<span className={styles.dot} aria-hidden />
-					{t("topbar.saved")}
+					<span className={styles.savedLabel}>{t("topbar.saved")}</span>
 				</span>
 				<span className={styles.savedState} data-on={dirty}>
 					<span
@@ -176,7 +177,7 @@ export function EditorTopBar({
 						aria-hidden
 						style={{ background: "var(--warn)", boxShadow: "0 0 0 3px var(--warn-soft)" }}
 					/>
-					{t("topbar.unsaved")}
+					<span className={styles.savedLabel}>{t("topbar.unsaved")}</span>
 				</span>
 			</span>
 
@@ -187,6 +188,7 @@ export function EditorTopBar({
 						type="button"
 						role="tab"
 						aria-selected={mode === m.id}
+						title={t(m.labelKey)}
 						// Feeds the hidden bold copy that reserves the selected width — see
 						// .modeSwitch button::before.
 						data-label={t(m.labelKey)}
@@ -197,6 +199,10 @@ export function EditorTopBar({
 				))}
 			</div>
 
+			{/* A preset is the whole look the right panel's panes edit — Composition, camera,
+			    cursor — so its entry sits in the bar, reachable from every pane and mode,
+			    rather than in any one pane's header. */}
+			<StylePresetsMenu />
 			<button
 				type="button"
 				className={styles.iconBtn}
@@ -215,7 +221,7 @@ export function EditorTopBar({
 				disabled={!canExport}
 			>
 				<Download size={15} />
-				{t("topbar.export")}
+				<span className={styles.exportLabel}>{t("topbar.export")}</span>
 			</button>
 		</header>
 	);
@@ -413,8 +419,10 @@ function AppMenu({ actions }: { actions: TopBarActions }) {
 				aria-expanded={open}
 				// Embedded, the wordmark is gone and the mark is decorative — which would
 				// leave the app menu a button with no accessible name at all. Named here
-				// instead, with the same string the wordmark carries.
+				// instead, with the same string the wordmark carries. Upstream hardcodes
+				// "OpenScreen" on both attributes; a branded fork cannot.
 				aria-label={embedded ? PRODUCT_NAME : undefined}
+				title={embedded ? PRODUCT_NAME : undefined}
 				onClick={() => setOpen((v) => !v)}
 			>
 				{/* Decorative: the wordmark beside it already names the app — and, being the
@@ -480,7 +488,9 @@ function AppMenu({ actions }: { actions: TopBarActions }) {
 }
 
 // The language switcher is commented out with the rest of the language UI
-// (see LaunchWindow.tsx). Kept rather than deleted so it can come back.
+// (see LaunchWindow.tsx). Kept rather than deleted so it can come back — and
+// refreshed from upstream on each merge, so what comes back is current: this
+// is upstream's CSS-module rewrite, not the inline-style version it replaced.
 // function LangButton() {
 // 	const { locale, setLocale } = useI18n();
 // 	const t = useScopedT("editor");
@@ -495,53 +505,29 @@ function AppMenu({ actions }: { actions: TopBarActions }) {
 // 		return () => document.removeEventListener("mousedown", onDocClick);
 // 	}, [open]);
 // 	return (
-// 		<div ref={ref} style={{ position: "relative", flexShrink: 0 }}>
+// 		<div ref={ref} className={styles.langAnchor}>
 // 			<button
 // 				type="button"
-// 				className={styles.iconBtn}
-// 				style={{ width: "auto", padding: "0 8px", gap: 6, display: "inline-flex" }}
+// 				className={`${styles.iconBtn} ${styles.langBtn}`}
 // 				onClick={() => setOpen((v) => !v)}
 // 				aria-label={t("topbar.changeLanguage")}
 // 				aria-pressed={open}
 // 			>
-// 				<Languages size={15} />
+// 				<Languages size={15} className={styles.langIcon} />
 // 				{/* Fixed-width, centred: the short labels run from "EN" to "PT-BR" to
 // 				    the CJK "简中", and letting the button size to them moved everything
 // 				    to its right on each language change. */}
 // 				<span className={styles.langShort}>{getLocaleShort(locale)}</span>
-// 				<ChevronDown size={9} style={{ color: "var(--muted)" }} />
+// 				<ChevronDown size={9} className={styles.langChevron} />
 // 			</button>
 // 			{open ? (
-// 				<div
-// 					style={{
-// 						position: "absolute",
-// 						top: "calc(100% + 4px)",
-// 						right: 0,
-// 						minWidth: 160,
-// 						background: "var(--surface)",
-// 						border: "1px solid var(--border)",
-// 						borderRadius: "var(--r-md)",
-// 						boxShadow: "var(--elev-pop)",
-// 						padding: 4,
-// 						zIndex: 60,
-// 					}}
-// 				>
+// 				<div className={styles.langMenu}>
 // 					{getAvailableLocales().map((code) => (
 // 						<button
 // 							key={code}
 // 							type="button"
-// 							style={{
-// 								display: "block",
-// 								width: "100%",
-// 								textAlign: "left",
-// 								padding: "6px 10px",
-// 								border: 0,
-// 								background: code === locale ? "var(--accent-wash)" : "transparent",
-// 								color: code === locale ? "var(--accent)" : "var(--fg-2)",
-// 								borderRadius: "var(--r-sm)",
-// 								cursor: "pointer",
-// 								font: "500 12px var(--font-body)",
-// 							}}
+// 							className={styles.langMenuItem}
+// 							data-active={code === locale}
 // 							onClick={() => {
 // 								setLocale(code);
 // 								setOpen(false);

@@ -23,7 +23,7 @@
 //! le napi — le `gen` est l'identité de la frame (cf. `LatestFrame`).
 
 use crate::compositor::{Compositor, LiveParams};
-use crate::regions::speed_at;
+use crate::regions::{speed_at, ProgrammeClock};
 use crate::scene::Scene;
 use crate::config::{self, Cfg};
 use crate::cursor::CursorTrack;
@@ -288,6 +288,9 @@ pub struct Player {
     has_current_frame: bool,
     use_current_on_next_step: bool,
     idx: u32,
+    /// Horloge programme du clip ACTIF, posée par `render_thread` à chaque changement de
+    /// clip ou de scène (`set_programme_clock`). `None` = pas de scène : fixture.
+    programme: Option<ProgrammeClock>,
 }
 
 impl Player {
@@ -307,6 +310,7 @@ impl Player {
             has_current_frame: false,
             use_current_on_next_step: false,
             idx: 0,
+            programme: None,
         })
     }
 
@@ -423,6 +427,27 @@ impl Player {
     /// `poc-d3d` (crate externe) en a besoin pour piloter sa propre boucle de lecture libre.
     pub unsafe fn screen_time_sec(&self) -> f64 {
         self.sdec.cur_time_sec()
+    }
+
+    /// Recalcule l'horloge programme pour le clip `clip_index` de `scene` (la scène COMPLÈTE,
+    /// pas la fenêtre d'un clip : il faut la durée de sortie des clips précédents).
+    ///
+    /// Cadence : `scene.output.fps`, sinon celle de la source, arrondie — le repli de l'export.
+    /// ponytail: l'export prend la source du PREMIER clip et, depuis la modale, sa propre
+    /// cadence ; un écart ne décale le temps programme que d'au plus une frame par span de
+    /// vitesse (arrondi `ceil` des spans). À aligner si un effet devient sensible à la frame.
+    pub unsafe fn set_programme_clock(&mut self, scene: Option<&Scene>, clip_index: usize) {
+        self.programme = scene.and_then(|s| {
+            let fps = s.output.fps.unwrap_or_else(|| self.sdec.fps().round().max(1.0));
+            ProgrammeClock::for_clip(s, clip_index, fps)
+        });
+    }
+
+    /// Temps programme de la frame écran courante : fonction de son seul pts, donc identique
+    /// qu'on y arrive en lecture (`step`) ou par un seek (`present_frame`).
+    pub unsafe fn programme_time(&self) -> Option<f32> {
+        let t = self.sdec.cur_time_sec();
+        self.programme.as_ref().map(|c| c.at(t) as f32)
     }
 
     /// Compose la PROCHAINE frame due (→ `comp.rt`), au plus une, si `target_source_time`
@@ -548,6 +573,7 @@ impl Player {
         let t = self.sdec.cur_time_sec() as f32;
         comp.set_cursor_time(Some(t));
         comp.set_timeline_time(Some(t));
+        comp.set_programme_time(self.programme_time());
     }
 
     /// Recompose la frame courante (déjà décodée) — rafraîchit après un changement de param.
@@ -631,6 +657,9 @@ struct InspectorParams {
     cursor_smoothing: f32,
     /// 0..1 : force du flou de mouvement DU CURSEUR (indépendant du motion blur écran).
     cursor_motion_blur: f32,
+    /// Flèche modélisée en 3D (mode 15).
+    cursor_model3d: bool,
+    cursor_auto_hide: bool,
 }
 
 impl Default for InspectorParams {
@@ -650,6 +679,8 @@ impl Default for InspectorParams {
             cursor_bounce_scale: 1.0,
             cursor_smoothing: 0.0,
             cursor_motion_blur: 0.0,
+            cursor_model3d: false,
+            cursor_auto_hide: false,
         }
     }
 }
@@ -905,6 +936,8 @@ impl LiveView {
                 "backgroundBlur" => p.bg_blur = value,
                 "webcamMirror" => p.webcam_mirror = value,
                 "cursorShow" => p.cursor_show = value,
+                "cursorAutoHide" => p.cursor_auto_hide = value,
+                "cursorModel3d" => p.cursor_model3d = value,
                 _ => {}
             }
         }
@@ -964,6 +997,10 @@ impl LiveView {
     pub fn set_scene(&self, json: &str) {
         match Scene::from_json(json) {
             Ok(scene) => {
+                if let Ok(mut p) = self.shared.inspector.lock() {
+                    p.cursor_show = scene.cursor.show;
+                    p.cursor_auto_hide = scene.cursor.auto_hide;
+                }
                 if let Ok(mut s) = self.shared.scene.lock() {
                     *s = Some(scene);
                     self.shared.scene_dirty.store(true, Ordering::Relaxed);
@@ -1095,6 +1132,29 @@ type PendingPrefetch = (usize, std::sync::mpsc::Receiver<Result<PrefetchedClip>>
 /// `avformat_find_stream_info` + init D3D11VA), assez court pour ne pas garder deux paires de
 /// décodeurs ouvertes plus longtemps que nécessaire.
 const PREFETCH_LEAD_SEC: f64 = 0.75;
+
+/// Durée pendant laquelle la boucle continue de recomposer après un changement en pause, le
+/// temps qu'un effet asynchrone (segmentation webcam) livre son résultat. Généreuse : à
+/// l'échelle d'une pause, une demi-seconde de recomposes ne coûte rien, alors qu'une fenêtre
+/// trop courte laisse l'effet invisible sur une machine lente — exactement le bug d'origine.
+const SETTLE_WINDOW: Duration = Duration::from_millis(500);
+/// Cadence des recomposes dans cette fenêtre : celle de la segmentation (`SEGMENTATION_HZ`),
+/// pas celle de la boucle — recomposer à 250 Hz n'accélérerait pas une inférence limitée à 30 Hz.
+const SETTLE_STEP: Duration = Duration::from_millis(33);
+
+/// Ouvre (ou rouvre) la fenêtre de stabilisation. Les deux appelants — changement en pause et
+/// seek en pause — doivent poser la MÊME paire : un `last_settle` oublié ferait recomposer à la
+/// cadence de la boucle au lieu de celle de la segmentation.
+fn open_settle_window(now: Instant) -> (Option<Instant>, Instant) {
+    (Some(now + SETTLE_WINDOW), now)
+}
+
+/// Faut-il recomposer alors que RIEN n'a changé ? Oui tant que la fenêtre de stabilisation
+/// court et que la cadence le permet. Extrait de la boucle pour être vérifiable sans GPU.
+fn should_settle(now: Instant, settle_until: Option<Instant>, last_settle: Instant) -> bool {
+    settle_until.is_some_and(|deadline| now < deadline)
+        && now.duration_since(last_settle) >= SETTLE_STEP
+}
 
 /// Démarre le préchargement du clip suivant sur un thread dédié dès qu'on entre dans la
 /// fenêtre `PREFETCH_LEAD_SEC` avant la fin du clip actif — pour que la bascule à la
@@ -1240,6 +1300,7 @@ unsafe fn advance_to_next_scene_clip(
             *active_webcam_offset_sec = next_clip.webcam_offset_sec;
             *active_clip_index = next_index;
             comp.set_scene(Some(scene_for_clip(scene, *active_clip_index)));
+            player.set_programme_clock(Some(scene), *active_clip_index);
             // Réutilise le curseur préchargé s'il est disponible (voir plus haut) — sinon
             // (préchargement pas encore prêt / raté) on retombe sur la lecture synchrone
             // habituelle, comme avant cette optimisation.
@@ -1348,6 +1409,15 @@ unsafe fn render_thread(
     let mut last_preview_size: (u32, u32) = (0, 0);
     let mut last_ip: Option<InspectorParams> = None;
     let mut last_smoothing: f32 = -1.0; // force la 1re application (0.0 est une valeur valide)
+    // Fenêtre de stabilisation après un changement EN PAUSE. Un seul recompose ne suffit pas
+    // quand l'effet demandé est asynchrone : la segmentation webcam (détourage / flou / fond
+    // personnalisé) démarre son worker au 1er compose, ne SOUMET la frame qu'au 2e et ne
+    // téléverse le masque qu'au 3e — d'où l'effet qui n'apparaissait qu'au scrub suivant, le
+    // scrub étant la seule chose qui recomposait encore.
+    // ponytail: fenêtre fixe plutôt qu'un vrai signal « masque en attente » exposé par les
+    // trois compositeurs ; à remplacer si une machine met plus que ça à inférer.
+    let mut settle_until: Option<Instant> = None;
+    let mut last_settle = Instant::now();
     // La vue live est TOUJOURS pilotée par la scène de l'app. Tant qu'aucune scène n'a été
     // appliquée, on refuse de jouer le layout fixture (POC) : un fallback fixture ne ferait que
     // MASQUER un scene-push cassé. On attend la scène avant de produire le 1er frame.
@@ -1490,6 +1560,8 @@ unsafe fn render_thread(
             cursor_size_scale: ip.cursor_size_scale,
             cursor_bounce_scale: ip.cursor_bounce_scale,
             cursor_motion_blur: ip.cursor_motion_blur,
+            cursor_model3d: ip.cursor_model3d,
+            cursor_auto_hide: ip.cursor_auto_hide,
             has_webcam: has_real_webcam,
         });
         // Lissage ressort-amortisseur : re-génère la piste (240 Hz) uniquement quand la valeur
@@ -1527,6 +1599,11 @@ unsafe fn render_thread(
                 scene_for_clip(&base_scene, active_clip_index)
             });
             comp.set_scene(scene);
+        }
+        // Le temps programme dépend du clip actif ET de la scène entière (durées des clips
+        // précédents) : à recalculer dès que l'un des deux change.
+        if clip_changed || scene_changed {
+            player.set_programme_clock(full_scene.as_ref(), active_clip_index);
         }
 
         // résolution cible du preview (le canvas Electron) → force le recadrage des
@@ -1575,6 +1652,11 @@ unsafe fn render_thread(
         if let Some(target) = requested {
             if player.present_frame(&comp, &cfg, target)? {
                 stepped = true;
+                // Un seek en pause compose UNE fois, exactement comme un changement de param :
+                // la frame webcam a changé, donc son masque aussi, et il arrivera deux composes
+                // plus tard. Sans cette fenêtre, le masque de la position PRÉCÉDENTE reste
+                // affiché jusqu'à ce qu'une autre action provoque un compose.
+                (settle_until, last_settle) = open_settle_window(now);
             }
             acc = 0.0; // resynchronise l'accumulateur de lecture libre après un seek
         } else if shared.playing.load(Ordering::Relaxed) {
@@ -1687,6 +1769,14 @@ unsafe fn render_thread(
             }
         } else if first || ip_changed || scene_changed || clip_changed || resized {
             // pause : recompose la frame courante (param / scène / clip / résolution changés).
+            (settle_until, last_settle) = open_settle_window(now);
+            let _ = player.recompose(&comp, &cfg);
+            stepped = true;
+        } else if should_settle(now, settle_until, last_settle) {
+            // Rien n'a changé, mais un masque de segmentation peut encore être en vol : on
+            // recompose à la cadence de la segmentation (pas à celle de la boucle) jusqu'à ce
+            // que la fenêtre expire.
+            last_settle = now;
             let _ = player.recompose(&comp, &cfg);
             stepped = true;
         }
@@ -1905,6 +1995,44 @@ pub fn run_standalone(_screen: &str, _webcam: &str, _cursor_json: &str) -> anyho
 
 #[cfg(test)]
 mod tests {
+    use super::{open_settle_window, should_settle, SETTLE_STEP, SETTLE_WINDOW};
+    use std::time::Instant;
+
+    /// Le bug d'origine : en pause, un seul recompose par changement, donc le masque de
+    /// segmentation (asynchrone, 3 composes de latence) n'arrivait jamais avant un scrub.
+    #[test]
+    fn settle_recomposes_within_the_window_at_the_segmentation_rate() {
+        let t0 = Instant::now();
+        let deadline = Some(t0 + SETTLE_WINDOW);
+
+        assert!(!should_settle(t0, None, t0), "aucune fenêtre ouverte : rien à faire");
+        assert!(
+            !should_settle(t0 + SETTLE_STEP / 2, deadline, t0),
+            "dans la fenêtre mais trop tôt : on ne recompose pas à la cadence de la boucle",
+        );
+        assert!(
+            should_settle(t0 + SETTLE_STEP, deadline, t0),
+            "dans la fenêtre et la cadence est due : c'est le tour qui livre le masque",
+        );
+        assert!(
+            !should_settle(t0 + SETTLE_WINDOW, deadline, t0),
+            "fenêtre expirée : on retombe en pause inerte plutôt que de recomposer sans fin",
+        );
+    }
+
+    /// Un seek en pause compose aussi UNE seule fois : la frame webcam a changé, son masque
+    /// arrive deux composes plus tard. Le chemin `present_frame` doit donc ouvrir la même
+    /// fenêtre que le chemin « un param a changé », sans recomposer immédiatement.
+    #[test]
+    fn a_paused_seek_opens_the_same_window() {
+        let t0 = Instant::now();
+        let (until, last) = open_settle_window(t0);
+
+        assert!(!should_settle(t0, until, last), "pas de recompose en boucle juste après le seek");
+        assert!(should_settle(t0 + SETTLE_STEP, until, last), "le tour suivant livre le masque");
+        assert!(!should_settle(t0 + SETTLE_WINDOW, until, last), "puis la fenêtre se referme");
+    }
+
     use super::*;
 
     fn multiclip_scene() -> Scene {

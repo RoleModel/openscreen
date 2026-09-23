@@ -29,6 +29,7 @@ const baseDoc: AxcutDocument = {
 	},
 	annotations: [],
 	zoomRanges: [],
+	audioTracks: [],
 	transcripts: [],
 	transcript: null,
 	legacyEditor: null,
@@ -84,6 +85,17 @@ describe("getEditorSettings", () => {
 		const snap = getEditorSettings(doc);
 		expect(snap.showBlur).toBe(false);
 	});
+
+	it("keeps depth of field on unless the project stored a boolean off", () => {
+		expect(getEditorSettings(baseDoc).depthOfField).toBe(true);
+		const junk: AxcutDocument = {
+			...baseDoc,
+			legacyEditor: { depthOfField: "no" as unknown as boolean },
+		};
+		expect(getEditorSettings(junk).depthOfField).toBe(true);
+		const off = patchEditorSettings(baseDoc, { depthOfField: false });
+		expect(getEditorSettings(off).depthOfField).toBe(false);
+	});
 });
 
 describe("patchEditorSettings", () => {
@@ -118,6 +130,29 @@ describe("patchEditorSettings", () => {
 		const snap = getEditorSettings(next);
 		expect(snap.cursor.size).toBe(4);
 		expect(snap.cursor.smoothing).toBe(0.9);
+	});
+
+	it("switches the 3D cursor without clobbering its siblings, off by default", () => {
+		expect(getEditorSettings(baseDoc).cursor.model3d).toBe(false);
+		const seed = patchEditorSettings(baseDoc, { cursor: { size: 4 } });
+		const on = getEditorSettings(patchEditorSettings(seed, { cursor: { model3d: true } }));
+		expect(on.cursor.model3d).toBe(true);
+		expect(on.cursor.size).toBe(4);
+	});
+
+	it("toggles cursorAutoHide on and off via patch", () => {
+		const enabled = patchEditorSettings(baseDoc, { cursorAutoHide: true });
+		expect(getEditorSettings(enabled).cursorAutoHide).toBe(true);
+		expect(getEditorSettings(enabled).cursor.autoHide).toBe(true);
+
+		const disabled = patchEditorSettings(enabled, { cursorAutoHide: false });
+		expect(getEditorSettings(disabled).cursorAutoHide).toBe(false);
+		expect(getEditorSettings(disabled).cursor.autoHide).toBe(false);
+
+		// Also verify via nested cursor.autoHide patch
+		const nestedEnabled = patchEditorSettings(disabled, { cursor: { autoHide: true } });
+		expect(getEditorSettings(nestedEnabled).cursorAutoHide).toBe(true);
+		expect(getEditorSettings(nestedEnabled).cursor.autoHide).toBe(true);
 	});
 
 	it("does not mutate the source document", () => {
@@ -238,5 +273,78 @@ describe("patchEditorSettings", () => {
 		// The rect then follows each axis from its own resolved pan.
 		expect(snap.webcamCropRegion.x).toBeCloseTo(0.375);
 		expect(snap.webcamCropRegion.y).toBeCloseTo(0.45);
+	});
+
+	it("round-trips webcam background settings through legacyEditor", () => {
+		const patched = patchEditorSettings(baseDoc, {
+			webcamBackgroundMode: "custom",
+			webcamWallpaper: "#ff0080",
+			webcamBlurIntensity: 0.8,
+		});
+		const snap = getEditorSettings(patched);
+		expect(snap.webcamBackgroundMode).toBe("custom");
+		expect(snap.webcamWallpaper).toBe("#ff0080");
+		expect(snap.webcamBlurIntensity).toBe(0.8);
+	});
+
+	// `legacyEditor` is user-writable JSON. An unknown mode used to flow straight through
+	// as a WebcamBackgroundMode, so the export pre-render ran and `renderSegmentedWebcam`
+	// matched no branch — encoding a blank webcam track.
+	it("falls back to the default when the stored webcam background mode is unknown", () => {
+		const doc = {
+			...baseDoc,
+			legacyEditor: { webcamBackgroundMode: "hologram" },
+		} as typeof baseDoc;
+		expect(getEditorSettings(doc).webcamBackgroundMode).toBe("none");
+	});
+
+	it("round-trips the wallpaper motion and rejects an unknown one", () => {
+		expect(getEditorSettings(baseDoc).wallpaperMotion).toBe("none");
+		const patched = patchEditorSettings(baseDoc, { wallpaperMotion: "aurora" });
+		expect(getEditorSettings(patched).wallpaperMotion).toBe("aurora");
+		const doc = { ...baseDoc, legacyEditor: { wallpaperMotion: "plasma" } } as typeof baseDoc;
+		expect(getEditorSettings(doc).wallpaperMotion).toBe("none");
+	});
+
+	it("round-trips the recording frame and reads an unknown one as no frame", () => {
+		expect(getEditorSettings(baseDoc).frame).toBe("none");
+		for (const frame of ["window", "laptop", "phone", "monitor"] as const) {
+			const patched = patchEditorSettings(baseDoc, { frame });
+			expect(getEditorSettings(patched).frame).toBe(frame);
+		}
+		const unknown = { ...baseDoc, legacyEditor: { frame: "holo-visor" } } as typeof baseDoc;
+		expect(getEditorSettings(unknown).frame).toBe("none");
+	});
+
+	// The migration: the theme used to be baked into the frame, and a project written then must
+	// open with BOTH the frame and the theme it had — without the document being rewritten.
+	it("splits the old window-light / window-dark into a frame and a theme", () => {
+		expect(getEditorSettings(baseDoc).frameTheme).toBe("light");
+		for (const [stored, theme] of [
+			["window-light", "light"],
+			["window-dark", "dark"],
+		] as const) {
+			const doc = { ...baseDoc, legacyEditor: { frame: stored } } as typeof baseDoc;
+			expect(getEditorSettings(doc).frame).toBe("window");
+			expect(getEditorSettings(doc).frameTheme).toBe(theme);
+		}
+		// And the theme is its own setting from here on, for every frame.
+		for (const frameTheme of ["light", "dark"] as const) {
+			const patched = patchEditorSettings(baseDoc, { frame: "laptop", frameTheme });
+			expect(getEditorSettings(patched).frameTheme).toBe(frameTheme);
+		}
+		// An explicit theme wins over the one an old value implies.
+		const both = {
+			...baseDoc,
+			legacyEditor: { frame: "window-light", frameTheme: "dark" },
+		} as typeof baseDoc;
+		expect(getEditorSettings(both).frameTheme).toBe("dark");
+	});
+
+	it("clamps a stored webcam blur intensity into 0..1", () => {
+		const tooHigh = { ...baseDoc, legacyEditor: { webcamBlurIntensity: 1000 } } as typeof baseDoc;
+		expect(getEditorSettings(tooHigh).webcamBlurIntensity).toBe(1);
+		const negative = { ...baseDoc, legacyEditor: { webcamBlurIntensity: -3 } } as typeof baseDoc;
+		expect(getEditorSettings(negative).webcamBlurIntensity).toBe(0);
 	});
 });

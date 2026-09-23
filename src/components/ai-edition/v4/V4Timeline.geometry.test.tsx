@@ -1,7 +1,8 @@
 // @vitest-environment jsdom
 import "@testing-library/jest-dom";
-import { fireEvent, render, screen } from "@testing-library/react";
-import { beforeAll, describe, expect, it, vi } from "vitest";
+import { act, fireEvent, render, screen } from "@testing-library/react";
+import { Profiler, type ProfilerOnRenderCallback } from "react";
+import { afterEach, beforeAll, describe, expect, it, vi } from "vitest";
 
 // The regression under test is geometric, so the environment has to have a size:
 // jsdom reports 0 for every box, which would leave `pxPerSec` at 0 (the
@@ -13,8 +14,19 @@ vi.mock("@/contexts/I18nContext", () => ({
 	useScopedT: () => (key: string) => key,
 }));
 vi.mock("sonner", () => ({ toast: { error: vi.fn(), info: vi.fn(), success: vi.fn() } }));
+// The audio lane's pill renders a ClipWaveform; no decode in this geometry suite.
+vi.mock("@/hooks/useAudioPeaks", () => ({ useAudioPeaks: () => null }));
 
+// The duration gate reads its timecode's width off a canvas context. jsdom has
+// no canvas, so every test here runs against this stub: 6px a character, the
+// same figure the component's no-canvas fallback assumes, which keeps the width
+// arithmetic in the tests below the one the first cut reasoned in. The
+// measured-path test re-aims it at a wider face and expects the gate to follow.
+const measureText = vi.fn((text: string) => ({ width: text.length * 6 }));
+
+import { ShortcutsProvider } from "@/contexts/ShortcutsContext";
 import type { useTimeline } from "@/lib/ai-edition/store/useTimeline";
+import { DEFAULT_SHORTCUTS, formatBinding } from "@/lib/shortcuts";
 import { V4Timeline } from "./V4Timeline";
 
 beforeAll(() => {
@@ -50,6 +62,13 @@ beforeAll(() => {
 			},
 		}),
 	});
+	vi.spyOn(HTMLCanvasElement.prototype, "getContext").mockImplementation(
+		() => ({ measureText }) as unknown as CanvasRenderingContext2D,
+	);
+});
+
+afterEach(() => {
+	measureText.mockImplementation((text: string) => ({ width: text.length * 6 }));
 });
 
 function clip(startSec: number, endSec: number) {
@@ -72,9 +91,13 @@ function renderTimeline(
 	clips = [clip(0, TOTAL_SEC)],
 	annotation = { id: "ann1", startMs: 10_000, endMs: 11_000 },
 	assets: Array<Record<string, unknown>> = [NO_CAMERA_ASSET],
+	onRender?: ProfilerOnRenderCallback,
 ) {
 	const tl = {
 		clips,
+		// Marks for added words are read straight off the transcript (see the pane's
+		// amber words) — no project here has any.
+		transcripts: [],
 		assets,
 		annotationRegions: [annotation],
 		speedRegions: [],
@@ -84,6 +107,9 @@ function renderTimeline(
 		selection: null,
 		multiSelection: [],
 		clipSelection: null,
+		audioTracks: [],
+		selectedAudioTrackId: null,
+		selectAudioTrack: vi.fn(),
 		clearSelection: vi.fn(),
 		selectRegion: vi.fn(),
 		selectClip: vi.fn(),
@@ -94,25 +120,43 @@ function renderTimeline(
 			/* the toolbar only awaits it */
 		}),
 	};
+	const setCurrentTime = vi.fn();
+	const timeline = (
+		<ShortcutsProvider>
+			<V4Timeline
+				// Only the members the lanes and the clip row read are mocked; the prop
+				// stays typed as the real API rather than widened to `any` (AGENTS.md).
+				tl={tl as unknown as ReturnType<typeof useTimeline>}
+				setCurrentTime={setCurrentTime}
+				playing={false}
+				onTogglePlay={vi.fn()}
+				onPrevClip={vi.fn()}
+				onNextClip={vi.fn()}
+				onEditClip={vi.fn()}
+				onAddVoiceover={vi.fn()}
+			/>
+		</ShortcutsProvider>
+	);
 	render(
-		<V4Timeline
-			// Only the members the lanes and the clip row read are mocked; the prop
-			// stays typed as the real API rather than widened to `any` (AGENTS.md).
-			tl={tl as unknown as ReturnType<typeof useTimeline>}
-			setCurrentTime={vi.fn()}
-			playing={false}
-			onTogglePlay={vi.fn()}
-			onPrevClip={vi.fn()}
-			onNextClip={vi.fn()}
-			onEditClip={vi.fn()}
-		/>,
+		onRender ? (
+			<Profiler id="timeline" onRender={onRender}>
+				{timeline}
+			</Profiler>
+		) : (
+			timeline
+		),
 	);
 	return {
 		pill: screen.getByTitle("toolbar.newAnnotation"),
 		clipEls: Array.from(document.querySelectorAll<HTMLElement>("[data-clip-id]")),
 		tl,
+		setCurrentTime,
 	};
 }
+
+afterEach(() => {
+	vi.unstubAllGlobals();
+});
 
 /** Drag a handle by `dxPx`. The move/up listeners live on `window`, so the drag
  *  is driven by pointer deltas alone — the handle may re-mount under it. */
@@ -133,6 +177,62 @@ function wheelZoomOn(el: HTMLElement, notches: number) {
 function zoomIn(notches: number) {
 	wheelZoomOn(document.querySelector("[class*=tlTracks]") as HTMLElement, notches);
 }
+
+describe("V4Timeline scrubbing", () => {
+	it("publishes at most one React scrub-state update per animation frame", () => {
+		const frames = new Map<number, FrameRequestCallback>();
+		let nextFrameId = 1;
+		vi.stubGlobal("requestAnimationFrame", (callback: FrameRequestCallback) => {
+			const frameId = nextFrameId++;
+			frames.set(frameId, callback);
+			return frameId;
+		});
+		vi.stubGlobal("cancelAnimationFrame", (frameId: number) => {
+			frames.delete(frameId);
+		});
+		const onRender = vi.fn<ProfilerOnRenderCallback>();
+		const { setCurrentTime } = renderTimeline(
+			[clip(0, TOTAL_SEC)],
+			{ id: "ann1", startMs: 10_000, endMs: 11_000 },
+			[NO_CAMERA_ASSET],
+			onRender,
+		);
+		const ruler = document.querySelector<HTMLElement>("[class*=tlRulerRow]");
+		expect(ruler).not.toBeNull();
+
+		// What ONE scrub-state update costs in commits, measured on the pointer-down seek
+		// (which sets it once, synchronously) rather than hardcoded: the toolbar's Radix
+		// tooltip triggers re-attach their ref on every commit and add a nested one.
+		const commitsBeforePointerDown = onRender.mock.calls.length;
+		fireEvent.pointerDown(ruler as HTMLElement, { button: 0, clientX: 90 });
+		const commitsPerUpdate = onRender.mock.calls.length - commitsBeforePointerDown;
+		expect(commitsPerUpdate).toBeGreaterThan(0);
+
+		// Over two frames: no pointer move commits, and each frame costs exactly one
+		// update however many moves it coalesced.
+		for (const [clientXs, expectedSec] of [
+			[[180, 270, 360], 720],
+			[[450, 540], 1080],
+		] as const) {
+			const commitsBeforeFrame = onRender.mock.calls.length;
+			setCurrentTime.mockClear();
+			for (const clientX of clientXs) fireEvent.pointerMove(window, { clientX });
+
+			expect(onRender).toHaveBeenCalledTimes(commitsBeforeFrame);
+			expect(setCurrentTime).not.toHaveBeenCalled();
+			expect(frames.size).toBe(1);
+
+			const [[frameId, frame]] = frames;
+			frames.delete(frameId);
+			act(() => frame(0));
+
+			expect(onRender).toHaveBeenCalledTimes(commitsBeforeFrame + commitsPerUpdate);
+			expect(setCurrentTime).toHaveBeenCalledTimes(1);
+			expect(setCurrentTime).toHaveBeenCalledWith(expectedSec);
+		}
+		fireEvent.pointerUp(window);
+	});
+});
 
 describe("V4Timeline lane pills", () => {
 	it("draws a pill exactly as wide as its region, at any zoom", () => {
@@ -194,6 +294,60 @@ describe("V4Timeline lane pills", () => {
 	});
 });
 
+describe("V4Timeline lane pill keyboard", () => {
+	// A pill carries `role="button"` and `tabIndex={0}`, so it is reachable by Tab and
+	// announced as activatable. Selection was pointer-only, which meant a keyboard user
+	// could focus a region and then reach nothing that acts on a selection — Delete,
+	// copy/paste and the inspector all key off `tl.selection`.
+	it("selects the focused pill on Enter", () => {
+		const { pill, tl } = renderTimeline();
+		fireEvent.keyDown(pill, { key: "Enter" });
+		expect(tl.selectRegion).toHaveBeenCalledWith("annotation", "ann1", { additive: false });
+	});
+
+	it("selects it on Space too, the other key a button answers to", () => {
+		const { pill, tl } = renderTimeline();
+		fireEvent.keyDown(pill, { key: " " });
+		expect(tl.selectRegion).toHaveBeenCalledWith("annotation", "ann1", { additive: false });
+	});
+
+	it("adds to the selection when Shift is held, matching shift-click", () => {
+		const { pill, tl } = renderTimeline();
+		fireEvent.keyDown(pill, { key: "Enter", shiftKey: true });
+		expect(tl.selectRegion).toHaveBeenCalledWith("annotation", "ann1", { additive: true });
+	});
+
+	it("leaves every other key to the shell's shortcut handler", () => {
+		// The editor binds single letters (Z adds a zoom, T a trim, D deletes). Swallowing
+		// them here would silently disable every shortcut while a pill has focus.
+		const { pill, tl } = renderTimeline();
+		for (const key of ["z", "t", "d", "Escape", "ArrowRight"]) {
+			fireEvent.keyDown(pill, { key });
+		}
+		expect(tl.selectRegion).not.toHaveBeenCalled();
+	});
+
+	it("stops Enter and Space reaching the window listener", () => {
+		// Space is bound to play/pause on WINDOW, above React's root container. Without
+		// stopping the NATIVE event the same keystroke would select the pill and toggle
+		// playback; the synthetic `stopPropagation` alone does not reach that far.
+		const onWindowKey = vi.fn();
+		window.addEventListener("keydown", onWindowKey);
+		try {
+			const { pill } = renderTimeline();
+			fireEvent.keyDown(pill, { key: " " });
+			fireEvent.keyDown(pill, { key: "Enter" });
+			expect(onWindowKey).not.toHaveBeenCalled();
+
+			// A key the pill ignores still gets there, or the shortcuts would be dead.
+			fireEvent.keyDown(pill, { key: "z" });
+			expect(onWindowKey).toHaveBeenCalledTimes(1);
+		} finally {
+			window.removeEventListener("keydown", onWindowKey);
+		}
+	});
+});
+
 describe("V4Timeline create-from-toolbar", () => {
 	// The button asks for a DURATION worth a fixed number of pixels at the current
 	// zoom, so the pill you get is always the same size on screen — which is what
@@ -205,14 +359,14 @@ describe("V4Timeline create-from-toolbar", () => {
 
 	it("scales the new region's duration with the zoom", () => {
 		const { tl } = renderTimeline();
-		fireEvent.click(screen.getByTitle("buttons.addZoom"));
+		fireEvent.click(screen.getByLabelText("buttons.addZoom"));
 		// 900px viewport / 1800 s = 0.5 px per second, so a 96px pill is 192 s.
 		expect(durationOf(tl)).toBeCloseTo(192, 3);
 
 		// Zoomed to the 50x ceiling the same 96px is worth 3.84 s: same pill on
 		// screen, a region 50x shorter.
 		zoomIn(40);
-		fireEvent.click(screen.getByTitle("buttons.addZoom"));
+		fireEvent.click(screen.getByLabelText("buttons.addZoom"));
 		expect(durationOf(tl)).toBeCloseTo(3.84, 3);
 	});
 
@@ -224,7 +378,7 @@ describe("V4Timeline create-from-toolbar", () => {
 		const { tl } = renderTimeline();
 		const ruler = document.querySelector("[class*=tlRulerRow]") as HTMLElement;
 		wheelZoomOn(ruler, 40);
-		fireEvent.click(screen.getByTitle("buttons.addZoom"));
+		fireEvent.click(screen.getByLabelText("buttons.addZoom"));
 		expect(durationOf(tl)).toBeCloseTo(3.84, 3);
 	});
 
@@ -247,7 +401,7 @@ describe("V4Timeline create-from-toolbar", () => {
 		// second; the region would be born unusable, so the duration floors.
 		const { tl } = renderTimeline([clip(0, 3)]);
 		zoomIn(40);
-		fireEvent.click(screen.getByTitle("buttons.addZoom"));
+		fireEvent.click(screen.getByLabelText("buttons.addZoom"));
 		expect(durationOf(tl)).toBeCloseTo(0.25, 3);
 	});
 
@@ -257,7 +411,7 @@ describe("V4Timeline create-from-toolbar", () => {
 	// so before it is clicked instead of looking like it worked.
 	it("disables Add Full Camera when no clip on the timeline has a camera", () => {
 		renderTimeline();
-		expect(screen.getByTitle("buttons.addCameraFullscreen")).toBeDisabled();
+		expect(screen.getByLabelText("buttons.addCameraFullscreen")).toBeDisabled();
 	});
 
 	it("enables Add Full Camera as soon as a clip's asset carries one", () => {
@@ -267,7 +421,7 @@ describe("V4Timeline create-from-toolbar", () => {
 				cameraTrack: { sourcePath: "/tmp/cam.webm", startMs: 0, offsetMs: 0, visible: true },
 			},
 		]);
-		expect(screen.getByTitle("buttons.addCameraFullscreen")).toBeEnabled();
+		expect(screen.getByLabelText("buttons.addCameraFullscreen")).toBeEnabled();
 	});
 
 	// The disabled button is only half the promise: an empty lane advertises the shortcut
@@ -321,6 +475,51 @@ describe("V4Timeline clip row", () => {
 		expect(pill.style.left).toBe(clipEls[1].style.left);
 	});
 
+	it("shows each clip's edited duration on the card", () => {
+		renderTimeline(CLIPS);
+		// 600s / 300s / 900s of an 1800s source: each card reads the clip's own
+		// length on the timeline (out − in), not the asset's original length. A
+		// speed region over the clip changes how long it plays, not this number.
+		expect(screen.getByText("10:00.0")).toBeInTheDocument();
+		expect(screen.getByText("5:00.0")).toBeInTheDocument();
+		expect(screen.getByText("15:00.0")).toBeInTheDocument();
+	});
+
+	it("withholds the duration from a card too small to hold it", () => {
+		// 250s at this zoom is a 125px card: past the narrow gate, so it still shows
+		// its name and pencil, but not wide enough for the timecode — which would
+		// otherwise escape the label pill and sit on the delete button. Measured in
+		// the running window, not derived here.
+		renderTimeline([clip(0, 250), clip(250, TOTAL_SEC)]);
+
+		expect(screen.queryByText("4:10.0")).not.toBeInTheDocument();
+		// The card that does have the room still reads its length.
+		expect(screen.getByText("25:50.0")).toBeInTheDocument();
+	});
+
+	it("asks for the room this card's own timecode needs, not the shortest one", () => {
+		// 600s of 3965s is a ~130px card. `0:12.0` would fit there; `10:00.0` is a
+		// character wider and does not, and `formatSec` has no hour field to stop
+		// the string growing — a clip past a hundred minutes reads `100:00.0`. A
+		// single fixed width would have let those through onto the delete button.
+		renderTimeline([clip(0, 600), clip(600, 3965)]);
+
+		expect(screen.queryByText("10:00.0")).not.toBeInTheDocument();
+		expect(screen.getByText("56:05.0")).toBeInTheDocument();
+	});
+
+	it("measures the timecode where a canvas exists, rather than averaging its length", () => {
+		// The stubbed face costs 9px a character against the 6px the jsdom fallback
+		// assumes. A 700s clip of this 3965s span is a ~159px card — roomy enough
+		// by the count (50 + 47 + 7×6 = 139) and too tight once the face is read
+		// (50 + 47 + 7×9 = 160) — so only a measured gate withholds it.
+		measureText.mockImplementation((text: string) => ({ width: text.length * 9 }));
+		renderTimeline([clip(0, 700), clip(700, 3965)]);
+
+		expect(screen.queryByText("11:40.0")).not.toBeInTheDocument();
+		expect(screen.getByText("54:25.0")).toBeInTheDocument();
+	});
+
 	it("takes the card gutter out of each clip's own width", () => {
 		// The 6px is what separates two cards. Taken off the clip's width it stays
 		// local to that clip; inserted between them (a flex gap) it displaced every
@@ -336,5 +535,247 @@ describe("V4Timeline clip row", () => {
 				3,
 			);
 		}
+	});
+});
+
+// Issue #350 — dragging an imported audio track on its lane. The pixel→second
+// math and the single-write commit are what these pin; the clamp/guard math is
+// covered by document/audioTracks.test.ts.
+describe("V4Timeline audio lane drag", () => {
+	const AUDIO_ASSET = { id: "aud", label: "voiceover", originalPath: "/vo.mp3", durationSec: 60 };
+	// A 60s track whose head sits at raw 100s.
+	const makeTrack = () => ({
+		id: "trk1",
+		assetId: "aud",
+		kind: "music" as const,
+		startMs: 100_000,
+		endMs: 160_000,
+		durationSec: 60,
+		offsetMs: 0,
+		gainDb: 0,
+		loop: false,
+		fadeInMs: 0,
+		fadeOutMs: 0,
+		muted: false,
+		label: "vo",
+		origin: "user" as const,
+	});
+
+	function renderAudioTracks(tracks: Array<ReturnType<typeof makeTrack>>) {
+		return renderAudio({}, {}, tracks);
+	}
+
+	function renderAudio(
+		trackOverrides: Partial<ReturnType<typeof makeTrack>> = {},
+		props: { onAddVoiceover?: () => void } = {},
+		tracks?: Array<ReturnType<typeof makeTrack>>,
+	) {
+		const placeAudioTrack = vi.fn(
+			async (_id: string, _span: { startMs: number; endMs: number; offsetMs?: number }) => {
+				/* the drag only awaits it */
+			},
+		);
+		const selectAudioTrack = vi.fn();
+		const tl = {
+			clips: [clip(0, TOTAL_SEC)],
+			assets: [AUDIO_ASSET],
+			annotationRegions: [],
+			speedRegions: [],
+			cameraFullscreenRegions: [],
+			zoomRegions: [],
+			trimRanges: [],
+			selection: null,
+			multiSelection: [],
+			clipSelection: null,
+			audioTracks: tracks ?? [{ ...makeTrack(), ...trackOverrides }],
+			// The lane reads these for the amber added-word marks (#540); this fixture
+			// is about audio geometry, so it has none.
+			transcripts: [],
+			selectedAudioTrackId: null,
+			selectAudioTrack,
+			placeAudioTrack,
+			clearSelection: vi.fn(),
+			selectRegion: vi.fn(),
+			selectClip: vi.fn(),
+			updateAnnotationSpan: vi.fn(async () => undefined),
+			addZoom: vi.fn(async () => undefined),
+		};
+		const { container } = render(
+			<ShortcutsProvider>
+				<V4Timeline
+					tl={tl as unknown as ReturnType<typeof useTimeline>}
+					setCurrentTime={vi.fn()}
+					playing={false}
+					onTogglePlay={vi.fn()}
+					onPrevClip={vi.fn()}
+					onNextClip={vi.fn()}
+					onEditClip={vi.fn()}
+					onAddVoiceover={props.onAddVoiceover ?? vi.fn()}
+				/>
+			</ShortcutsProvider>,
+		);
+		// `pill` is a getter: the multi-track cases render no "vo" pill, and an
+		// eager lookup would throw before their own assertions ran.
+		return {
+			get pill() {
+				return screen.getByTitle((t) => t.startsWith("vo "));
+			},
+			container,
+			placeAudioTrack,
+			selectAudioTrack,
+		};
+	}
+
+	// 900px / 1800s = 0.5 px per second, so +90px is +180s.
+	const secForPx = (px: number) => (px / VIEWPORT_PX) * TOTAL_SEC;
+
+	it("offers both audio paths behind one toolbar button", () => {
+		// A mic and a music note side by side both just said "audio"; one button
+		// with a named menu is what tells a first-time user the two paths apart.
+		const onAddVoiceover = vi.fn();
+		renderAudio({}, { onAddVoiceover });
+		fireEvent.click(screen.getByLabelText("toolbar.addAudioTooltip"));
+		fireEvent.click(screen.getByText("audio.addVoiceover"));
+		expect(onAddVoiceover).toHaveBeenCalledTimes(1);
+	});
+
+	it("teaches the key that does the same thing", () => {
+		// Read off the live bindings rather than hardcoded here, so a rebind in the
+		// shortcuts dialog moves the menu with it instead of teaching a stale key.
+		renderAudio();
+		fireEvent.click(screen.getByLabelText("toolbar.addAudioTooltip"));
+		const keys = Array.from(document.querySelectorAll("kbd"), (k) => k.textContent);
+		expect(keys).toEqual([
+			formatBinding(DEFAULT_SHORTCUTS.addVoiceover, false),
+			formatBinding(DEFAULT_SHORTCUTS.addAudio, false),
+		]);
+	});
+
+	it("marks where a looping track starts its file over", () => {
+		// A 60s file under a 180s span repeats twice more after the first pass, so
+		// there are two boundaries to show — at a third and two thirds.
+		const { pill } = renderAudio({ loop: true, endMs: 100_000 + 180_000 });
+		expect(pill.querySelectorAll('[data-testid="audio-loop-mark"]')).toHaveLength(2);
+	});
+
+	it("draws no loop marks when the track fits inside its source", () => {
+		const { pill } = renderAudio({ loop: true });
+		expect(pill.querySelectorAll('[data-testid="audio-loop-mark"]')).toHaveLength(0);
+	});
+
+	it("stacks overlapping tracks on separate rows", () => {
+		// Three takes over the same stretch used to draw at the same height, one
+		// hiding the next — you could not tell which pill you were about to drag.
+		const { container } = renderAudioTracks([
+			{ ...makeTrack(), id: "a", label: "a", startMs: 0, endMs: 60_000 },
+			{ ...makeTrack(), id: "b", label: "b", startMs: 10_000, endMs: 70_000 },
+			{ ...makeTrack(), id: "c", label: "c", startMs: 20_000, endMs: 80_000 },
+		]);
+		const tops = ["a", "b", "c"].map(
+			(l) => (screen.getByTitle((t) => t.startsWith(`${l} `)) as HTMLElement).style.top,
+		);
+		expect(new Set(tops).size).toBe(3);
+		// ...and the lane grew to hold them rather than clipping.
+		const lane = container.querySelector('[class*="tlLaneAudio"]') as HTMLElement;
+		expect(Number.parseInt(lane.style.height, 10)).toBeGreaterThan(60);
+	});
+
+	it("keeps non-overlapping tracks on one row", () => {
+		renderAudioTracks([
+			{ ...makeTrack(), id: "a", label: "a", startMs: 0, endMs: 10_000 },
+			{ ...makeTrack(), id: "b", label: "b", startMs: 20_000, endMs: 30_000 },
+		]);
+		const tops = ["a", "b"].map(
+			(l) => (screen.getByTitle((t) => t.startsWith(`${l} `)) as HTMLElement).style.top,
+		);
+		expect(new Set(tops).size).toBe(1);
+	});
+
+	it("selects the track on pointer-down before any movement", () => {
+		const { pill, selectAudioTrack } = renderAudio();
+		fireEvent.pointerDown(pill, { clientX: 0 });
+		window.dispatchEvent(new MouseEvent("pointerup", { clientX: 0 }));
+		expect(selectAudioTrack).toHaveBeenCalledWith("trk1");
+	});
+
+	it("body drag slides the head and commits once, trims untouched", () => {
+		const { pill, placeAudioTrack } = renderAudio();
+		fireEvent.pointerDown(pill, { clientX: 0 });
+		window.dispatchEvent(new MouseEvent("pointermove", { clientX: 90 }));
+		window.dispatchEvent(new MouseEvent("pointerup", { clientX: 90 }));
+		expect(placeAudioTrack).toHaveBeenCalledTimes(1);
+		const [id, placement] = placeAudioTrack.mock.calls[0];
+		expect(id).toBe("trk1");
+		// The span slides whole: head moves, length is unchanged.
+		expect(placement.startMs / 1000).toBeCloseTo(100 + secForPx(90), 3);
+		expect((placement.endMs - placement.startMs) / 1000).toBeCloseTo(60, 3);
+	});
+
+	it("left-handle drag trims into the source instead of sliding the audio", () => {
+		// A left-edge drag is a trim IN: the head moves right by N seconds and the
+		// same N is skipped in the file, so what plays under the pill stays put.
+		// Committing the span alone left `offsetMs` untouched, which just slid the
+		// whole track along — the "my music starts five seconds late" symptom.
+		const { pill, placeAudioTrack } = renderAudio();
+		const handle = pill.firstElementChild as Element;
+		fireEvent.pointerDown(handle, { clientX: 0 });
+		window.dispatchEvent(new MouseEvent("pointermove", { clientX: 15 }));
+		window.dispatchEvent(new MouseEvent("pointerup", { clientX: 15 }));
+		expect(placeAudioTrack).toHaveBeenCalledTimes(1);
+		const [, placement] = placeAudioTrack.mock.calls[0];
+		const movedSec = placement.startMs / 1000 - 100;
+		expect(movedSec).toBeGreaterThan(0);
+		// The head moved and the source in-point advanced by the same amount.
+		expect((placement.offsetMs ?? 0) / 1000).toBeCloseTo(movedSec, 3);
+		// The tail is untouched, so the span shortens by exactly what was trimmed.
+		expect((placement.endMs - placement.startMs) / 1000).toBeCloseTo(60 - movedSec, 3);
+	});
+
+	it("a plain move leaves the source in-point alone", () => {
+		const { pill, placeAudioTrack } = renderAudio();
+		fireEvent.pointerDown(pill, { clientX: 0 });
+		window.dispatchEvent(new MouseEvent("pointermove", { clientX: 90 }));
+		window.dispatchEvent(new MouseEvent("pointerup", { clientX: 90 }));
+		const [, placement] = placeAudioTrack.mock.calls[0];
+		expect(placement.offsetMs).toBe(0);
+	});
+
+	it("caps the out-point at the source length when the track does not loop", () => {
+		// A non-looping track has nothing to play past the end of its file, so the
+		// right edge stops there however far the pointer goes.
+		const { pill, placeAudioTrack } = renderAudio();
+		const handle = pill.lastElementChild as Element;
+		fireEvent.pointerDown(handle, { clientX: 0 });
+		window.dispatchEvent(new MouseEvent("pointermove", { clientX: 400 }));
+		window.dispatchEvent(new MouseEvent("pointerup", { clientX: 400 }));
+		const [, placement] = placeAudioTrack.mock.calls[0];
+		expect((placement.endMs - placement.startMs) / 1000).toBeCloseTo(60, 3);
+	});
+
+	it("lets a looping track be pulled out past the end of its file", () => {
+		// This is what makes the loop toggle mean anything: the span has to be able
+		// to EXCEED the source, or the audio always plays exactly once and turning
+		// loop on does nothing at all.
+		const { pill, placeAudioTrack } = renderAudio({ loop: true });
+		const handle = pill.lastElementChild as Element;
+		fireEvent.pointerDown(handle, { clientX: 0 });
+		window.dispatchEvent(new MouseEvent("pointermove", { clientX: 400 }));
+		window.dispatchEvent(new MouseEvent("pointerup", { clientX: 400 }));
+		const [, placement] = placeAudioTrack.mock.calls[0];
+		expect((placement.endMs - placement.startMs) / 1000).toBeGreaterThan(60);
+	});
+
+	it("right-handle drag pulls the out-point in, head fixed", () => {
+		const { pill, placeAudioTrack } = renderAudio();
+		// The right resize handle is the last child of the pill.
+		const handle = pill.lastElementChild as Element;
+		fireEvent.pointerDown(handle, { clientX: 0 });
+		window.dispatchEvent(new MouseEvent("pointermove", { clientX: -30 }));
+		window.dispatchEvent(new MouseEvent("pointerup", { clientX: -30 }));
+		expect(placeAudioTrack).toHaveBeenCalledTimes(1);
+		const [, placement] = placeAudioTrack.mock.calls[0];
+		// The head is pinned; only the tail comes in, so the span gets shorter.
+		expect(placement.startMs).toBe(100_000);
+		expect(placement.endMs - placement.startMs).toBeLessThan(60_000);
 	});
 });
