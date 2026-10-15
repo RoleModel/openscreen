@@ -170,7 +170,7 @@
 		"vite": "^7.3.6",
 		"vite-plugin-electron": "^0.29.1",
 		"vite-plugin-electron-renderer": "^0.14.6",
-		"vitest": "^4.1.10"
+		"vitest": "^4.1.11"
 	},
 	"main": "dist-electron/main.js",
 	"lint-staged": {
